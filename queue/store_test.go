@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -44,7 +45,7 @@ func TestUpdateQueue_CAS(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 冲突
-	if err := s.UpdateQueue(ctx, info, 1); err != ErrConditionFailed {
+	if err := s.UpdateQueue(ctx, info, 1); !errors.Is(err, ErrConditionFailed) {
 		t.Fatalf("expected ErrConditionFailed, got %v", err)
 	}
 }

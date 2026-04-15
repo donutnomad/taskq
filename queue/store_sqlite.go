@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,11 +12,13 @@ import (
 
 const sqliteSchema = `
 CREATE TABLE IF NOT EXISTS queue_info (
-	queue_name   TEXT NOT NULL,
-	partition_id INTEGER NOT NULL,
-	range_id     INTEGER NOT NULL DEFAULT 1,
-	ack_level    INTEGER NOT NULL DEFAULT 0,
-	next_task_id INTEGER NOT NULL DEFAULT 1,
+	queue_name       TEXT NOT NULL,
+	partition_id     INTEGER NOT NULL,
+	range_id         INTEGER NOT NULL DEFAULT 1,
+	ack_level        INTEGER NOT NULL DEFAULT 0,
+	next_task_id     INTEGER NOT NULL DEFAULT 1,
+	lease_owner      TEXT,
+	lease_expires_at TIMESTAMP,
 	PRIMARY KEY (queue_name, partition_id)
 );
 CREATE TABLE IF NOT EXISTS tasks (
@@ -203,6 +206,84 @@ func (s *sqliteStore) DeleteTask(ctx context.Context, queueName string, partitio
 	_, err := s.db.ExecContext(ctx,
 		`DELETE FROM tasks WHERE queue_name = ? AND partition_id = ? AND task_id = ?`,
 		queueName, partitionID, taskID)
+	return err
+}
+
+func (s *sqliteStore) AcquireLease(ctx context.Context, queueName string, partitionID int,
+	owner string, ttl time.Duration) (*QueueInfo, error) {
+
+	now := time.Now()
+	expiresAt := now.Add(ttl)
+
+	// 确保 queue_info 行存在
+	_, err := s.GetQueue(ctx, queueName, partitionID)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if err := s.CreateQueue(ctx, &QueueInfo{
+			QueueName:   queueName,
+			PartitionID: partitionID,
+			RangeID:     1,
+			AckLevel:    0,
+			NextTaskID:  1,
+		}); err != nil {
+			return nil, fmt.Errorf("create queue for lease: %w", err)
+		}
+	}
+
+	// 获取 lease + 递增 rangeID（原子操作）
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE queue_info
+		 SET lease_owner = ?, lease_expires_at = ?, range_id = range_id + 1
+		 WHERE queue_name = ? AND partition_id = ?
+		   AND (lease_owner IS NULL OR lease_expires_at < ? OR lease_owner = ?)`,
+		owner, expiresAt,
+		queueName, partitionID,
+		now, owner)
+	if err != nil {
+		return nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, ErrLeaseHeld
+	}
+
+	// 读取最新状态
+	return s.GetQueue(ctx, queueName, partitionID)
+}
+
+func (s *sqliteStore) RenewLease(ctx context.Context, queueName string, partitionID int,
+	owner string, ttl time.Duration) error {
+
+	expiresAt := time.Now().Add(ttl)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE queue_info SET lease_expires_at = ?
+		 WHERE queue_name = ? AND partition_id = ? AND lease_owner = ?`,
+		expiresAt, queueName, partitionID, owner)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrLeaseHeld
+	}
+	return nil
+}
+
+func (s *sqliteStore) ReleaseLease(ctx context.Context, queueName string, partitionID int,
+	owner string) error {
+
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE queue_info SET lease_owner = NULL, lease_expires_at = NULL
+		 WHERE queue_name = ? AND partition_id = ? AND lease_owner = ?`,
+		queueName, partitionID, owner)
 	return err
 }
 

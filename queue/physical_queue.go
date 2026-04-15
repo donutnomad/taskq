@@ -3,7 +3,6 @@ package queue
 import (
 	"container/list"
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
@@ -20,6 +19,11 @@ type PollResult struct {
 	Err   error
 }
 
+const (
+	defaultLeaseTTL   = 15 * time.Second
+	defaultLeaseRenew = 5 * time.Second
+)
+
 // PhysicalQueue 单分区队列核心，包含 sync match 和 DB 管理。
 type PhysicalQueue struct {
 	mu          sync.Mutex
@@ -28,6 +32,7 @@ type PhysicalQueue struct {
 	partitionID int
 	ownership   *ownershipState
 	visTimeout  time.Duration
+	leaseOwner  string
 
 	waiters   *list.List // chan PollResult
 	forwardFn func()     // 非 root 分区：本地无 waiter 时转发到 root
@@ -35,37 +40,19 @@ type PhysicalQueue struct {
 	writer    *taskWriter
 	gc        *taskGC
 	visScan   *visibilityScanner
+	leaseWg   sync.WaitGroup
 
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
 func newPhysicalQueue(ctx context.Context, store Store, queueName string,
-	partitionID int, visTimeout time.Duration) (*PhysicalQueue, error) {
+	partitionID int, visTimeout time.Duration, leaseOwner string) (*PhysicalQueue, error) {
 
-	// 获取或创建 queue info
-	info, err := store.GetQueue(ctx, queueName, partitionID)
+	// 通过 DB lease 获取分区独占权（同时递增 rangeID）
+	info, err := store.AcquireLease(ctx, queueName, partitionID, leaseOwner, defaultLeaseTTL)
 	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("get queue: %w", err)
-		}
-		info = &QueueInfo{
-			QueueName:   queueName,
-			PartitionID: partitionID,
-			RangeID:     1,
-			AckLevel:    0,
-			NextTaskID:  1,
-		}
-		if err := store.CreateQueue(ctx, info); err != nil {
-			return nil, fmt.Errorf("create queue: %w", err)
-		}
-	}
-
-	// 递增 rangeID 抢占所有权
-	prevRangeID := info.RangeID
-	info.RangeID++
-	if err := store.UpdateQueue(ctx, info, prevRangeID); err != nil {
-		return nil, fmt.Errorf("acquire ownership: %w", err)
+		return nil, err
 	}
 
 	ownership := newOwnershipState(store, info.RangeID)
@@ -77,6 +64,7 @@ func newPhysicalQueue(ctx context.Context, store Store, queueName string,
 		partitionID: partitionID,
 		ownership:   ownership,
 		visTimeout:  visTimeout,
+		leaseOwner:  leaseOwner,
 		waiters:     list.New(),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -88,6 +76,8 @@ func newPhysicalQueue(ctx context.Context, store Store, queueName string,
 	pq.gc = newTaskGC(ctx, store, queueName, partitionID, ownership, pq.dbMgr)
 	pq.visScan = newVisibilityScanner(ctx, store, queueName, partitionID,
 		pq.dbMgr, visTimeout, pq.wakeWaiters)
+	pq.leaseWg.Add(1)
+	go pq.leaseRenewLoop()
 
 	return pq, nil
 }
@@ -214,6 +204,25 @@ func (pq *PhysicalQueue) nack(ctx context.Context, token string) error {
 	return nil
 }
 
+func (pq *PhysicalQueue) leaseRenewLoop() {
+	defer pq.leaseWg.Done()
+	timer := time.NewTimer(defaultLeaseRenew)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			if err := pq.store.RenewLease(pq.ctx, pq.queueName, pq.partitionID,
+				pq.leaseOwner, defaultLeaseTTL); err != nil {
+				pq.cancel() // 续期失败 → 停止所有后台组件
+				return
+			}
+			timer.Reset(defaultLeaseRenew)
+		case <-pq.ctx.Done():
+			return
+		}
+	}
+}
+
 func (pq *PhysicalQueue) close() {
 	pq.cancel()
 	// 唤醒所有 waiters
@@ -231,6 +240,9 @@ func (pq *PhysicalQueue) close() {
 	pq.writer.close()
 	pq.visScan.close()
 	pq.gc.close()
+	pq.leaseWg.Wait()
+	// 释放 lease（使用新 context，因为 pq.ctx 已取消）
+	pq.store.ReleaseLease(context.Background(), pq.queueName, pq.partitionID, pq.leaseOwner)
 }
 
 // parseToken "partitionID:taskID" → (partitionID, taskID, error)
@@ -248,9 +260,10 @@ func parseToken(token string) (int, int64, error) {
 
 // NewPhysicalQueue 创建单个分区的物理队列。
 // 分布式模式下由 matching 服务调用，每个 PhysicalQueue 独立管理一个分区。
+// leaseOwner 用于 DB lease 独占分区，如果 lease 被其他节点持有则返回 ErrLeaseHeld。
 func NewPhysicalQueue(ctx context.Context, store Store, queueName string,
-	partitionID int, visTimeout time.Duration) (*PhysicalQueue, error) {
-	return newPhysicalQueue(ctx, store, queueName, partitionID, visTimeout)
+	partitionID int, visTimeout time.Duration, leaseOwner string) (*PhysicalQueue, error) {
+	return newPhysicalQueue(ctx, store, queueName, partitionID, visTimeout, leaseOwner)
 }
 
 // AddTask 写入任务到本分区

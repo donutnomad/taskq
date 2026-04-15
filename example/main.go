@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -62,10 +63,7 @@ func (s *memMemberStore) PruneExpiredMembers(_ context.Context, _ int) error {
 // ---- 主流程 ----
 
 func main() {
-	const (
-		queueName     = "demo-queue"
-		numPartitions = 4
-	)
+	const queueName = "demo-queue"
 
 	// 1. 创建 SQLite store（内存模式）
 	store, err := queue.NewSQLiteStore(":memory:")
@@ -81,6 +79,10 @@ func main() {
 		log.Fatal(err)
 	}
 	addr := lis.Addr().String()
+	addrPort, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		log.Fatal(err)
+	}
 	lis.Close()
 
 	// 3. 创建真实 Monitor（内存 MemberStore + 单节点）
@@ -88,7 +90,7 @@ func main() {
 	monitor := membership.NewMonitor(
 		[]string{"matching"},
 		memberStore,
-		addr,
+		addrPort,
 		1*time.Second, // pollInterval
 		1*time.Second, // propagationTime
 		time.Time{},   // joinTime：立即加入
@@ -107,7 +109,7 @@ func main() {
 		Monitor:       monitor,
 		ListenAddr:    addr,
 		BroadcastAddr: addr,
-		QueueConfigs:  map[string]int{queueName: numPartitions},
+		QueueConfigs:  map[string]int{queueName: 4},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -123,11 +125,10 @@ func main() {
 
 	// 5. 创建真实 Frontend
 	fe, err := frontend.New(frontend.Config{
-		Monitor:       monitor,
-		QueueName:     queueName,
-		NumPartitions: numPartitions,
-		DialOpts:      []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-		PollTimeout:   5 * time.Second,
+		Monitor:     monitor,
+		QueueName:   queueName,
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 5 * time.Second,
 	})
 	if err != nil {
 		log.Fatal(err)

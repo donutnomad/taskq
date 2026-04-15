@@ -14,7 +14,7 @@
 monitor := membership.NewMonitor(
     []string{"matching"},
     store,
-    "10.0.0.1:7235",  // broadcastRPCAddress，所有角色共用
+    netip.MustParseAddrPort("10.0.0.1:7235"), // broadcastAddr，所有角色共用
     5*time.Second,     // pollInterval
     3*time.Second,     // propagationTime
     time.Time{},       // joinTime
@@ -25,7 +25,7 @@ monitor := membership.NewMonitor(
 monitor := membership.NewMonitor(
     []string{"matching", "history"},
     store,
-    "10.0.0.1:7235",
+    netip.MustParseAddrPort("10.0.0.1:7235"),
     5*time.Second,
     3*time.Second,
     time.Time{},

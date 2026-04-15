@@ -24,6 +24,7 @@ type partitionManager struct {
 	mu           sync.RWMutex
 	store        queue.Store
 	selfAddr     string // 本节点广播地址
+	leaseOwner   string // DB lease 标识
 	resolver     membership.ServiceResolver
 	visTimeout   time.Duration
 	partitions   map[string]*queue.PhysicalQueue // key = partitionKey(...)
@@ -36,6 +37,7 @@ func newPartitionManager(
 	ctx context.Context,
 	store queue.Store,
 	selfAddr string,
+	leaseOwner string,
 	resolver membership.ServiceResolver,
 	visTimeout time.Duration,
 	queueConfigs map[string]int,
@@ -44,6 +46,7 @@ func newPartitionManager(
 	return &partitionManager{
 		store:        store,
 		selfAddr:     selfAddr,
+		leaseOwner:   leaseOwner,
 		resolver:     resolver,
 		visTimeout:   visTimeout,
 		partitions:   make(map[string]*queue.PhysicalQueue),
@@ -88,7 +91,7 @@ func (pm *partitionManager) getOrLoadPartition(queueName string, partitionID int
 		return pq, nil
 	}
 
-	pq, err := queue.NewPhysicalQueue(pm.ctx, pm.store, queueName, partitionID, pm.visTimeout)
+	pq, err := queue.NewPhysicalQueue(pm.ctx, pm.store, queueName, partitionID, pm.visTimeout, pm.leaseOwner)
 	if err != nil {
 		return nil, fmt.Errorf("load partition %s: %w", key, err)
 	}
@@ -130,7 +133,10 @@ func (pm *partitionManager) reconcile() {
 		if _, ok := pm.partitions[key]; ok {
 			continue
 		}
-		pq, err := queue.NewPhysicalQueue(pm.ctx, pm.store, pid.queueName, pid.partitionID, pm.visTimeout)
+		pq, err := queue.NewPhysicalQueue(pm.ctx, pm.store, pid.queueName, pid.partitionID, pm.visTimeout, pm.leaseOwner)
+		if errors.Is(err, queue.ErrLeaseHeld) {
+			continue // 正常竞争，其他节点持有 lease
+		}
 		if err != nil {
 			log.Printf("matching: failed to load partition %s: %v", key, err)
 			continue
@@ -138,6 +144,12 @@ func (pm *partitionManager) reconcile() {
 		log.Printf("matching: loaded partition %s", key)
 		pm.partitions[key] = pq
 	}
+}
+
+// getQueuePartitionCount 返回队列的分区数
+func (pm *partitionManager) getQueuePartitionCount(queueName string) (int, bool) {
+	n, ok := pm.queueConfigs[queueName]
+	return n, ok
 }
 
 // close 关闭所有分区

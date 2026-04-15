@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -37,9 +38,9 @@ type monitor struct {
 	rings         map[string]*serviceResolver
 	replicaPoints int
 
-	hostID              []byte
-	broadcastRPCAddress string // "ip:port"
-	draining            bool
+	hostID        []byte
+	broadcastAddr netip.AddrPort
+	draining      bool
 
 	initialized chan struct{}
 }
@@ -51,7 +52,7 @@ var _ Monitor = (*monitor)(nil)
 // 参数：
 //   - serviceNames: 本节点承担的服务角色列表（如 []string{"matching"} 或 []string{"matching", "history"}）
 //   - store: DB 操作接口
-//   - broadcastRPCAddress: 本节点 gRPC 地址，格式 "ip:rpcPort"
+//   - broadcastAddr: 本节点 gRPC 广播地址
 //   - pollInterval: DB 轮询间隔（建议 3~10s）
 //   - propagationTime: 成员变更传播估计时间（用于 EvictSelfAt）
 //   - joinTime: 计划加入时间（零值表示立即加入）
@@ -59,7 +60,7 @@ var _ Monitor = (*monitor)(nil)
 func NewMonitor(
 	serviceNames []string,
 	store MemberStore,
-	broadcastRPCAddress string,
+	broadcastAddr netip.AddrPort,
 	pollInterval time.Duration,
 	propagationTime time.Duration,
 	joinTime time.Time,
@@ -69,18 +70,18 @@ func NewMonitor(
 	hostID, _ := uuid.New().MarshalBinary()
 
 	m := &monitor{
-		lifecycleCtx:        ctx,
-		lifecycleCancel:     cancel,
-		serviceNames:        serviceNames,
-		store:               store,
-		pollInterval:        pollInterval,
-		propagationTime:     propagationTime,
-		joinTime:            joinTime,
-		rings:               make(map[string]*serviceResolver),
-		replicaPoints:       replicaPoints,
-		hostID:              hostID,
-		broadcastRPCAddress: broadcastRPCAddress,
-		initialized:         make(chan struct{}),
+		lifecycleCtx:    ctx,
+		lifecycleCancel: cancel,
+		serviceNames:    serviceNames,
+		store:           store,
+		pollInterval:    pollInterval,
+		propagationTime: propagationTime,
+		joinTime:        joinTime,
+		rings:           make(map[string]*serviceResolver),
+		replicaPoints:   replicaPoints,
+		hostID:          hostID,
+		broadcastAddr:   broadcastAddr,
+		initialized:     make(chan struct{}),
 	}
 
 	for _, svc := range serviceNames {
@@ -182,16 +183,8 @@ func (m *monitor) SetDraining(draining bool) error {
 	m.draining = draining
 	m.mu.Unlock()
 
-	host, portStr, err := net.SplitHostPort(m.broadcastRPCAddress)
-	if err != nil {
-		return err
-	}
-	rpcPort, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil {
-		return err
-	}
 	for _, svc := range m.serviceNames {
-		req := m.buildUpsertRequest(host, uint16(rpcPort), svc)
+		req := m.buildUpsertRequest(svc)
 		if err := m.store.UpsertMember(m.lifecycleCtx, req); err != nil {
 			return err
 		}
@@ -260,28 +253,19 @@ func (m *monitor) syncMembers() error {
 func (m *monitor) startHeartbeat() error {
 	_ = m.store.PruneExpiredMembers(m.lifecycleCtx, 10)
 
-	host, portStr, err := net.SplitHostPort(m.broadcastRPCAddress)
-	if err != nil {
-		return err
-	}
-	rpcPort, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil {
-		return err
-	}
-
 	for _, svc := range m.serviceNames {
-		req := m.buildUpsertRequest(host, uint16(rpcPort), svc)
-		if err = m.store.UpsertMember(m.lifecycleCtx, req); err != nil {
+		req := m.buildUpsertRequest(svc)
+		if err := m.store.UpsertMember(m.lifecycleCtx, req); err != nil {
 			return err
 		}
 	}
 
 	m.wg.Add(1)
-	go m.heartbeatLoop(host, uint16(rpcPort))
+	go m.heartbeatLoop()
 	return nil
 }
 
-func (m *monitor) buildUpsertRequest(host string, rpcPort uint16, serviceName string) UpsertMemberRequest {
+func (m *monitor) buildUpsertRequest(serviceName string) UpsertMemberRequest {
 	m.mu.Lock()
 	draining := m.draining
 	m.mu.Unlock()
@@ -293,8 +277,8 @@ func (m *monitor) buildUpsertRequest(host string, rpcPort uint16, serviceName st
 
 	return UpsertMemberRequest{
 		ServiceName:  serviceName,
-		RPCAddress:   net.ParseIP(host),
-		RPCPort:      rpcPort,
+		RPCAddress:   m.broadcastAddr.Addr().AsSlice(),
+		RPCPort:      m.broadcastAddr.Port(),
 		HostID:       m.hostID,
 		SessionStart: time.Now().UTC(),
 		RecordExpiry: upsertMembershipRecordExpiryDefault,
@@ -303,11 +287,11 @@ func (m *monitor) buildUpsertRequest(host string, rpcPort uint16, serviceName st
 	}
 }
 
-func (m *monitor) heartbeatLoop(host string, rpcPort uint16) {
+func (m *monitor) heartbeatLoop() {
 	defer m.wg.Done()
 	for {
 		for _, svc := range m.serviceNames {
-			req := m.buildUpsertRequest(host, rpcPort, svc)
+			req := m.buildUpsertRequest(svc)
 			_ = m.store.UpsertMember(m.lifecycleCtx, req)
 		}
 		jitter := time.Duration(rand.Int63n(5000)) * time.Millisecond

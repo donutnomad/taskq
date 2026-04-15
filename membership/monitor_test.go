@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -63,7 +64,7 @@ func TestMonitorStartStop(t *testing.T) {
 	m := NewMonitor(
 		[]string{"matching"},
 		store,
-		"127.0.0.1:7233",
+		netip.MustParseAddrPort("127.0.0.1:7233"),
 		5*time.Second,
 		3*time.Second,
 		time.Time{},
@@ -98,7 +99,7 @@ func TestMonitorGetResolver(t *testing.T) {
 	m := NewMonitor(
 		[]string{"matching"},
 		store,
-		"10.0.0.1:7235",
+		netip.MustParseAddrPort("10.0.0.1:7235"),
 		100*time.Millisecond,
 		time.Second,
 		time.Time{},
@@ -138,7 +139,7 @@ func TestMonitorSetDraining(t *testing.T) {
 	m := NewMonitor(
 		[]string{"matching"},
 		store,
-		"10.0.0.1:7235",
+		netip.MustParseAddrPort("10.0.0.1:7235"),
 		100*time.Millisecond,
 		time.Second,
 		time.Time{},
@@ -174,7 +175,7 @@ func TestEvictSelfAtReturnValue(t *testing.T) {
 	m := NewMonitor(
 		[]string{"matching"},
 		store,
-		"10.0.0.1:7235",
+		netip.MustParseAddrPort("10.0.0.1:7235"),
 		100*time.Millisecond,
 		propagationTime,
 		time.Time{},
@@ -207,7 +208,7 @@ func TestMonitorHeartbeat(t *testing.T) {
 	m := NewMonitor(
 		[]string{"history"},
 		store,
-		"10.0.0.5:7234",
+		netip.MustParseAddrPort("10.0.0.5:7234"),
 		50*time.Millisecond,
 		time.Second,
 		time.Time{},
@@ -236,7 +237,7 @@ func TestMonitorMultiServiceNames(t *testing.T) {
 	m := NewMonitor(
 		[]string{"matching", "history"},
 		store,
-		"10.0.0.1:7235",
+		netip.MustParseAddrPort("10.0.0.1:7235"),
 		100*time.Millisecond,
 		time.Second,
 		time.Time{},

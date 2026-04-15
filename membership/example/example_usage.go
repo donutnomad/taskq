@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/donutnomad/taskq/membership"
@@ -47,7 +48,7 @@ func (s *MySQLMemberStore) PruneExpiredMembers(ctx context.Context, maxCount int
 func main() {
 	store := &MySQLMemberStore{}
 
-	myGRPCAddr := "10.0.0.2:7235" // 本节点 gRPC 地址
+	myGRPCAddr := netip.MustParseAddrPort("10.0.0.2:7235") // 本节点 gRPC 地址
 
 	monitor := membership.NewMonitor(
 		[]string{"matching", "history", "frontend"}, // 本节点承担的服务角色列表

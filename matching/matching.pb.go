@@ -429,6 +429,94 @@ func (*NackTaskResponse) Descriptor() ([]byte, []int) {
 	return file_matching_matching_proto_rawDescGZIP(), []int{7}
 }
 
+type GetQueueInfoRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	QueueName     string                 `protobuf:"bytes,1,opt,name=queue_name,json=queueName,proto3" json:"queue_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetQueueInfoRequest) Reset() {
+	*x = GetQueueInfoRequest{}
+	mi := &file_matching_matching_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetQueueInfoRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetQueueInfoRequest) ProtoMessage() {}
+
+func (x *GetQueueInfoRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_matching_matching_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetQueueInfoRequest.ProtoReflect.Descriptor instead.
+func (*GetQueueInfoRequest) Descriptor() ([]byte, []int) {
+	return file_matching_matching_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *GetQueueInfoRequest) GetQueueName() string {
+	if x != nil {
+		return x.QueueName
+	}
+	return ""
+}
+
+type GetQueueInfoResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NumPartitions int32                  `protobuf:"varint,1,opt,name=num_partitions,json=numPartitions,proto3" json:"num_partitions,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetQueueInfoResponse) Reset() {
+	*x = GetQueueInfoResponse{}
+	mi := &file_matching_matching_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetQueueInfoResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetQueueInfoResponse) ProtoMessage() {}
+
+func (x *GetQueueInfoResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_matching_matching_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetQueueInfoResponse.ProtoReflect.Descriptor instead.
+func (*GetQueueInfoResponse) Descriptor() ([]byte, []int) {
+	return file_matching_matching_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *GetQueueInfoResponse) GetNumPartitions() int32 {
+	if x != nil {
+		return x.NumPartitions
+	}
+	return 0
+}
+
 var File_matching_matching_proto protoreflect.FileDescriptor
 
 const file_matching_matching_proto_rawDesc = "" +
@@ -460,12 +548,18 @@ const file_matching_matching_proto_rawDesc = "" +
 	"queue_name\x18\x01 \x01(\tR\tqueueName\x12!\n" +
 	"\fpartition_id\x18\x02 \x01(\x05R\vpartitionId\x12\x14\n" +
 	"\x05token\x18\x03 \x01(\tR\x05token\"\x12\n" +
-	"\x10NackTaskResponse2\x97\x02\n" +
+	"\x10NackTaskResponse\"4\n" +
+	"\x13GetQueueInfoRequest\x12\x1d\n" +
+	"\n" +
+	"queue_name\x18\x01 \x01(\tR\tqueueName\"=\n" +
+	"\x14GetQueueInfoResponse\x12%\n" +
+	"\x0enum_partitions\x18\x01 \x01(\x05R\rnumPartitions2\xe6\x02\n" +
 	"\x0fMatchingService\x12>\n" +
 	"\aAddTask\x12\x18.matching.AddTaskRequest\x1a\x19.matching.AddTaskResponse\x12A\n" +
 	"\bPollTask\x12\x19.matching.PollTaskRequest\x1a\x1a.matching.PollTaskResponse\x12>\n" +
 	"\aAckTask\x12\x18.matching.AckTaskRequest\x1a\x19.matching.AckTaskResponse\x12A\n" +
-	"\bNackTask\x12\x19.matching.NackTaskRequest\x1a\x1a.matching.NackTaskResponseB&Z$github.com/donutnomad/taskq/matchingb\x06proto3"
+	"\bNackTask\x12\x19.matching.NackTaskRequest\x1a\x1a.matching.NackTaskResponse\x12M\n" +
+	"\fGetQueueInfo\x12\x1d.matching.GetQueueInfoRequest\x1a\x1e.matching.GetQueueInfoResponseB&Z$github.com/donutnomad/taskq/matchingb\x06proto3"
 
 var (
 	file_matching_matching_proto_rawDescOnce sync.Once
@@ -479,28 +573,32 @@ func file_matching_matching_proto_rawDescGZIP() []byte {
 	return file_matching_matching_proto_rawDescData
 }
 
-var file_matching_matching_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_matching_matching_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_matching_matching_proto_goTypes = []any{
-	(*AddTaskRequest)(nil),   // 0: matching.AddTaskRequest
-	(*AddTaskResponse)(nil),  // 1: matching.AddTaskResponse
-	(*PollTaskRequest)(nil),  // 2: matching.PollTaskRequest
-	(*PollTaskResponse)(nil), // 3: matching.PollTaskResponse
-	(*AckTaskRequest)(nil),   // 4: matching.AckTaskRequest
-	(*AckTaskResponse)(nil),  // 5: matching.AckTaskResponse
-	(*NackTaskRequest)(nil),  // 6: matching.NackTaskRequest
-	(*NackTaskResponse)(nil), // 7: matching.NackTaskResponse
+	(*AddTaskRequest)(nil),       // 0: matching.AddTaskRequest
+	(*AddTaskResponse)(nil),      // 1: matching.AddTaskResponse
+	(*PollTaskRequest)(nil),      // 2: matching.PollTaskRequest
+	(*PollTaskResponse)(nil),     // 3: matching.PollTaskResponse
+	(*AckTaskRequest)(nil),       // 4: matching.AckTaskRequest
+	(*AckTaskResponse)(nil),      // 5: matching.AckTaskResponse
+	(*NackTaskRequest)(nil),      // 6: matching.NackTaskRequest
+	(*NackTaskResponse)(nil),     // 7: matching.NackTaskResponse
+	(*GetQueueInfoRequest)(nil),  // 8: matching.GetQueueInfoRequest
+	(*GetQueueInfoResponse)(nil), // 9: matching.GetQueueInfoResponse
 }
 var file_matching_matching_proto_depIdxs = []int32{
 	0, // 0: matching.MatchingService.AddTask:input_type -> matching.AddTaskRequest
 	2, // 1: matching.MatchingService.PollTask:input_type -> matching.PollTaskRequest
 	4, // 2: matching.MatchingService.AckTask:input_type -> matching.AckTaskRequest
 	6, // 3: matching.MatchingService.NackTask:input_type -> matching.NackTaskRequest
-	1, // 4: matching.MatchingService.AddTask:output_type -> matching.AddTaskResponse
-	3, // 5: matching.MatchingService.PollTask:output_type -> matching.PollTaskResponse
-	5, // 6: matching.MatchingService.AckTask:output_type -> matching.AckTaskResponse
-	7, // 7: matching.MatchingService.NackTask:output_type -> matching.NackTaskResponse
-	4, // [4:8] is the sub-list for method output_type
-	0, // [0:4] is the sub-list for method input_type
+	8, // 4: matching.MatchingService.GetQueueInfo:input_type -> matching.GetQueueInfoRequest
+	1, // 5: matching.MatchingService.AddTask:output_type -> matching.AddTaskResponse
+	3, // 6: matching.MatchingService.PollTask:output_type -> matching.PollTaskResponse
+	5, // 7: matching.MatchingService.AckTask:output_type -> matching.AckTaskResponse
+	7, // 8: matching.MatchingService.NackTask:output_type -> matching.NackTaskResponse
+	9, // 9: matching.MatchingService.GetQueueInfo:output_type -> matching.GetQueueInfoResponse
+	5, // [5:10] is the sub-list for method output_type
+	0, // [0:5] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -517,7 +615,7 @@ func file_matching_matching_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_matching_matching_proto_rawDesc), len(file_matching_matching_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   8,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

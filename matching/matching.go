@@ -14,6 +14,7 @@ import (
 
 	"github.com/donutnomad/taskq/membership"
 	"github.com/donutnomad/taskq/queue"
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 )
 
@@ -38,6 +39,8 @@ type Config struct {
 	VisTimeout time.Duration
 	// QueueConfigs 队列名 → 分区数
 	QueueConfigs map[string]int
+	// LeaseOwner 节点唯一标识，用于 DB lease 独占分区。为空时自动生成 UUID。
+	LeaseOwner string
 	// GRPCOptions 额外的 gRPC server 选项
 	GRPCOptions []grpc.ServerOption
 }
@@ -71,6 +74,9 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.VisTimeout <= 0 {
 		cfg.VisTimeout = defaultVisTimeout
 	}
+	if cfg.LeaseOwner == "" {
+		cfg.LeaseOwner = uuid.New().String()
+	}
 
 	resolver, err := cfg.Monitor.GetResolver(cfg.ServiceName)
 	if err != nil {
@@ -79,7 +85,7 @@ func NewServer(cfg Config) (*Server, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	mgr := newPartitionManager(ctx, cfg.Store, cfg.BroadcastAddr, resolver, cfg.VisTimeout, cfg.QueueConfigs)
+	mgr := newPartitionManager(ctx, cfg.Store, cfg.BroadcastAddr, cfg.LeaseOwner, resolver, cfg.VisTimeout, cfg.QueueConfigs)
 
 	grpcServer := grpc.NewServer(cfg.GRPCOptions...)
 	handler := &matchingHandler{mgr: mgr}

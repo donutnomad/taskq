@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
@@ -20,6 +22,7 @@ type Options struct {
 	Partitions int
 	VisTimeout time.Duration
 	BufferSize int
+	LeaseOwner string // 为空时自动生成 UUID
 }
 
 // PartitionedQueue 多分区队列，对外实现 TaskQueue 接口。
@@ -50,6 +53,9 @@ func New(ctx context.Context, opts Options) (*PartitionedQueue, error) {
 	if opts.VisTimeout <= 0 {
 		opts.VisTimeout = defaultVisTimeout
 	}
+	if opts.LeaseOwner == "" {
+		opts.LeaseOwner = uuid.New().String()
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	pq := &PartitionedQueue{
@@ -61,7 +67,7 @@ func New(ctx context.Context, opts Options) (*PartitionedQueue, error) {
 
 	pq.partitions = make([]*PhysicalQueue, opts.Partitions)
 	for i := 0; i < opts.Partitions; i++ {
-		p, err := newPhysicalQueue(ctx, opts.Store, opts.QueueName, i, opts.VisTimeout)
+		p, err := newPhysicalQueue(ctx, opts.Store, opts.QueueName, i, opts.VisTimeout, opts.LeaseOwner)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				pq.partitions[j].close()
@@ -167,7 +173,7 @@ func (pq *PartitionedQueue) AddPartition() error {
 	defer pq.mu.Unlock()
 
 	newID := len(pq.partitions)
-	p, err := newPhysicalQueue(pq.ctx, pq.opts.Store, pq.opts.QueueName, newID, pq.opts.VisTimeout)
+	p, err := newPhysicalQueue(pq.ctx, pq.opts.Store, pq.opts.QueueName, newID, pq.opts.VisTimeout, pq.opts.LeaseOwner)
 	if err != nil {
 		return fmt.Errorf("create partition %d: %w", newID, err)
 	}

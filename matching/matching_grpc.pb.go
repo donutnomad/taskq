@@ -19,10 +19,11 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	MatchingService_AddTask_FullMethodName  = "/matching.MatchingService/AddTask"
-	MatchingService_PollTask_FullMethodName = "/matching.MatchingService/PollTask"
-	MatchingService_AckTask_FullMethodName  = "/matching.MatchingService/AckTask"
-	MatchingService_NackTask_FullMethodName = "/matching.MatchingService/NackTask"
+	MatchingService_AddTask_FullMethodName      = "/matching.MatchingService/AddTask"
+	MatchingService_PollTask_FullMethodName     = "/matching.MatchingService/PollTask"
+	MatchingService_AckTask_FullMethodName      = "/matching.MatchingService/AckTask"
+	MatchingService_NackTask_FullMethodName     = "/matching.MatchingService/NackTask"
+	MatchingService_GetQueueInfo_FullMethodName = "/matching.MatchingService/GetQueueInfo"
 )
 
 // MatchingServiceClient is the client API for MatchingService service.
@@ -36,6 +37,7 @@ type MatchingServiceClient interface {
 	PollTask(ctx context.Context, in *PollTaskRequest, opts ...grpc.CallOption) (*PollTaskResponse, error)
 	AckTask(ctx context.Context, in *AckTaskRequest, opts ...grpc.CallOption) (*AckTaskResponse, error)
 	NackTask(ctx context.Context, in *NackTaskRequest, opts ...grpc.CallOption) (*NackTaskResponse, error)
+	GetQueueInfo(ctx context.Context, in *GetQueueInfoRequest, opts ...grpc.CallOption) (*GetQueueInfoResponse, error)
 }
 
 type matchingServiceClient struct {
@@ -86,6 +88,16 @@ func (c *matchingServiceClient) NackTask(ctx context.Context, in *NackTaskReques
 	return out, nil
 }
 
+func (c *matchingServiceClient) GetQueueInfo(ctx context.Context, in *GetQueueInfoRequest, opts ...grpc.CallOption) (*GetQueueInfoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetQueueInfoResponse)
+	err := c.cc.Invoke(ctx, MatchingService_GetQueueInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // MatchingServiceServer is the server API for MatchingService service.
 // All implementations must embed UnimplementedMatchingServiceServer
 // for forward compatibility.
@@ -97,6 +109,7 @@ type MatchingServiceServer interface {
 	PollTask(context.Context, *PollTaskRequest) (*PollTaskResponse, error)
 	AckTask(context.Context, *AckTaskRequest) (*AckTaskResponse, error)
 	NackTask(context.Context, *NackTaskRequest) (*NackTaskResponse, error)
+	GetQueueInfo(context.Context, *GetQueueInfoRequest) (*GetQueueInfoResponse, error)
 	mustEmbedUnimplementedMatchingServiceServer()
 }
 
@@ -118,6 +131,9 @@ func (UnimplementedMatchingServiceServer) AckTask(context.Context, *AckTaskReque
 }
 func (UnimplementedMatchingServiceServer) NackTask(context.Context, *NackTaskRequest) (*NackTaskResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method NackTask not implemented")
+}
+func (UnimplementedMatchingServiceServer) GetQueueInfo(context.Context, *GetQueueInfoRequest) (*GetQueueInfoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetQueueInfo not implemented")
 }
 func (UnimplementedMatchingServiceServer) mustEmbedUnimplementedMatchingServiceServer() {}
 func (UnimplementedMatchingServiceServer) testEmbeddedByValue()                         {}
@@ -212,6 +228,24 @@ func _MatchingService_NackTask_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MatchingService_GetQueueInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetQueueInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).GetQueueInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_GetQueueInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).GetQueueInfo(ctx, req.(*GetQueueInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // MatchingService_ServiceDesc is the grpc.ServiceDesc for MatchingService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -234,6 +268,10 @@ var MatchingService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "NackTask",
 			Handler:    _MatchingService_NackTask_Handler,
+		},
+		{
+			MethodName: "GetQueueInfo",
+			Handler:    _MatchingService_GetQueueInfo_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

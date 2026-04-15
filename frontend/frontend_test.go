@@ -2,6 +2,7 @@ package frontend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -128,11 +129,11 @@ func TestFrontend_EndToEnd(t *testing.T) {
 	_ = addr
 
 	fe, err := New(Config{
-		Monitor:       monitor,
-		QueueName:     "test-q",
-		NumPartitions: 4,
-		DialOpts:      []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-		PollTimeout:   2 * time.Second,
+		Monitor:   monitor,
+		QueueName: "test-q",
+
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 2 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -171,11 +172,11 @@ func TestFrontend_NackRedelivery(t *testing.T) {
 
 	monitor := &stubMonitor{resolver: resolver}
 	fe, err := New(Config{
-		Monitor:       monitor,
-		QueueName:     "test-q",
-		NumPartitions: 4,
-		DialOpts:      []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-		PollTimeout:   2 * time.Second,
+		Monitor:   monitor,
+		QueueName: "test-q",
+
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 2 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -209,11 +210,11 @@ func TestFrontend_MultipleEnqueue(t *testing.T) {
 
 	monitor := &stubMonitor{resolver: resolver}
 	fe, err := New(Config{
-		Monitor:       monitor,
-		QueueName:     "test-q",
-		NumPartitions: 4,
-		DialOpts:      []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-		PollTimeout:   2 * time.Second,
+		Monitor:   monitor,
+		QueueName: "test-q",
+
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 2 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -253,11 +254,11 @@ func TestFrontend_WorkerConcurrent(t *testing.T) {
 
 	monitor := &stubMonitor{resolver: resolver}
 	fe, err := New(Config{
-		Monitor:       monitor,
-		QueueName:     "work-q",
-		NumPartitions: 4,
-		DialOpts:      []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-		PollTimeout:   5 * time.Second,
+		Monitor:   monitor,
+		QueueName: "work-q",
+
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -326,11 +327,11 @@ func TestFrontend_WorkerLongPoll(t *testing.T) {
 
 	monitor := &stubMonitor{resolver: resolver}
 	fe, err := New(Config{
-		Monitor:       monitor,
-		QueueName:     "poll-q",
-		NumPartitions: 4,
-		DialOpts:      []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-		PollTimeout:   5 * time.Second,
+		Monitor:   monitor,
+		QueueName: "poll-q",
+
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)

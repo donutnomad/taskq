@@ -88,6 +88,14 @@ func (h *matchingHandler) NackTask(ctx context.Context, req *NackTaskRequest) (*
 	return &NackTaskResponse{}, nil
 }
 
+func (h *matchingHandler) GetQueueInfo(_ context.Context, req *GetQueueInfoRequest) (*GetQueueInfoResponse, error) {
+	n, ok := h.mgr.getQueuePartitionCount(req.QueueName)
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "queue %q not found", req.QueueName)
+	}
+	return &GetQueueInfoResponse{NumPartitions: int32(n)}, nil
+}
+
 // toGRPCError 将内部错误转换为 gRPC status error
 func toGRPCError(err error) error {
 	if err == nil {

@@ -132,11 +132,9 @@ func (dm *dbTaskManager) advanceAckLevel() {
 		if _, inFlight := dm.outstanding[next]; inFlight {
 			break
 		}
-		// 如果 next 在 redelivery 中，跳过（不阻塞推进）
+		// 如果 next 在 redelivery 中，必须阻塞推进（防止 GC 删除未消费的任务）
 		if dm.inRedelivery(next) {
-			dm.ackLevel = next
-			delete(dm.acked, next)
-			continue
+			break
 		}
 		// 如果 next 已 ack，推进
 		if dm.acked[next] {

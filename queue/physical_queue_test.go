@@ -10,7 +10,7 @@ func newTestPhysicalQueue(t *testing.T) (*PhysicalQueue, Store) {
 	t.Helper()
 	s := newTestStore(t)
 	ctx := context.Background()
-	pq, err := newPhysicalQueue(ctx, s, "test-q", 0, 60*time.Second)
+	pq, err := newPhysicalQueue(ctx, s, "test-q", 0, 60*time.Second, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}

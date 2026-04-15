@@ -7,6 +7,7 @@ package frontend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// ErrNoTask 队列为空，长轮询超时后无可用任务
+var ErrNoTask = errors.New("no task available")
 
 const (
 	defaultPollTimeout = 30 * time.Second
@@ -34,8 +38,6 @@ type Config struct {
 	ServiceName string
 	// QueueName 队列名称
 	QueueName string
-	// NumPartitions 分区数（必须与 matching 服务配置一致）
-	NumPartitions int
 	// DialOpts gRPC 拨号选项，默认使用 insecure
 	DialOpts []grpc.DialOption
 	// PollTimeout Dequeue 长轮询超时，默认 30s
@@ -44,15 +46,16 @@ type Config struct {
 
 // Frontend 是分布式队列的客户端路由器
 type Frontend struct {
-	cfg        Config
-	resolver   membership.ServiceResolver
-	pool       *connPool
-	changeCh   chan *membership.ChangedEvent
-	enqueueIdx atomic.Int64
-	pollIdx    atomic.Int64
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	cfg           Config
+	resolver      membership.ServiceResolver
+	pool          *connPool
+	changeCh      chan *membership.ChangedEvent
+	numPartitions int
+	enqueueIdx    atomic.Int64
+	pollIdx       atomic.Int64
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
 }
 
 // New 创建并启动 Frontend 路由器
@@ -62,9 +65,6 @@ func New(cfg Config) (*Frontend, error) {
 	}
 	if cfg.QueueName == "" {
 		return nil, fmt.Errorf("frontend: QueueName is required")
-	}
-	if cfg.NumPartitions <= 0 {
-		return nil, fmt.Errorf("frontend: NumPartitions must be > 0")
 	}
 	if cfg.ServiceName == "" {
 		cfg.ServiceName = defaultServiceName
@@ -87,6 +87,15 @@ func New(cfg Config) (*Frontend, error) {
 		cancel:   cancel,
 	}
 
+	// 通过 gRPC 查询分区数
+	numPartitions, err := f.fetchNumPartitions(ctx)
+	if err != nil {
+		cancel()
+		f.pool.close()
+		return nil, err
+	}
+	f.numPartitions = numPartitions
+
 	// 监听成员变化，清理已离开节点的连接
 	f.changeCh = make(chan *membership.ChangedEvent, 10)
 	if err := resolver.AddListener("frontend", f.changeCh); err != nil {
@@ -100,7 +109,7 @@ func New(cfg Config) (*Frontend, error) {
 
 // Enqueue 写入任务，round-robin 选分区后路由到对应 matching 节点
 func (f *Frontend) Enqueue(ctx context.Context, data []byte) error {
-	partID := int(f.enqueueIdx.Add(1)) % f.cfg.NumPartitions
+	partID := int(f.enqueueIdx.Add(1)) % f.numPartitions
 
 	for attempt := range defaultMaxRetries {
 		client, err := f.getPartitionClient(f.cfg.QueueName, partID)
@@ -128,11 +137,11 @@ func (f *Frontend) Enqueue(ctx context.Context, data []byte) error {
 
 // Dequeue 消费任务：快速扫描所有分区 → 长轮询
 func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
-	startIdx := int(f.pollIdx.Add(1)) % f.cfg.NumPartitions
+	startIdx := int(f.pollIdx.Add(1)) % f.numPartitions
 
 	// 阶段 1：快速扫描，非阻塞尝试所有分区
-	for i := range f.cfg.NumPartitions {
-		pid := (startIdx + i) % f.cfg.NumPartitions
+	for i := range f.numPartitions {
+		pid := (startIdx + i) % f.numPartitions
 
 		client, err := f.getPartitionClient(f.cfg.QueueName, pid)
 		if err != nil {
@@ -168,7 +177,7 @@ func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
 		return nil, "", fmt.Errorf("frontend: dequeue: %w", err)
 	}
 	if resp.Empty {
-		return nil, "", ctx.Err()
+		return nil, "", ErrNoTask
 	}
 	return resp.Data, resp.Token, nil
 }
@@ -267,6 +276,26 @@ func (f *Frontend) watchMembershipChanges() {
 			}
 		}
 	}
+}
+
+// fetchNumPartitions 从 matching 服务查询队列的分区数
+func (f *Frontend) fetchNumPartitions(ctx context.Context) (int, error) {
+	host, err := f.resolver.Lookup(f.cfg.QueueName)
+	if err != nil {
+		return 0, fmt.Errorf("frontend: lookup matching node: %w", err)
+	}
+	client, err := f.pool.getClient(host.GetAddress())
+	if err != nil {
+		return 0, fmt.Errorf("frontend: connect matching node: %w", err)
+	}
+	resp, err := client.GetQueueInfo(ctx, &matching.GetQueueInfoRequest{QueueName: f.cfg.QueueName})
+	if err != nil {
+		return 0, fmt.Errorf("frontend: get queue info: %w", err)
+	}
+	if resp.NumPartitions <= 0 {
+		return 0, fmt.Errorf("frontend: invalid partition count %d for queue %q", resp.NumPartitions, f.cfg.QueueName)
+	}
+	return int(resp.NumPartitions), nil
 }
 
 // isRetryable 判断 gRPC 错误是否可重试（分区所有权转移）
