@@ -1,10 +1,11 @@
-// Package ringpop 封装了 Temporal 的节点成员发现和一致性哈希路由能力。
+// Package ringpop 封装了节点成员发现和一致性哈希路由能力。
 // 对外暴露 Monitor 和 ServiceResolver 两个核心接口。
 package ringpop
 
 import (
 	"context"
 	"errors"
+	"net"
 	"time"
 )
 
@@ -45,14 +46,14 @@ func (a hostAddress) Identity() string   { return string(a) }
 // ---- Monitor 接口 ----
 //
 // Monitor 是整个成员管理的顶层接口。
-// 你的每个服务节点启动时调用 Start()，关闭时调用 Stop()/EvictSelf()。
+// 你的每个服务节点启动时调用 Start()，关闭时调用 Stop()。
 // 通过 GetResolver(serviceName) 拿到对应服务的哈希环，再用 Lookup(key) 找负责该 key 的节点。
 type Monitor interface {
-	// Start 加入 Gossip 环，在节点准备好接受请求后调用
+	// Start 启动成员管理，在节点准备好接受请求后调用
 	Start()
 	// Stop 停止 Monitor
 	Stop()
-	// EvictSelf 主动离开 Gossip 环（用于优雅下线）
+	// EvictSelf 主动离开（用于优雅下线）
 	EvictSelf() error
 	// EvictSelfAt 在指定时间离开（用于滚动发布，让流量提前切走）
 	// 返回值是建议的等待时长，调用方应等待该时长后再退出进程
@@ -63,10 +64,10 @@ type Monitor interface {
 	GetReachableMembers() ([]string, error)
 	// WaitUntilInitialized 阻塞直到初始化完成
 	WaitUntilInitialized(context.Context) error
-	// SetDraining 设置本节点是否处于 draining 状态（通过 Gossip 传播给所有节点）
-	// draining=true 时该节点不会被 AvailableMembers 返回，但仍在环中
+	// SetDraining 设置本节点是否处于 draining 状态
+	// draining=true 时该节点不会被 AvailableMembers 返回
 	SetDraining(draining bool) error
-	// ApproximateMaxPropagationTime 返回 Gossip 传播的近似上界时间
+	// ApproximateMaxPropagationTime 返回成员变更传播的近似上界时间
 	ApproximateMaxPropagationTime() time.Duration
 }
 
@@ -74,12 +75,10 @@ type Monitor interface {
 //
 // ServiceResolver 是某个服务的一致性哈希环视图。
 // 核心用法：Lookup(key) → 返回负责该 key 的节点地址。
-// key 通常是：namespaceId + ":" + taskQueueName + ":" + taskType
 type ServiceResolver interface {
-	// Lookup 用一致性哈希找到负责 key 的节点（确定性，同样 key 始终返回同一节点）
+	// Lookup 用一致性哈希找到负责 key 的节点
 	Lookup(key string) (HostInfo, error)
 	// LookupN 找 n 个节点（用于副本或 spreading）
-	// 保证 LookupN(key,n)[0] == Lookup(key)
 	LookupN(key string, n int) []HostInfo
 	// AddListener 注册监听器，成员变化时向 notifyChannel 发送事件
 	AddListener(name string, notifyChannel chan<- *ChangedEvent) error
@@ -93,6 +92,42 @@ type ServiceResolver interface {
 	Members() []HostInfo
 	// AvailableMembers 返回非 draining 节点
 	AvailableMembers() []HostInfo
-	// RequestRefresh 请求立即刷新环（通常不需要手动调用）
+	// RequestRefresh 请求立即刷新环
 	RequestRefresh()
+}
+
+// ---- 持久化接口 ----
+
+// MemberStore 是 Monitor 依赖的持久化接口。
+// 用 MySQL/PostgreSQL/Redis 等实现这个接口即可。
+type MemberStore interface {
+	// UpsertMember 写入或更新本节点的心跳记录
+	UpsertMember(ctx context.Context, req UpsertMemberRequest) error
+	// GetActiveMembers 查询最近有心跳的节点列表
+	GetActiveMembers(ctx context.Context, lastHeartbeatWithin time.Duration) ([]MemberRecord, error)
+	// PruneExpiredMembers 清理过期记录（可选，防止表无限增长）
+	PruneExpiredMembers(ctx context.Context, maxCount int) error
+}
+
+// UpsertMemberRequest 写入心跳时的请求参数
+type UpsertMemberRequest struct {
+	ServiceName  string
+	RPCAddress   net.IP
+	RPCPort      uint16
+	HostID       []byte
+	SessionStart time.Time
+	RecordExpiry time.Duration
+	Draining     bool
+	StartAt      int64 // unix 秒，0 表示立即生效
+	StopAt       int64 // unix 秒，0 表示不设置下线时间
+}
+
+// MemberRecord 从 DB 读取的节点记录
+type MemberRecord struct {
+	RPCAddress  net.IP
+	RPCPort     uint16
+	ServiceName string
+	Draining    bool
+	StartAt     int64 // unix 秒，0 表示立即生效
+	StopAt      int64 // unix 秒，0 表示永不主动下线
 }
