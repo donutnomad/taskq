@@ -49,15 +49,8 @@ func main() {
 
 	myGRPCAddr := "10.0.0.2:7235" // 本节点 gRPC 地址
 
-	services := map[string]int{
-		"matching": 7235,
-		"history":  7234,
-		"frontend": 7233,
-	}
-
 	monitor := membership.NewMonitor(
-		"matching",     // 本节点的服务角色
-		services,       // 集群所有角色及其端口
+		[]string{"matching", "history", "frontend"}, // 本节点承担的服务角色列表
 		store,
 		myGRPCAddr,    // gRPC 广播地址
 		5*time.Second, // pollInterval：DB 轮询间隔

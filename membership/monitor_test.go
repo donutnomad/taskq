@@ -61,8 +61,7 @@ func TestMonitorStartStop(t *testing.T) {
 	}
 
 	m := NewMonitor(
-		"matching",
-		map[string]int{"matching": 7233},
+		[]string{"matching"},
 		store,
 		"127.0.0.1:7233",
 		5*time.Second,
@@ -97,8 +96,7 @@ func TestMonitorGetResolver(t *testing.T) {
 	}
 
 	m := NewMonitor(
-		"matching",
-		map[string]int{"matching": 7235, "history": 7234},
+		[]string{"matching"},
 		store,
 		"10.0.0.1:7235",
 		100*time.Millisecond,
@@ -138,8 +136,7 @@ func TestMonitorSetDraining(t *testing.T) {
 	}
 
 	m := NewMonitor(
-		"matching",
-		map[string]int{"matching": 7235},
+		[]string{"matching"},
 		store,
 		"10.0.0.1:7235",
 		100*time.Millisecond,
@@ -175,8 +172,7 @@ func TestEvictSelfAtReturnValue(t *testing.T) {
 
 	propagationTime := 3 * time.Second
 	m := NewMonitor(
-		"matching",
-		map[string]int{"matching": 7235},
+		[]string{"matching"},
 		store,
 		"10.0.0.1:7235",
 		100*time.Millisecond,
@@ -209,8 +205,7 @@ func TestMonitorHeartbeat(t *testing.T) {
 	store := &stubStore{}
 
 	m := NewMonitor(
-		"history",
-		map[string]int{"history": 7234},
+		[]string{"history"},
 		store,
 		"10.0.0.5:7234",
 		50*time.Millisecond,
@@ -233,4 +228,67 @@ func TestMonitorHeartbeat(t *testing.T) {
 
 	m.Stop()
 	fmt.Printf("heartbeat count: %d\n", upsertCount)
+}
+
+func TestMonitorMultiServiceNames(t *testing.T) {
+	store := &stubStore{}
+
+	m := NewMonitor(
+		[]string{"matching", "history"},
+		store,
+		"10.0.0.1:7235",
+		100*time.Millisecond,
+		time.Second,
+		time.Time{},
+		200,
+	)
+	m.Start()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = m.WaitUntilInitialized(ctx)
+
+	// 验证心跳为两个 serviceName 各写了记录
+	store.mu.Lock()
+	serviceSet := make(map[string]bool)
+	for _, req := range store.upserts {
+		serviceSet[req.ServiceName] = true
+	}
+	store.mu.Unlock()
+
+	if !serviceSet["matching"] {
+		t.Fatal("expected heartbeat for matching")
+	}
+	if !serviceSet["history"] {
+		t.Fatal("expected heartbeat for history")
+	}
+
+	// 等待同步，使 resolver 能 Lookup 到本节点
+	time.Sleep(300 * time.Millisecond)
+
+	// 验证两个 resolver 都能 Lookup 到本节点
+	matchingResolver, err := m.GetResolver("matching")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := matchingResolver.Lookup("some-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.GetAddress() != "10.0.0.1:7235" {
+		t.Fatalf("expected 10.0.0.1:7235, got %s", host.GetAddress())
+	}
+
+	historyResolver, err := m.GetResolver("history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host2, err := historyResolver.Lookup("another-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host2.GetAddress() != "10.0.0.1:7235" {
+		t.Fatalf("expected 10.0.0.1:7235, got %s", host2.GetAddress())
+	}
+
+	m.Stop()
 }

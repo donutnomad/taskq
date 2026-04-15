@@ -27,9 +27,8 @@ type monitor struct {
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
 
-	serviceName string
-	services    map[string]int // serviceName → gRPC port
-	store       MemberStore
+	serviceNames []string
+	store        MemberStore
 
 	pollInterval    time.Duration
 	propagationTime time.Duration
@@ -50,8 +49,7 @@ var _ Monitor = (*monitor)(nil)
 // NewMonitor 创建一个 Monitor 实例。
 //
 // 参数：
-//   - serviceName: 本节点的服务角色名（如 "matching"）
-//   - services: 集群中所有服务角色及其 gRPC 端口
+//   - serviceNames: 本节点承担的服务角色列表（如 []string{"matching"} 或 []string{"matching", "history"}）
 //   - store: DB 操作接口
 //   - broadcastRPCAddress: 本节点 gRPC 地址，格式 "ip:rpcPort"
 //   - pollInterval: DB 轮询间隔（建议 3~10s）
@@ -59,8 +57,7 @@ var _ Monitor = (*monitor)(nil)
 //   - joinTime: 计划加入时间（零值表示立即加入）
 //   - replicaPoints: 一致性哈希虚拟节点数，建议 100~300
 func NewMonitor(
-	serviceName string,
-	services map[string]int,
+	serviceNames []string,
 	store MemberStore,
 	broadcastRPCAddress string,
 	pollInterval time.Duration,
@@ -74,8 +71,7 @@ func NewMonitor(
 	m := &monitor{
 		lifecycleCtx:        ctx,
 		lifecycleCancel:     cancel,
-		serviceName:         serviceName,
-		services:            services,
+		serviceNames:        serviceNames,
 		store:               store,
 		pollInterval:        pollInterval,
 		propagationTime:     propagationTime,
@@ -87,7 +83,7 @@ func NewMonitor(
 		initialized:         make(chan struct{}),
 	}
 
-	for svc := range services {
+	for _, svc := range serviceNames {
 		m.rings[svc] = newServiceResolver(svc, replicaPoints)
 	}
 	return m
@@ -194,8 +190,13 @@ func (m *monitor) SetDraining(draining bool) error {
 	if err != nil {
 		return err
 	}
-	req := m.buildUpsertRequest(host, uint16(rpcPort))
-	return m.store.UpsertMember(m.lifecycleCtx, req)
+	for _, svc := range m.serviceNames {
+		req := m.buildUpsertRequest(host, uint16(rpcPort), svc)
+		if err := m.store.UpsertMember(m.lifecycleCtx, req); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *monitor) ApproximateMaxPropagationTime() time.Duration {
@@ -226,8 +227,8 @@ func (m *monitor) syncMembers() error {
 
 	nowUnix := time.Now().Unix()
 
-	byService := make(map[string][]*hostInfo, len(m.services))
-	for svc := range m.services {
+	byService := make(map[string][]*hostInfo, len(m.rings))
+	for svc := range m.rings {
 		byService[svc] = nil
 	}
 
@@ -268,10 +269,11 @@ func (m *monitor) startHeartbeat() error {
 		return err
 	}
 
-	req := m.buildUpsertRequest(host, uint16(rpcPort))
-
-	if err = m.store.UpsertMember(m.lifecycleCtx, req); err != nil {
-		return err
+	for _, svc := range m.serviceNames {
+		req := m.buildUpsertRequest(host, uint16(rpcPort), svc)
+		if err = m.store.UpsertMember(m.lifecycleCtx, req); err != nil {
+			return err
+		}
 	}
 
 	m.wg.Add(1)
@@ -279,7 +281,7 @@ func (m *monitor) startHeartbeat() error {
 	return nil
 }
 
-func (m *monitor) buildUpsertRequest(host string, rpcPort uint16) UpsertMemberRequest {
+func (m *monitor) buildUpsertRequest(host string, rpcPort uint16, serviceName string) UpsertMemberRequest {
 	m.mu.Lock()
 	draining := m.draining
 	m.mu.Unlock()
@@ -290,7 +292,7 @@ func (m *monitor) buildUpsertRequest(host string, rpcPort uint16) UpsertMemberRe
 	}
 
 	return UpsertMemberRequest{
-		ServiceName:  m.serviceName,
+		ServiceName:  serviceName,
 		RPCAddress:   net.ParseIP(host),
 		RPCPort:      rpcPort,
 		HostID:       m.hostID,
@@ -304,8 +306,10 @@ func (m *monitor) buildUpsertRequest(host string, rpcPort uint16) UpsertMemberRe
 func (m *monitor) heartbeatLoop(host string, rpcPort uint16) {
 	defer m.wg.Done()
 	for {
-		req := m.buildUpsertRequest(host, rpcPort)
-		_ = m.store.UpsertMember(m.lifecycleCtx, req)
+		for _, svc := range m.serviceNames {
+			req := m.buildUpsertRequest(host, rpcPort, svc)
+			_ = m.store.UpsertMember(m.lifecycleCtx, req)
+		}
 		jitter := time.Duration(rand.Int63n(5000)) * time.Millisecond
 		select {
 		case <-m.lifecycleCtx.Done():
