@@ -167,6 +167,44 @@ func TestMonitorSetDraining(t *testing.T) {
 	m.Stop()
 }
 
+func TestEvictSelfAtReturnValue(t *testing.T) {
+	store := &stubStore{}
+	store.members = []MemberRecord{
+		{RPCAddress: net.ParseIP("10.0.0.1"), RPCPort: 7235, ServiceName: "matching"},
+	}
+
+	propagationTime := 3 * time.Second
+	m := NewMonitor(
+		"matching",
+		map[string]int{"matching": 7235},
+		store,
+		"10.0.0.1:7235",
+		100*time.Millisecond,
+		propagationTime,
+		time.Time{},
+		200,
+	)
+	m.Start()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = m.WaitUntilInitialized(ctx)
+	defer m.Stop()
+
+	// EvictSelfAt 5 秒后离开，propagationTime=3s
+	// 期望返回值约为 until + propagationTime = 5s + 3s = 8s
+	// Bug: 返回值是 until + 2*propagationTime = 5s + 6s = 11s
+	evictAt := time.Now().Add(5 * time.Second)
+	waitDuration, err := m.EvictSelfAt(evictAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	maxExpected := 5*time.Second + propagationTime + 500*time.Millisecond
+	if waitDuration > maxExpected {
+		t.Fatalf("EvictSelfAt returned %v, expected at most ~%v (double-counting propagationTime)", waitDuration, maxExpected)
+	}
+}
+
 func TestMonitorHeartbeat(t *testing.T) {
 	store := &stubStore{}
 

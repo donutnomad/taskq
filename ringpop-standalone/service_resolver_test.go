@@ -77,6 +77,20 @@ func TestServiceResolverChangedEvent(t *testing.T) {
 	}
 }
 
+func TestServiceResolverDoubleStop(t *testing.T) {
+	r := newServiceResolver("matching", 200)
+	r.Start()
+	r.Stop()
+
+	// 第二次调用 Stop() 不应 panic
+	defer func() {
+		if p := recover(); p != nil {
+			t.Fatalf("double Stop() panicked: %v", p)
+		}
+	}()
+	r.Stop()
+}
+
 func TestServiceResolverDuplicateListener(t *testing.T) {
 	r := newServiceResolver("matching", 200)
 	r.Start()

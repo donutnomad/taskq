@@ -3,7 +3,6 @@ package ringpop
 import (
 	"context"
 	"fmt"
-	"math"
 	"math/rand"
 	"net"
 	"strconv"
@@ -23,6 +22,7 @@ const (
 type monitor struct {
 	mu     sync.Mutex
 	status int32 // 0=init, 1=started, 2=stopped
+	wg     sync.WaitGroup
 
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
@@ -119,13 +119,14 @@ func (m *monitor) Start() {
 
 	close(m.initialized)
 
+	m.wg.Add(1)
 	go m.pollLoop()
 }
 
 func (m *monitor) Stop() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.status != 1 {
+		m.mu.Unlock()
 		return
 	}
 	m.status = 2
@@ -133,6 +134,8 @@ func (m *monitor) Stop() {
 	for _, ring := range m.rings {
 		ring.Stop()
 	}
+	m.mu.Unlock()
+	m.wg.Wait()
 }
 
 func (m *monitor) WaitUntilInitialized(ctx context.Context) error {
@@ -155,7 +158,7 @@ func (m *monitor) EvictSelfAt(asOf time.Time) (time.Duration, error) {
 	}
 	leaveAfter := until + m.propagationTime
 	time.AfterFunc(until, func() { _ = m.SetDraining(true) })
-	return leaveAfter + m.propagationTime, nil
+	return leaveAfter, nil
 }
 
 func (m *monitor) GetResolver(service string) (ServiceResolver, error) {
@@ -202,6 +205,7 @@ func (m *monitor) ApproximateMaxPropagationTime() time.Duration {
 // ---- 内部方法 ----
 
 func (m *monitor) pollLoop() {
+	defer m.wg.Done()
 	ticker := time.NewTicker(m.pollInterval)
 	defer ticker.Stop()
 	for {
@@ -270,6 +274,7 @@ func (m *monitor) startHeartbeat() error {
 		return err
 	}
 
+	m.wg.Add(1)
 	go m.heartbeatLoop(host, uint16(rpcPort))
 	return nil
 }
@@ -297,15 +302,15 @@ func (m *monitor) buildUpsertRequest(host string, rpcPort uint16) UpsertMemberRe
 }
 
 func (m *monitor) heartbeatLoop(host string, rpcPort uint16) {
+	defer m.wg.Done()
 	for {
+		req := m.buildUpsertRequest(host, rpcPort)
+		_ = m.store.UpsertMember(m.lifecycleCtx, req)
+		jitter := time.Duration(rand.Int63n(5000)) * time.Millisecond
 		select {
 		case <-m.lifecycleCtx.Done():
 			return
-		default:
+		case <-time.After(10*time.Second + jitter):
 		}
-		req := m.buildUpsertRequest(host, rpcPort)
-		_ = m.store.UpsertMember(m.lifecycleCtx, req)
-		jitter := time.Duration(math.Round(rand.Float64() * 5))
-		time.Sleep((10 + jitter) * time.Second)
 	}
 }

@@ -49,6 +49,11 @@ func (r *serviceResolver) Start() {
 func (r *serviceResolver) Stop() {
 	r.listenerLock.Lock()
 	defer r.listenerLock.Unlock()
+	select {
+	case <-r.shutdownCh:
+		return // already stopped
+	default:
+	}
 	r.ringAndHosts.Store(ringAndHosts{
 		ring:  newHashRing(r.replicaPoints),
 		hosts: nil,
