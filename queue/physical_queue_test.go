@@ -1,0 +1,103 @@
+package queue
+
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+func newTestPhysicalQueue(t *testing.T) (*PhysicalQueue, Store) {
+	t.Helper()
+	s := newTestStore(t)
+	ctx := context.Background()
+	pq, err := newPhysicalQueue(ctx, s, "test-q", 0, 60*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pq.close() })
+	return pq, s
+}
+
+func TestPhysicalQueue_AddAndPoll(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+	ctx := context.Background()
+
+	if err := pq.addTask(ctx, []byte(`{"type":"workflow"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	row, token, ok := pq.tryPoll(ctx)
+	if !ok {
+		t.Fatal("expected task")
+	}
+	if row == nil || token == "" {
+		t.Fatal("expected non-nil row and token")
+	}
+}
+
+func TestPhysicalQueue_SyncMatch(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+	ctx := context.Background()
+
+	// 先注册 waiter
+	ch := make(chan PollResult, 1)
+	pq.registerWaiter(ch)
+
+	// 写入任务，应通过 sync match 投递给 waiter
+	if err := pq.addTask(ctx, []byte(`{"type":"activity"}`)); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-ch:
+		if result.Row == nil {
+			t.Fatal("expected task in sync match result")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for sync match")
+	}
+}
+
+func TestPhysicalQueue_AckAndNack(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+	ctx := context.Background()
+
+	pq.addTask(ctx, []byte("task1"))
+	pq.addTask(ctx, []byte("task2"))
+
+	r1, tok1, _ := pq.tryPoll(ctx)
+	r2, tok2, _ := pq.tryPoll(ctx)
+	_ = r1
+	_ = r2
+
+	// ack task 1
+	pq.ack(ctx, tok1)
+
+	// nack task 2
+	pq.nack(ctx, tok2)
+
+	// nack 后 task2 应可再次被 poll
+	r3, _, ok := pq.tryPoll(ctx)
+	if !ok {
+		t.Fatal("expected redelivered task after nack")
+	}
+	if string(r3.Data) != "task2" {
+		t.Fatalf("expected task2, got %s", r3.Data)
+	}
+}
+
+func TestPhysicalQueue_BlockingPoll(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	ch := make(chan PollResult, 1)
+	pq.registerWaiter(ch)
+
+	select {
+	case <-ch:
+		t.Fatal("should not get task")
+	case <-ctx.Done():
+		// 正常超时
+	}
+}

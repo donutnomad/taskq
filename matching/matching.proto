@@ -1,0 +1,44 @@
+syntax = "proto3";
+package matching;
+option go_package = "github.com/donutnomad/taskq/matching";
+
+// MatchingService 是分区级任务队列的 gRPC 端点。
+// 每个 matching 节点只服务哈希环分配给自己的分区。
+service MatchingService {
+    rpc AddTask(AddTaskRequest) returns (AddTaskResponse);
+    rpc PollTask(PollTaskRequest) returns (PollTaskResponse);
+    rpc AckTask(AckTaskRequest) returns (AckTaskResponse);
+    rpc NackTask(NackTaskRequest) returns (NackTaskResponse);
+}
+
+message AddTaskRequest {
+    string queue_name = 1;
+    int32 partition_id = 2;
+    bytes data = 3;
+}
+message AddTaskResponse {}
+
+message PollTaskRequest {
+    string queue_name = 1;
+    int32 partition_id = 2;
+    int64 poll_timeout_ms = 3; // 0=非阻塞，>0=长轮询毫秒数
+}
+message PollTaskResponse {
+    bool empty = 1;    // true=无任务
+    bytes data = 2;
+    string token = 3;  // ack/nack 用的 token
+}
+
+message AckTaskRequest {
+    string queue_name = 1;
+    int32 partition_id = 2;
+    string token = 3;
+}
+message AckTaskResponse {}
+
+message NackTaskRequest {
+    string queue_name = 1;
+    int32 partition_id = 2;
+    string token = 3;
+}
+message NackTaskResponse {}
