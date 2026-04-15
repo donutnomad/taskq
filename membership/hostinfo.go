@@ -1,4 +1,4 @@
-package ringpop
+package membership
 
 import "github.com/dgryski/go-farm"
 

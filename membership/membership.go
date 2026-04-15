@@ -1,6 +1,6 @@
-// Package ringpop 封装了节点成员发现和一致性哈希路由能力。
+// Package membership 封装了节点成员发现和一致性哈希路由能力。
 // 对外暴露 Monitor 和 ServiceResolver 两个核心接口。
-package ringpop
+package membership
 
 import (
 	"context"
