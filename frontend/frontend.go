@@ -161,25 +161,53 @@ func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
 		}
 	}
 
-	// 阶段 2：长轮询起始分区
-	pid := startIdx
-	client, err := f.getPartitionClient(f.cfg.QueueName, pid)
-	if err != nil {
-		return nil, "", fmt.Errorf("frontend: dequeue: %w", err)
+	// 阶段 2：并发长轮询所有分区，任一分区返回任务即取消其余
+	type pollResult struct {
+		data  []byte
+		token string
+		err   error
+	}
+	pollCtx, pollCancel := context.WithTimeout(ctx, f.cfg.PollTimeout+5*time.Second)
+	defer pollCancel()
+
+	resultCh := make(chan pollResult, f.numPartitions)
+	for i := range f.numPartitions {
+		pid := (startIdx + i) % f.numPartitions
+		go func() {
+			client, err := f.getPartitionClient(f.cfg.QueueName, pid)
+			if err != nil {
+				resultCh <- pollResult{err: err}
+				return
+			}
+			resp, err := client.PollTask(pollCtx, &matching.PollTaskRequest{
+				QueueName:     f.cfg.QueueName,
+				PartitionId:   int32(pid),
+				PollTimeoutMs: f.cfg.PollTimeout.Milliseconds(),
+			})
+			if err != nil {
+				resultCh <- pollResult{err: err}
+				return
+			}
+			if resp.Empty {
+				resultCh <- pollResult{err: ErrNoTask}
+				return
+			}
+			resultCh <- pollResult{data: resp.Data, token: resp.Token}
+		}()
 	}
 
-	resp, err := client.PollTask(ctx, &matching.PollTaskRequest{
-		QueueName:     f.cfg.QueueName,
-		PartitionId:   int32(pid),
-		PollTimeoutMs: f.cfg.PollTimeout.Milliseconds(),
-	})
-	if err != nil {
-		return nil, "", fmt.Errorf("frontend: dequeue: %w", err)
+	for range f.numPartitions {
+		r := <-resultCh
+		if r.err == nil {
+			pollCancel()
+			return r.data, r.token, nil
+		}
 	}
-	if resp.Empty {
-		return nil, "", ErrNoTask
+	// 如果调用方 context 已取消，传播取消错误
+	if ctx.Err() != nil {
+		return nil, "", fmt.Errorf("frontend: dequeue: %w", ctx.Err())
 	}
-	return resp.Data, resp.Token, nil
+	return nil, "", ErrNoTask
 }
 
 // Ack 确认消费完成
@@ -304,5 +332,5 @@ func isRetryable(err error) bool {
 	if !ok {
 		return false
 	}
-	return s.Code() == codes.FailedPrecondition || s.Code() == codes.Unavailable
+	return s.Code() == codes.FailedPrecondition || s.Code() == codes.Unavailable || s.Code() == codes.Aborted
 }

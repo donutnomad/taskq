@@ -150,7 +150,7 @@ func (m *monitor) EvictSelf() error {
 
 func (m *monitor) EvictSelfAt(asOf time.Time) (time.Duration, error) {
 	until := time.Until(asOf)
-	if until <= 0 || until.Seconds() >= maxScheduledEventTimeSeconds {
+	if until <= 0 {
 		return 0, m.SetDraining(true)
 	}
 	leaveAfter := until + m.propagationTime
@@ -171,9 +171,14 @@ func (m *monitor) GetReachableMembers() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	seen := make(map[string]struct{}, len(members))
 	result := make([]string, 0, len(members))
 	for _, rec := range members {
-		result = append(result, net.JoinHostPort(rec.RPCAddress.String(), strconv.Itoa(int(rec.RPCPort))))
+		addr := net.JoinHostPort(rec.RPCAddress.String(), strconv.Itoa(int(rec.RPCPort)))
+		if _, dup := seen[addr]; !dup {
+			seen[addr] = struct{}{}
+			result = append(result, addr)
+		}
 	}
 	return result, nil
 }

@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -39,7 +40,10 @@ func (o *ownershipState) updateQueue(ctx context.Context, info *QueueInfo) error
 	info.RangeID = newRangeID
 
 	if err := o.store.UpdateQueue(ctx, info, prevRangeID); err != nil {
-		return ErrOwnershipLost
+		if errors.Is(err, ErrConditionFailed) {
+			return ErrOwnershipLost
+		}
+		return err
 	}
 
 	o.rangeID = newRangeID
