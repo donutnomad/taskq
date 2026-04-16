@@ -196,8 +196,7 @@ func main() {
 	fmt.Println()
 
 	// ===== 测试 3: 长轮询 =====
-	// 由于 Dequeue 的长轮询阶段只等待一个分区，而 Enqueue 的 round-robin
-	// 可能把消息分配到其他分区，这里用循环 Dequeue 模拟真实 worker 行为。
+	// Frontend 会并发长轮询所有分区，这里直接等待一次 Dequeue 返回即可。
 	fmt.Println("=== 测试 3: 长轮询 ===")
 	fmt.Println("[消费者] 启动长轮询（队列为空）...")
 
@@ -208,16 +207,10 @@ func main() {
 	}
 	ch := make(chan dequeueResult, 1)
 	go func() {
-		// 真实 worker 会循环调用 Dequeue 直到拿到任务
-		for {
-			pollCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-			d, t, e := fe.Dequeue(pollCtx)
-			cancel()
-			if e == nil && len(d) > 0 {
-				ch <- dequeueResult{d, t, nil}
-				return
-			}
-		}
+		pollCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		d, t, e := fe.Dequeue(pollCtx)
+		ch <- dequeueResult{d, t, e}
 	}()
 
 	time.Sleep(500 * time.Millisecond)

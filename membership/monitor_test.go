@@ -293,3 +293,23 @@ func TestMonitorMultiServiceNames(t *testing.T) {
 
 	m.Stop()
 }
+
+func TestMonitorBuildUpsertRequestPreservesFutureJoinTime(t *testing.T) {
+	store := &stubStore{}
+	joinAt := time.Now().Add(20 * time.Second).Truncate(time.Second)
+
+	m := NewMonitor(
+		[]string{"matching"},
+		store,
+		netip.MustParseAddrPort("10.0.0.1:7235"),
+		100*time.Millisecond,
+		time.Second,
+		joinAt,
+		200,
+	).(*monitor)
+
+	req := m.buildUpsertRequest("matching")
+	if req.StartAt != joinAt.Unix() {
+		t.Fatalf("expected future join time %d to be preserved, got %d", joinAt.Unix(), req.StartAt)
+	}
+}

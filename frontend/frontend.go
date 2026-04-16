@@ -25,10 +25,13 @@ import (
 var ErrNoTask = errors.New("no task available")
 
 const (
-	defaultPollTimeout = 30 * time.Second
-	defaultMaxRetries  = 3
-	defaultServiceName = "matching"
+	defaultPollTimeout  = 30 * time.Second
+	defaultMaxRetries   = 3
+	defaultRetryBackoff = 50 * time.Millisecond
+	defaultServiceName  = "matching"
 )
+
+var frontendListenerSeq atomic.Int64
 
 // Config 前端路由配置
 type Config struct {
@@ -50,6 +53,7 @@ type Frontend struct {
 	resolver      membership.ServiceResolver
 	pool          *connPool
 	changeCh      chan *membership.ChangedEvent
+	listenerName  string
 	numPartitions int
 	enqueueIdx    atomic.Int64
 	pollIdx       atomic.Int64
@@ -80,11 +84,12 @@ func New(cfg Config) (*Frontend, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &Frontend{
-		cfg:      cfg,
-		resolver: resolver,
-		pool:     newConnPool(cfg.DialOpts),
-		ctx:      ctx,
-		cancel:   cancel,
+		cfg:          cfg,
+		resolver:     resolver,
+		pool:         newConnPool(cfg.DialOpts),
+		listenerName: fmt.Sprintf("frontend-%d", frontendListenerSeq.Add(1)),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
 	// 通过 gRPC 查询分区数
@@ -98,8 +103,9 @@ func New(cfg Config) (*Frontend, error) {
 
 	// 监听成员变化，清理已离开节点的连接
 	f.changeCh = make(chan *membership.ChangedEvent, 10)
-	if err := resolver.AddListener("frontend", f.changeCh); err != nil {
+	if err := resolver.AddListener(f.listenerName, f.changeCh); err != nil {
 		cancel()
+		f.pool.close()
 		return nil, fmt.Errorf("frontend: add listener: %w", err)
 	}
 	f.wg.Go(f.watchMembershipChanges)
@@ -115,6 +121,9 @@ func (f *Frontend) Enqueue(ctx context.Context, data []byte) error {
 		client, err := f.getPartitionClient(f.cfg.QueueName, partID)
 		if err != nil {
 			if attempt < defaultMaxRetries-1 {
+				if retryErr := f.waitRetry(ctx); retryErr != nil {
+					return fmt.Errorf("frontend: enqueue: %w", retryErr)
+				}
 				continue
 			}
 			return fmt.Errorf("frontend: enqueue: %w", err)
@@ -131,6 +140,11 @@ func (f *Frontend) Enqueue(ctx context.Context, data []byte) error {
 		if !isRetryable(err) {
 			return fmt.Errorf("frontend: enqueue: %w", err)
 		}
+		if attempt < defaultMaxRetries-1 {
+			if retryErr := f.waitRetry(ctx); retryErr != nil {
+				return fmt.Errorf("frontend: enqueue: %w", retryErr)
+			}
+		}
 	}
 	return fmt.Errorf("frontend: enqueue: max retries exceeded")
 }
@@ -138,6 +152,8 @@ func (f *Frontend) Enqueue(ctx context.Context, data []byte) error {
 // Dequeue 消费任务：快速扫描所有分区 → 长轮询
 func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
 	startIdx := int(f.pollIdx.Add(1)) % f.numPartitions
+	var firstErr error
+	healthyResponses := 0
 
 	// 阶段 1：快速扫描，非阻塞尝试所有分区
 	for i := range f.numPartitions {
@@ -145,6 +161,9 @@ func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
 
 		client, err := f.getPartitionClient(f.cfg.QueueName, pid)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("frontend: dequeue partition %d: %w", pid, err)
+			}
 			continue
 		}
 
@@ -154,11 +173,18 @@ func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
 			PollTimeoutMs: 0, // 非阻塞
 		})
 		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("frontend: dequeue partition %d: %w", pid, err)
+			}
 			continue
 		}
+		healthyResponses++
 		if !resp.Empty {
 			return resp.Data, resp.Token, nil
 		}
+	}
+	if healthyResponses == 0 && firstErr != nil {
+		return nil, "", firstErr
 	}
 
 	// 阶段 2：并发长轮询所有分区，任一分区返回任务即取消其余
@@ -176,7 +202,7 @@ func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
 		go func() {
 			client, err := f.getPartitionClient(f.cfg.QueueName, pid)
 			if err != nil {
-				resultCh <- pollResult{err: err}
+				resultCh <- pollResult{err: fmt.Errorf("frontend: dequeue partition %d: %w", pid, err)}
 				return
 			}
 			resp, err := client.PollTask(pollCtx, &matching.PollTaskRequest{
@@ -185,7 +211,7 @@ func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
 				PollTimeoutMs: f.cfg.PollTimeout.Milliseconds(),
 			})
 			if err != nil {
-				resultCh <- pollResult{err: err}
+				resultCh <- pollResult{err: fmt.Errorf("frontend: dequeue partition %d: %w", pid, err)}
 				return
 			}
 			if resp.Empty {
@@ -196,16 +222,28 @@ func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
 		}()
 	}
 
+	firstErr = nil
+	sawEmpty := false
 	for range f.numPartitions {
 		r := <-resultCh
 		if r.err == nil {
 			pollCancel()
 			return r.data, r.token, nil
 		}
+		if errors.Is(r.err, ErrNoTask) {
+			sawEmpty = true
+			continue
+		}
+		if firstErr == nil {
+			firstErr = r.err
+		}
 	}
 	// 如果调用方 context 已取消，传播取消错误
 	if ctx.Err() != nil {
 		return nil, "", fmt.Errorf("frontend: dequeue: %w", ctx.Err())
+	}
+	if !sawEmpty && firstErr != nil {
+		return nil, "", firstErr
 	}
 	return nil, "", ErrNoTask
 }
@@ -221,6 +259,9 @@ func (f *Frontend) Ack(ctx context.Context, token string) error {
 		client, err := f.getPartitionClient(f.cfg.QueueName, partID)
 		if err != nil {
 			if attempt < defaultMaxRetries-1 {
+				if retryErr := f.waitRetry(ctx); retryErr != nil {
+					return fmt.Errorf("frontend: ack: %w", retryErr)
+				}
 				continue
 			}
 			return fmt.Errorf("frontend: ack: %w", err)
@@ -237,6 +278,11 @@ func (f *Frontend) Ack(ctx context.Context, token string) error {
 		if !isRetryable(err) {
 			return fmt.Errorf("frontend: ack: %w", err)
 		}
+		if attempt < defaultMaxRetries-1 {
+			if retryErr := f.waitRetry(ctx); retryErr != nil {
+				return fmt.Errorf("frontend: ack: %w", retryErr)
+			}
+		}
 	}
 	return fmt.Errorf("frontend: ack: max retries exceeded")
 }
@@ -252,6 +298,9 @@ func (f *Frontend) Nack(ctx context.Context, token string) error {
 		client, err := f.getPartitionClient(f.cfg.QueueName, partID)
 		if err != nil {
 			if attempt < defaultMaxRetries-1 {
+				if retryErr := f.waitRetry(ctx); retryErr != nil {
+					return fmt.Errorf("frontend: nack: %w", retryErr)
+				}
 				continue
 			}
 			return fmt.Errorf("frontend: nack: %w", err)
@@ -268,6 +317,11 @@ func (f *Frontend) Nack(ctx context.Context, token string) error {
 		if !isRetryable(err) {
 			return fmt.Errorf("frontend: nack: %w", err)
 		}
+		if attempt < defaultMaxRetries-1 {
+			if retryErr := f.waitRetry(ctx); retryErr != nil {
+				return fmt.Errorf("frontend: nack: %w", retryErr)
+			}
+		}
 	}
 	return fmt.Errorf("frontend: nack: max retries exceeded")
 }
@@ -275,7 +329,7 @@ func (f *Frontend) Nack(ctx context.Context, token string) error {
 // Close 关闭前端路由器
 func (f *Frontend) Close() {
 	f.cancel()
-	_ = f.resolver.RemoveListener("frontend")
+	_ = f.resolver.RemoveListener(f.listenerName)
 	f.pool.close()
 	f.wg.Wait()
 }
@@ -333,4 +387,20 @@ func isRetryable(err error) bool {
 		return false
 	}
 	return s.Code() == codes.FailedPrecondition || s.Code() == codes.Unavailable || s.Code() == codes.Aborted
+}
+
+func (f *Frontend) waitRetry(ctx context.Context) error {
+	f.resolver.RequestRefresh()
+
+	timer := time.NewTimer(defaultRetryBackoff)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-f.ctx.Done():
+		return context.Canceled
+	case <-timer.C:
+		return nil
+	}
 }

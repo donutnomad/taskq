@@ -3,7 +3,6 @@ package queue
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
@@ -49,6 +48,10 @@ func NewSQLiteStore(dsn string) (Store, error) {
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("set WAL mode: %w", err)
+	}
+	if _, err := db.Exec("PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set busy timeout: %w", err)
 	}
 	if _, err := db.Exec(sqliteSchema); err != nil {
 		db.Close()
@@ -215,21 +218,13 @@ func (s *sqliteStore) AcquireLease(ctx context.Context, queueName string, partit
 	now := time.Now()
 	expiresAt := now.Add(ttl)
 
-	// 确保 queue_info 行存在
-	_, err := s.GetQueue(ctx, queueName, partitionID)
-	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return nil, err
-		}
-		if err := s.CreateQueue(ctx, &QueueInfo{
-			QueueName:   queueName,
-			PartitionID: partitionID,
-			RangeID:     1,
-			AckLevel:    0,
-			NextTaskID:  1,
-		}); err != nil {
-			return nil, fmt.Errorf("create queue for lease: %w", err)
-		}
+	// 确保 queue_info 行存在。使用 INSERT OR IGNORE 避免并发初始化时的唯一键竞争。
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO queue_info
+		 (queue_name, partition_id, range_id, ack_level, next_task_id)
+		 VALUES (?, ?, 1, 0, 1)`,
+		queueName, partitionID); err != nil {
+		return nil, fmt.Errorf("ensure queue for lease: %w", err)
 	}
 
 	// 获取 lease + 递增 rangeID（原子操作）

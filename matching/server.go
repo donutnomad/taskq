@@ -67,6 +67,14 @@ func (h *matchingHandler) PollTask(ctx context.Context, req *PollTaskRequest) (*
 }
 
 func (h *matchingHandler) AckTask(ctx context.Context, req *AckTaskRequest) (*AckTaskResponse, error) {
+	partID, _, err := queue.ParseToken(req.Token)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if partID != int(req.PartitionId) {
+		return nil, status.Errorf(codes.InvalidArgument, "token partition %d does not match request partition %d", partID, req.PartitionId)
+	}
+
 	pq, err := h.mgr.getOrLoadPartition(req.QueueName, int(req.PartitionId))
 	if err != nil {
 		return nil, toGRPCError(err)
@@ -78,6 +86,14 @@ func (h *matchingHandler) AckTask(ctx context.Context, req *AckTaskRequest) (*Ac
 }
 
 func (h *matchingHandler) NackTask(ctx context.Context, req *NackTaskRequest) (*NackTaskResponse, error) {
+	partID, _, err := queue.ParseToken(req.Token)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if partID != int(req.PartitionId) {
+		return nil, status.Errorf(codes.InvalidArgument, "token partition %d does not match request partition %d", partID, req.PartitionId)
+	}
+
 	pq, err := h.mgr.getOrLoadPartition(req.QueueName, int(req.PartitionId))
 	if err != nil {
 		return nil, toGRPCError(err)

@@ -43,6 +43,9 @@ func (r *stubResolver) Lookup(key string) (membership.HostInfo, error) {
 }
 func (r *stubResolver) LookupN(_ string, _ int) []membership.HostInfo { return nil }
 func (r *stubResolver) AddListener(name string, ch chan<- *membership.ChangedEvent) error {
+	if _, ok := r.listeners[name]; ok {
+		return membership.ErrListenerAlreadyExist
+	}
 	r.listeners[name] = ch
 	return nil
 }
@@ -72,6 +75,73 @@ func (m *stubMonitor) WaitUntilInitialized(context.Context) error   { return nil
 func (m *stubMonitor) SetDraining(bool) error                       { return nil }
 func (m *stubMonitor) ApproximateMaxPropagationTime() time.Duration { return 0 }
 
+type refreshAwareResolver struct {
+	mu        sync.Mutex
+	current   string
+	next      string
+	refreshes int
+	listeners map[string]chan<- *membership.ChangedEvent
+}
+
+func newRefreshAwareResolver(current, next string) *refreshAwareResolver {
+	return &refreshAwareResolver{
+		current:   current,
+		next:      next,
+		listeners: make(map[string]chan<- *membership.ChangedEvent),
+	}
+}
+
+func (r *refreshAwareResolver) Lookup(_ string) (membership.HostInfo, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.refreshes > 0 {
+		return membership.NewHostInfoFromAddress(r.next), nil
+	}
+	return membership.NewHostInfoFromAddress(r.current), nil
+}
+
+func (r *refreshAwareResolver) LookupN(_ string, _ int) []membership.HostInfo { return nil }
+func (r *refreshAwareResolver) AddListener(name string, ch chan<- *membership.ChangedEvent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.listeners[name]; ok {
+		return membership.ErrListenerAlreadyExist
+	}
+	r.listeners[name] = ch
+	return nil
+}
+func (r *refreshAwareResolver) RemoveListener(name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.listeners, name)
+	return nil
+}
+func (r *refreshAwareResolver) MemberCount() int                        { return 1 }
+func (r *refreshAwareResolver) AvailableMemberCount() int               { return 1 }
+func (r *refreshAwareResolver) Members() []membership.HostInfo          { return nil }
+func (r *refreshAwareResolver) AvailableMembers() []membership.HostInfo { return nil }
+func (r *refreshAwareResolver) RequestRefresh() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.refreshes++
+}
+
+type refreshAwareMonitor struct {
+	resolver membership.ServiceResolver
+}
+
+func (m *refreshAwareMonitor) Start()                                       {}
+func (m *refreshAwareMonitor) Stop()                                        {}
+func (m *refreshAwareMonitor) EvictSelf() error                             { return nil }
+func (m *refreshAwareMonitor) EvictSelfAt(time.Time) (time.Duration, error) { return 0, nil }
+func (m *refreshAwareMonitor) GetResolver(string) (membership.ServiceResolver, error) {
+	return m.resolver, nil
+}
+func (m *refreshAwareMonitor) GetReachableMembers() ([]string, error)       { return nil, nil }
+func (m *refreshAwareMonitor) WaitUntilInitialized(context.Context) error   { return nil }
+func (m *refreshAwareMonitor) SetDraining(bool) error                       { return nil }
+func (m *refreshAwareMonitor) ApproximateMaxPropagationTime() time.Duration { return 0 }
+
 func newTestSQLiteStore(t *testing.T) queue.Store {
 	t.Helper()
 	store, err := queue.NewSQLiteStore(":memory:")
@@ -84,6 +154,12 @@ func newTestSQLiteStore(t *testing.T) queue.Store {
 
 // startMatchingServer 启动测试用 matching 服务，返回监听地址
 func startMatchingServer(t *testing.T, store queue.Store, resolver *stubResolver, queueConfigs map[string]int) string {
+	t.Helper()
+	_, addr := startMatchingServerWithHandle(t, store, resolver, queueConfigs)
+	return addr
+}
+
+func startMatchingServerWithHandle(t *testing.T, store queue.Store, resolver *stubResolver, queueConfigs map[string]int) (*matching.Server, string) {
 	t.Helper()
 
 	monitor := &stubMonitor{resolver: resolver}
@@ -115,7 +191,7 @@ func startMatchingServer(t *testing.T, store queue.Store, resolver *stubResolver
 	t.Cleanup(func() { srv.Stop() })
 
 	time.Sleep(50 * time.Millisecond)
-	return addr
+	return srv, addr
 }
 
 // ---- 测试 ----
@@ -396,5 +472,137 @@ func TestFrontend_DequeueEmpty_ReturnsErrNoTask(t *testing.T) {
 	_, _, err = fe.Dequeue(ctx)
 	if !errors.Is(err, ErrNoTask) {
 		t.Fatalf("expected ErrNoTask on empty queue, got %v", err)
+	}
+}
+
+func TestFrontend_DequeueReturnsUnderlyingErrorWhenAllPartitionsFail(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver()
+	srv, _ := startMatchingServerWithHandle(t, store, resolver, map[string]int{"down-q": 2})
+
+	monitor := &stubMonitor{resolver: resolver}
+	fe, err := New(Config{
+		Monitor:     monitor,
+		QueueName:   "down-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe.Close()
+
+	srv.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _, err = fe.Dequeue(ctx)
+	if err == nil {
+		t.Fatal("expected dequeue to surface the transport failure")
+	}
+	if errors.Is(err, ErrNoTask) {
+		t.Fatalf("expected transport failure, got ErrNoTask: %v", err)
+	}
+}
+
+func TestFrontend_AllowsMultipleInstancesOnSameResolver(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver()
+	startMatchingServer(t, store, resolver, map[string]int{"multi-q": 2})
+
+	monitor := &stubMonitor{resolver: resolver}
+	fe1, err := New(Config{
+		Monitor:     monitor,
+		QueueName:   "multi-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe1.Close()
+
+	fe2, err := New(Config{
+		Monitor:     monitor,
+		QueueName:   "multi-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("expected multiple frontend instances on the same resolver to succeed, got %v", err)
+	}
+	defer fe2.Close()
+}
+
+func TestFrontend_EnqueueRetriesAfterResolverRefresh(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	oldResolver := newStubResolver()
+	oldSrv, oldAddr := startMatchingServerWithHandle(t, store, oldResolver, map[string]int{"refresh-q": 1})
+
+	newResolver := newStubResolver()
+	_, newAddr := startMatchingServerWithHandle(t, store, newResolver, map[string]int{"refresh-q": 1})
+
+	routing := newRefreshAwareResolver(oldAddr, newAddr)
+	fe, err := New(Config{
+		Monitor:     &refreshAwareMonitor{resolver: routing},
+		QueueName:   "refresh-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe.Close()
+
+	oldSrv.Stop()
+
+	if err := fe.Enqueue(context.Background(), []byte("rerouted")); err != nil {
+		t.Fatalf("expected enqueue to succeed after resolver refresh, got %v", err)
+	}
+
+	if routing.refreshes == 0 {
+		t.Fatal("expected enqueue retry path to request a resolver refresh")
+	}
+}
+
+func TestFrontend_AckRetriesAfterResolverRefresh(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	oldResolver := newStubResolver()
+	oldSrv, oldAddr := startMatchingServerWithHandle(t, store, oldResolver, map[string]int{"ack-refresh-q": 1})
+
+	newResolver := newStubResolver()
+	_, newAddr := startMatchingServerWithHandle(t, store, newResolver, map[string]int{"ack-refresh-q": 1})
+
+	routing := newRefreshAwareResolver(oldAddr, newAddr)
+	fe, err := New(Config{
+		Monitor:     &refreshAwareMonitor{resolver: routing},
+		QueueName:   "ack-refresh-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe.Close()
+
+	ctx := context.Background()
+	if err := fe.Enqueue(ctx, []byte("ack-me")); err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := fe.Dequeue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldSrv.Stop()
+
+	if err := fe.Ack(ctx, token); err != nil {
+		t.Fatalf("expected ack to succeed after resolver refresh, got %v", err)
+	}
+
+	if routing.refreshes == 0 {
+		t.Fatal("expected ack retry path to request a resolver refresh")
 	}
 }

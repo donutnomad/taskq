@@ -266,20 +266,22 @@ sequenceDiagram
     alt 快速扫描命中
         F-->>W: data, token, nil
     else 全部为空
-        Note over F: 阶段 2：长轮询
-        F->>M: PollTask(pid, timeout=30s)
-        M->>PQ: TryPoll()
-        PQ-->>M: 空
-        M->>PQ: RegisterWaiter(ch)
-
-        alt 任务到达 (sync match / forward)
-            PQ-->>M: PollResult via channel
-            M-->>F: data, token
-            F-->>W: data, token, nil
-        else 超时
-            M-->>F: Empty=true
-            F-->>W: nil, "", ErrNoTask
+        Note over F: 阶段 2：并发长轮询所有分区
+        par 每个分区并发等待
+            F->>M: PollTask(pid, timeout=30s)
+            M->>PQ: TryPoll()
+            PQ-->>M: 空
+            M->>PQ: RegisterWaiter(ch)
+            alt 该分区有任务到达
+                PQ-->>M: PollResult via channel
+                M-->>F: data, token
+            else 超时
+                M-->>F: Empty=true
+            end
+        and 其他分区
+            F->>M: PollTask(otherPid, timeout=30s)
         end
+        F-->>W: 首个返回任务的数据；若全部超时则 ErrNoTask
     end
 ```
 
@@ -520,7 +522,12 @@ func main() {
     store, _ := queue.NewSQLiteStore("taskq.db")
     defer store.Close()
 
-    // 2. 启动成员发现
+    // 2. 准备 MemberStore
+    // 这里需要你自己的 membership.MemberStore 实现。
+    // 可直接参考 ./example/main.go 里的 memMemberStore，或接入 MySQL/PostgreSQL。
+    memberStore := newYourMemberStore()
+
+    // 3. 启动成员发现
     lis, _ := net.Listen("tcp", "127.0.0.1:0")
     addr := lis.Addr().String()
     addrPort, _ := netip.ParseAddrPort(addr)
@@ -534,7 +541,7 @@ func main() {
     monitor.WaitUntilInitialized(ctx)
     defer monitor.Stop()
 
-    // 3. 启动 Matching 服务
+    // 4. 启动 Matching 服务
     srv, _ := matching.NewServer(matching.Config{
         Store:         store,
         Monitor:       monitor,
@@ -545,7 +552,7 @@ func main() {
     srv.Start()
     defer srv.Stop()
 
-    // 4. 创建 Frontend
+    // 5. 创建 Frontend
     fe, _ := frontend.New(frontend.Config{
         Monitor:     monitor,
         QueueName:   "demo-queue",
@@ -554,23 +561,23 @@ func main() {
     })
     defer fe.Close()
 
-    // 5. 生产
+    // 6. 生产
     fe.Enqueue(ctx, []byte(`{"type":"send-email","to":"user@example.com"}`))
 
-    // 6. 消费
+    // 7. 消费
     data, token, err := fe.Dequeue(ctx)
     if err != nil {
         log.Fatal(err)
     }
     fmt.Printf("收到任务: %s\n", data)
 
-    // 7. 确认（或 Nack 重投递）
+    // 8. 确认（或 Nack 重投递）
     fe.Ack(ctx, token)
     // fe.Nack(ctx, token) // 拒绝，任务会被重新投递
 }
 ```
 
-运行完整示例：
+上面的代码片段省略了 `MemberStore` 的具体实现。可直接运行仓库里的完整示例：
 
 ```bash
 go run ./example/
@@ -631,8 +638,11 @@ taskq/
 ## 运行测试
 
 ```bash
-# 全量测试（含 race 检测）
-go test ./queue/ ./matching/ ./frontend/ -v -race
+# 全量测试
+go test ./... -v
+
+# 主要包做 race 检测
+go test ./membership ./queue ./matching ./frontend -v -race
 
 # 运行示例
 go run ./example/

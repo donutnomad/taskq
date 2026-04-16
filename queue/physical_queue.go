@@ -84,7 +84,13 @@ func newPhysicalQueue(ctx context.Context, store Store, queueName string,
 
 // addTask 写入 DB，sync match 在 onFlush 回调中完成
 func (pq *PhysicalQueue) addTask(ctx context.Context, data []byte) error {
+	if pq.ctx.Err() != nil {
+		return ErrQueueClosed
+	}
 	_, err := pq.writer.enqueue(data)
+	if err != nil && pq.ctx.Err() != nil {
+		return ErrQueueClosed
+	}
 	return err
 }
 
@@ -130,8 +136,16 @@ func (pq *PhysicalQueue) onFlush(rows []*TaskRow) {
 
 // tryPoll 非阻塞尝试获取任务
 func (pq *PhysicalQueue) tryPoll(ctx context.Context) (*TaskRow, string, bool) {
+	if pq.ctx.Err() != nil {
+		return nil, "", false
+	}
+
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
+
+	if pq.ctx.Err() != nil {
+		return nil, "", false
+	}
 
 	row, ok := pq.dbMgr.getTask(ctx)
 	if !ok {
@@ -145,11 +159,32 @@ func (pq *PhysicalQueue) tryPoll(ctx context.Context) (*TaskRow, string, bool) {
 func (pq *PhysicalQueue) registerWaiter(ch chan PollResult) *list.Element {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
+
+	if pq.ctx.Err() != nil {
+		select {
+		case ch <- PollResult{Err: ErrQueueClosed}:
+		default:
+		}
+		return nil
+	}
+
+	if row, ok := pq.dbMgr.getTask(pq.ctx); ok {
+		token := fmt.Sprintf("%d:%d", pq.partitionID, row.TaskID)
+		select {
+		case ch <- PollResult{Row: row, Token: token}:
+		default:
+		}
+		return nil
+	}
+
 	return pq.waiters.PushBack(ch)
 }
 
 // removeWaiter 取消注册
 func (pq *PhysicalQueue) removeWaiter(elem *list.Element) {
+	if elem == nil {
+		return
+	}
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	pq.waiters.Remove(elem)
@@ -186,6 +221,9 @@ func (pq *PhysicalQueue) wakeWaiters() {
 }
 
 func (pq *PhysicalQueue) ack(ctx context.Context, token string) error {
+	if pq.ctx.Err() != nil {
+		return ErrQueueClosed
+	}
 	_, taskID, err := parseToken(token)
 	if err != nil {
 		return err
@@ -195,6 +233,9 @@ func (pq *PhysicalQueue) ack(ctx context.Context, token string) error {
 }
 
 func (pq *PhysicalQueue) nack(ctx context.Context, token string) error {
+	if pq.ctx.Err() != nil {
+		return ErrQueueClosed
+	}
 	_, taskID, err := parseToken(token)
 	if err != nil {
 		return err
@@ -299,6 +340,11 @@ func (pq *PhysicalQueue) Nack(ctx context.Context, token string) error {
 // Close 关闭分区，停止所有后台组件
 func (pq *PhysicalQueue) Close() {
 	pq.close()
+}
+
+// IsClosed 返回分区是否已停止服务。
+func (pq *PhysicalQueue) IsClosed() bool {
+	return pq.ctx.Err() != nil
 }
 
 // ParseToken 解析 ack token，返回分区 ID 和任务 ID。

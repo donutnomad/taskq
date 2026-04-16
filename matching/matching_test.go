@@ -295,6 +295,158 @@ func TestMatchingServer_LongPoll(t *testing.T) {
 	}
 }
 
+func TestMatchingServer_StopUnblocksInFlightLongPoll(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+
+	srv, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 1})
+	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
+
+	client := newTestClient(t, addr)
+
+	pollDone := make(chan error, 1)
+	go func() {
+		_, err := client.PollTask(context.Background(), &PollTaskRequest{
+			QueueName:     "test-q",
+			PartitionId:   0,
+			PollTimeoutMs: 30000,
+		})
+		pollDone <- err
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+
+	stopDone := make(chan struct{})
+	go func() {
+		srv.Stop()
+		close(stopDone)
+	}()
+
+	select {
+	case <-stopDone:
+	case <-time.After(1500 * time.Millisecond):
+		srv.grpcServer.Stop()
+		srv.mgr.close()
+		t.Fatal("server stop blocked while a long poll was in flight")
+	}
+
+	select {
+	case err := <-pollDone:
+		if err == nil {
+			t.Fatal("expected in-flight long poll to be interrupted when server stops")
+		}
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("long poll did not exit after server stop")
+	}
+}
+
+func TestMatchingServer_AckTaskRejectsTokenPartitionMismatch(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+
+	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 2})
+	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
+
+	client := newTestClient(t, addr)
+	ctx := context.Background()
+
+	if _, err := client.AddTask(ctx, &AddTaskRequest{QueueName: "test-q", PartitionId: 0, Data: []byte("p0")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.AddTask(ctx, &AddTaskRequest{QueueName: "test-q", PartitionId: 1, Data: []byte("p1")}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp0, err := client.PollTask(ctx, &PollTaskRequest{QueueName: "test-q", PartitionId: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.PollTask(ctx, &PollTaskRequest{QueueName: "test-q", PartitionId: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.AckTask(ctx, &AckTaskRequest{
+		QueueName:   "test-q",
+		PartitionId: 1,
+		Token:       resp0.Token,
+	})
+	if err == nil {
+		t.Fatal("expected partition-mismatched ack token to be rejected")
+	}
+	if s, ok := status.FromError(err); !ok || s.Code() != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for partition-mismatched ack token, got %v", err)
+	}
+}
+
+func TestMatchingServer_NackTaskRejectsTokenPartitionMismatch(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+
+	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 2})
+	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
+
+	client := newTestClient(t, addr)
+	ctx := context.Background()
+
+	if _, err := client.AddTask(ctx, &AddTaskRequest{QueueName: "test-q", PartitionId: 0, Data: []byte("p0")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.AddTask(ctx, &AddTaskRequest{QueueName: "test-q", PartitionId: 1, Data: []byte("p1")}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp0, err := client.PollTask(ctx, &PollTaskRequest{QueueName: "test-q", PartitionId: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.PollTask(ctx, &PollTaskRequest{QueueName: "test-q", PartitionId: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.NackTask(ctx, &NackTaskRequest{
+		QueueName:   "test-q",
+		PartitionId: 1,
+		Token:       resp0.Token,
+	})
+	if err == nil {
+		t.Fatal("expected partition-mismatched nack token to be rejected")
+	}
+	if s, ok := status.FromError(err); !ok || s.Code() != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument for partition-mismatched nack token, got %v", err)
+	}
+}
+
+func TestPartitionManager_ReloadsClosedPartition(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress("127.0.0.1:9999")}
+
+	pm := newPartitionManager(
+		context.Background(),
+		store,
+		"127.0.0.1:9999",
+		"lease-owner",
+		resolver,
+		time.Minute,
+		map[string]int{"test-q": 1},
+	)
+	defer pm.close()
+
+	pq1, err := pm.getOrLoadPartition("test-q", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pq1.Close()
+
+	pq2, err := pm.getOrLoadPartition("test-q", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pq1 == pq2 {
+		t.Fatal("expected closed partition instance to be discarded and reloaded")
+	}
+}
+
 func TestMatchingServer_NotOwner(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	// resolver 指向一个不同的地址（不是本节点）

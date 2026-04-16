@@ -133,8 +133,8 @@ func (s *Server) Start() error {
 func (s *Server) Stop() {
 	s.cancel()
 	_ = s.resolver.RemoveListener("matching-server")
-	s.grpcServer.GracefulStop()
 	s.mgr.close()
+	s.grpcServer.GracefulStop()
 	s.wg.Wait()
 }
 

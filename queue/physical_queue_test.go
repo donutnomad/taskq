@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -99,5 +100,67 @@ func TestPhysicalQueue_BlockingPoll(t *testing.T) {
 		t.Fatal("should not get task")
 	case <-ctx.Done():
 		// 正常超时
+	}
+}
+
+func TestPhysicalQueue_RegisterWaiterImmediatelyGetsReadableTask(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+	ctx := context.Background()
+
+	if _, _, ok := pq.tryPoll(ctx); ok {
+		t.Fatal("expected empty queue before reproducing the wait registration gap")
+	}
+
+	if err := pq.addTask(ctx, []byte("already-readable")); err != nil {
+		t.Fatal(err)
+	}
+
+	ch := make(chan PollResult, 1)
+	elem := pq.registerWaiter(ch)
+	defer pq.removeWaiter(elem)
+
+	select {
+	case result := <-ch:
+		if result.Err != nil {
+			t.Fatalf("expected readable task, got error: %v", result.Err)
+		}
+		if result.Row == nil || string(result.Row.Data) != "already-readable" {
+			t.Fatalf("expected already-readable task, got %+v", result.Row)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected waiter registration to pick up an already-readable task")
+	}
+}
+
+func TestPhysicalQueue_CanceledQueueStopsServingAndRejectsAckNack(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+	ctx := context.Background()
+
+	if err := pq.addTask(ctx, []byte("task-1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := pq.addTask(ctx, []byte("task-2")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, tok1, ok := pq.tryPoll(ctx)
+	if !ok {
+		t.Fatal("expected first task")
+	}
+	_, tok2, ok := pq.tryPoll(ctx)
+	if !ok {
+		t.Fatal("expected second task")
+	}
+
+	pq.cancel()
+
+	if row, _, ok := pq.tryPoll(ctx); ok || row != nil {
+		t.Fatalf("expected canceled queue to stop serving tasks, got ok=%v row=%+v", ok, row)
+	}
+	if err := pq.ack(ctx, tok1); !errors.Is(err, ErrQueueClosed) {
+		t.Fatalf("expected ErrQueueClosed from ack after cancellation, got %v", err)
+	}
+	if err := pq.nack(ctx, tok2); !errors.Is(err, ErrQueueClosed) {
+		t.Fatalf("expected ErrQueueClosed from nack after cancellation, got %v", err)
 	}
 }

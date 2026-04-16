@@ -1,5 +1,3 @@
-//go:build bugrepro
-
 package frontend
 
 import (

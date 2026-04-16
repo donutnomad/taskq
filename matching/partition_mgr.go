@@ -71,11 +71,19 @@ func (pm *partitionManager) getOrLoadPartition(queueName string, partitionID int
 
 	// 快路径：读锁查找
 	pm.mu.RLock()
-	if pq, ok := pm.partitions[key]; ok {
-		pm.mu.RUnlock()
-		return pq, nil
-	}
+	pq, ok := pm.partitions[key]
 	pm.mu.RUnlock()
+	if ok {
+		if pq.IsClosed() {
+			pm.mu.Lock()
+			if cur, stillOK := pm.partitions[key]; stillOK && cur == pq {
+				delete(pm.partitions, key)
+			}
+			pm.mu.Unlock()
+		} else {
+			return pq, nil
+		}
+	}
 
 	// 检查所有权
 	if !pm.isOwner(queueName, partitionID) {
@@ -88,7 +96,11 @@ func (pm *partitionManager) getOrLoadPartition(queueName string, partitionID int
 
 	// double check
 	if pq, ok := pm.partitions[key]; ok {
-		return pq, nil
+		if pq.IsClosed() {
+			delete(pm.partitions, key)
+		} else {
+			return pq, nil
+		}
 	}
 
 	pq, err := queue.NewPhysicalQueue(pm.ctx, pm.store, queueName, partitionID, pm.visTimeout, pm.leaseOwner)

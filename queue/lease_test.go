@@ -3,6 +3,8 @@ package queue
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -139,5 +141,50 @@ func TestRenewLease(t *testing.T) {
 	// 不同 owner 续期应失败
 	if err := s.RenewLease(ctx, "q", 0, "owner-b", 15*time.Second); err != ErrLeaseHeld {
 		t.Fatalf("expected ErrLeaseHeld, got %v", err)
+	}
+}
+
+func TestAcquireLease_ConcurrentFirstCreate(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "lease-race.db")
+
+	storeA, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeA.Close()
+
+	storeB, err := NewSQLiteStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeB.Close()
+
+	const attempts = 20
+	var wg sync.WaitGroup
+	errCh := make(chan error, attempts*2)
+
+	for i := range attempts {
+		i := i
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, err := storeA.AcquireLease(context.Background(), "race-q", i, "owner-a", 15*time.Second)
+			errCh <- err
+		}()
+		go func() {
+			defer wg.Done()
+			_, err := storeB.AcquireLease(context.Background(), "race-q", i, "owner-b", 15*time.Second)
+			errCh <- err
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err == nil || errors.Is(err, ErrLeaseHeld) {
+			continue
+		}
+		t.Fatalf("expected only success or ErrLeaseHeld during concurrent first-create, got %v", err)
 	}
 }

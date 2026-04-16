@@ -56,7 +56,7 @@ membership 包的定位
                                                                                                                                                                                                                         
   - 哈希环是优化手段：避免所有节点都去抢所有 lease，减少 DB 竞争                                                                                                                                                        
   - DB lease 是安全保证：解决视图不一致窗口期的 multi-owner 问题                                                                                                                                                        
-  - lease 需要 fencing token：防止慢节点在 lease 过期后仍然处理消息（比如 GC pause 后恢复），消费时带上 fencing token，broker 端校验                                                                                    
+  - 当前实现只有 DB lease + RangeID CAS，还没有 fencing token 这一层保护                                                                                    
   
 
 各场景总结                                                                                                                                                                                                            

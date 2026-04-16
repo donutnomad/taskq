@@ -16,7 +16,6 @@ import (
 const (
 	upsertMembershipRecordExpiryDefault = time.Hour * 48
 	healthyHostLastHeartbeatCutoff      = time.Second * 20
-	maxScheduledEventTimeSeconds        = 15
 )
 
 // monitor 实现 Monitor 接口，基于 DB 轮询的成员管理。
@@ -276,7 +275,7 @@ func (m *monitor) buildUpsertRequest(serviceName string) UpsertMemberRequest {
 	m.mu.Unlock()
 
 	var startAt int64
-	if until := time.Until(m.joinTime); until > 0 && until.Seconds() < maxScheduledEventTimeSeconds {
+	if !m.joinTime.IsZero() && time.Until(m.joinTime) > 0 {
 		startAt = m.joinTime.Unix()
 	}
 
