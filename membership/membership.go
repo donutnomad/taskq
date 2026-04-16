@@ -4,17 +4,9 @@ package membership
 
 import (
 	"context"
-	"errors"
 	"net"
 	"time"
 )
-
-// ---- 错误定义 ----
-
-var ErrUnknownService = errors.New("service not tracked by Monitor")
-var ErrInsufficientHosts = errors.New("not enough hosts to serve the request")
-var ErrListenerAlreadyExist = errors.New("listener already exist for the service")
-var ErrIncorrectAddressFormat = errors.New("incorrect address format")
 
 // ---- 核心数据结构 ----
 

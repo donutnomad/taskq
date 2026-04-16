@@ -3,14 +3,10 @@ package queue
 import (
 	"container/list"
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
 )
-
-// ErrQueueClosed 队列已关闭
-var ErrQueueClosed = errors.New("queue closed")
 
 // PollResult 长轮询结果
 type PollResult struct {

@@ -12,9 +12,6 @@ import (
 	"github.com/donutnomad/taskq/queue"
 )
 
-// ErrNotOwner 本节点不拥有请求的分区
-var ErrNotOwner = errors.New("partition not owned by this node")
-
 // partitionKey 返回用于一致性哈希查找的 key
 func partitionKey(queueName string, partitionID int) string {
 	return fmt.Sprintf("%s/%d", queueName, partitionID)

@@ -2,15 +2,8 @@ package queue
 
 import (
 	"context"
-	"errors"
 	"time"
 )
-
-// ErrConditionFailed 乐观锁冲突错误
-var ErrConditionFailed = errors.New("condition failed: range_id mismatch")
-
-// ErrLeaseHeld 分区 lease 被其他节点持有
-var ErrLeaseHeld = errors.New("partition lease held by another owner")
 
 // TaskRow 数据库任务行
 type TaskRow struct {
