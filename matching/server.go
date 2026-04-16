@@ -126,6 +126,12 @@ func toGRPCError(err error) error {
 	if errors.Is(err, ErrNotOwner) {
 		return status.Error(codes.FailedPrecondition, err.Error())
 	}
+	if errors.Is(err, ErrUnknownQueue) {
+		return status.Error(codes.NotFound, err.Error())
+	}
+	if errors.Is(err, ErrInvalidPartition) {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
 	if errors.Is(err, queue.ErrOwnershipLost) {
 		return status.Error(codes.Aborted, err.Error())
 	}

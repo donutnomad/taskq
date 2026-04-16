@@ -68,6 +68,9 @@ func newPhysicalQueue(
 	}
 
 	pq.runtime = newTaskRuntime(pq, info.AckLevel)
+	if info.NextTaskID > 1 {
+		pq.runtime.setMaxReadLevel(info.NextTaskID - 1)
+	}
 	pq.writer = newTaskWriter(pq, info.NextTaskID, pq.onFlush)
 	pq.gc = newTaskGC(pq, pq.runtime)
 	pq.visScan = newVisibilityScanner(pq, pq.runtime)

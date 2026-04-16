@@ -2,7 +2,9 @@ package membership
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/netip"
@@ -16,6 +18,19 @@ import (
 const (
 	upsertMembershipRecordExpiryDefault = time.Hour * 48
 	healthyHostLastHeartbeatCutoff      = time.Second * 20
+	defaultMembershipRetryMaxAttempts   = 5
+	defaultMembershipRetryBaseDelay     = 500 * time.Millisecond
+	defaultMembershipRetryMaxDelay      = 8 * time.Second
+	defaultMembershipHeartbeatInterval  = 10 * time.Second
+	defaultMembershipHeartbeatJitterMax = 5 * time.Second
+)
+
+var (
+	membershipRetryMaxAttempts   = defaultMembershipRetryMaxAttempts
+	membershipRetryBaseDelay     = defaultMembershipRetryBaseDelay
+	membershipRetryMaxDelay      = defaultMembershipRetryMaxDelay
+	membershipHeartbeatInterval  = defaultMembershipHeartbeatInterval
+	membershipHeartbeatJitterMax = defaultMembershipHeartbeatJitterMax
 )
 
 // monitor 实现 Monitor 接口，基于 DB 轮询的成员管理。
@@ -42,6 +57,7 @@ type monitor struct {
 	draining      bool
 
 	initialized chan struct{}
+	shutdownErr error
 }
 
 var _ Monitor = (*monitor)(nil)
@@ -99,12 +115,18 @@ func (m *monitor) Start() {
 	m.status = 1
 	m.mu.Unlock()
 
-	if err := m.startHeartbeat(); err != nil {
-		panic("unable to initialize membership heartbeats: " + err.Error())
+	if err := m.store.PruneExpiredMembers(m.lifecycleCtx, 10); err != nil {
+		slog.Warn("membership prune expired members failed", "err", err)
 	}
 
-	if err := m.syncMembers(); err != nil {
-		panic("failed to sync members on startup: " + err.Error())
+	if err := m.retryMembershipOp("initialize membership heartbeats", m.writeHeartbeats); err != nil {
+		m.fail(fmt.Errorf("unable to initialize membership heartbeats: %w", err))
+		return
+	}
+
+	if err := m.retryMembershipOp("sync members on startup", m.syncMembers); err != nil {
+		m.fail(fmt.Errorf("failed to sync members on startup: %w", err))
+		return
 	}
 
 	m.mu.Lock()
@@ -117,27 +139,48 @@ func (m *monitor) Start() {
 
 	m.wg.Add(1)
 	go m.pollLoop()
+	m.wg.Add(1)
+	go m.heartbeatLoop()
 }
 
 func (m *monitor) Stop() {
+	m.stop(nil)
+	m.wg.Wait()
+}
+
+func (m *monitor) stop(err error) {
 	m.mu.Lock()
 	if m.status != 1 {
 		m.mu.Unlock()
 		return
 	}
 	m.status = 2
+	if err != nil && m.shutdownErr == nil {
+		m.shutdownErr = err
+	}
 	m.lifecycleCancel()
 	for _, ring := range m.rings {
 		ring.Stop()
 	}
 	m.mu.Unlock()
-	m.wg.Wait()
+}
+
+func (m *monitor) fail(err error) {
+	slog.Error("membership monitor stopped after retry exhaustion", "err", err)
+	m.stop(err)
 }
 
 func (m *monitor) WaitUntilInitialized(ctx context.Context) error {
 	select {
 	case <-m.initialized:
 		return nil
+	case <-m.lifecycleCtx.Done():
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.shutdownErr != nil {
+			return m.shutdownErr
+		}
+		return m.lifecycleCtx.Err()
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -211,7 +254,10 @@ func (m *monitor) pollLoop() {
 		case <-m.lifecycleCtx.Done():
 			return
 		case <-ticker.C:
-			_ = m.syncMembers()
+			if err := m.retryMembershipOp("sync members", m.syncMembers); err != nil {
+				m.fail(fmt.Errorf("sync members failed after retries: %w", err))
+				return
+			}
 		}
 	}
 }
@@ -254,18 +300,13 @@ func (m *monitor) syncMembers() error {
 	return nil
 }
 
-func (m *monitor) startHeartbeat() error {
-	_ = m.store.PruneExpiredMembers(m.lifecycleCtx, 10)
-
+func (m *monitor) writeHeartbeats() error {
 	for _, svc := range m.serviceNames {
 		req := m.buildUpsertRequest(svc)
 		if err := m.store.UpsertMember(m.lifecycleCtx, req); err != nil {
 			return err
 		}
 	}
-
-	m.wg.Add(1)
-	go m.heartbeatLoop()
 	return nil
 }
 
@@ -294,15 +335,75 @@ func (m *monitor) buildUpsertRequest(serviceName string) UpsertMemberRequest {
 func (m *monitor) heartbeatLoop() {
 	defer m.wg.Done()
 	for {
-		for _, svc := range m.serviceNames {
-			req := m.buildUpsertRequest(svc)
-			_ = m.store.UpsertMember(m.lifecycleCtx, req)
+		jitter := time.Duration(0)
+		if membershipHeartbeatJitterMax > 0 {
+			jitter = time.Duration(rand.Int63n(int64(membershipHeartbeatJitterMax)))
 		}
-		jitter := time.Duration(rand.Int63n(5000)) * time.Millisecond
+		timer := time.NewTimer(membershipHeartbeatInterval + jitter)
 		select {
 		case <-m.lifecycleCtx.Done():
+			timer.Stop()
 			return
-		case <-time.After(10*time.Second + jitter):
+		case <-timer.C:
+		}
+		if err := m.retryMembershipOp("write membership heartbeats", m.writeHeartbeats); err != nil {
+			m.fail(fmt.Errorf("write membership heartbeats failed after retries: %w", err))
+			return
 		}
 	}
+}
+
+func (m *monitor) retryMembershipOp(name string, op func() error) error {
+	delay := membershipRetryBaseDelay
+	if delay <= 0 {
+		delay = time.Millisecond
+	}
+	maxDelay := membershipRetryMaxDelay
+	if maxDelay < delay {
+		maxDelay = delay
+	}
+	maxAttempts := membershipRetryMaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := op(); err == nil {
+			return nil
+		} else {
+			if errors.Is(err, context.Canceled) && m.lifecycleCtx.Err() != nil {
+				return m.lifecycleCtx.Err()
+			}
+			lastErr = err
+		}
+
+		if attempt == maxAttempts {
+			break
+		}
+
+		slog.Warn(
+			"membership operation failed, retrying",
+			"operation", name,
+			"attempt", attempt,
+			"max_attempts", maxAttempts,
+			"retry_in", delay,
+			"err", lastErr,
+		)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-m.lifecycleCtx.Done():
+			timer.Stop()
+			return m.lifecycleCtx.Err()
+		case <-timer.C:
+		}
+
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
+
+	return fmt.Errorf("%s: %w", name, lastErr)
 }

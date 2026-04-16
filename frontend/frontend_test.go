@@ -606,3 +606,75 @@ func TestFrontend_AckRetriesAfterResolverRefresh(t *testing.T) {
 		t.Fatal("expected ack retry path to request a resolver refresh")
 	}
 }
+
+func TestFrontend_NackRetriesAfterResolverRefresh(t *testing.T) {
+	store := newTestSQLiteStore(t)
+
+	oldResolver := newStubResolver()
+	oldSrv, oldAddr := startMatchingServerWithHandle(t, store, oldResolver, map[string]int{"nack-refresh-q": 1})
+
+	newResolver := newStubResolver()
+	_, newAddr := startMatchingServerWithHandle(t, store, newResolver, map[string]int{"nack-refresh-q": 1})
+
+	routing := newRefreshAwareResolver(oldAddr, newAddr)
+	fe, err := New(Config{
+		Monitor:     &refreshAwareMonitor{resolver: routing},
+		QueueName:   "nack-refresh-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe.Close()
+
+	ctx := context.Background()
+	if err := fe.Enqueue(ctx, []byte("nack-me")); err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := fe.Dequeue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldSrv.Stop()
+
+	if err := fe.Nack(ctx, token); err != nil {
+		t.Fatalf("expected nack to succeed after resolver refresh, got %v", err)
+	}
+
+	if routing.refreshes == 0 {
+		t.Fatal("expected nack retry path to request a resolver refresh")
+	}
+}
+
+func TestFrontend_DequeueReturnsPromptlyWhenCallerContextCanceled(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver()
+	startMatchingServer(t, store, resolver, map[string]int{"cancel-q": 4})
+
+	fe, err := New(Config{
+		Monitor:     &stubMonitor{resolver: resolver},
+		QueueName:   "cancel-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, _, err = fe.Dequeue(ctx)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context deadline exceeded, got %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("expected dequeue to return promptly after caller cancellation, took %v", elapsed)
+	}
+}

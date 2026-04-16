@@ -72,7 +72,9 @@ func (r *serviceResolver) setMembers(hosts []*hostInfo) {
 
 	ring := newHashRing(r.replicaPoints)
 	for addr := range newMap {
-		ring.AddMember(addr)
+		if host := newMap[addr]; host != nil && !isDraining(host) {
+			ring.AddMember(addr)
+		}
 	}
 	r.ringAndHosts.Store(ringAndHosts{ring: ring, hosts: newMap})
 	r.emitEvent(event)

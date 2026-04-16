@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -24,40 +25,48 @@ func (rt *taskRuntime) setMaxReadLevel(level int64) {
 }
 
 func (rt *taskRuntime) tryGetTask(ctx context.Context) (*TaskRow, string, bool, error) {
-	if row := rt.state.takeRedelivery(); row != nil {
-		task, token, err := rt.dispatchTask(ctx, row, false)
-		if err != nil {
+	for {
+		if row := rt.state.takeRedelivery(); row != nil {
+			task, token, err := rt.dispatchTask(ctx, row, false)
+			if err == nil {
+				return task, token, true, nil
+			}
+			if errors.Is(err, errTaskNotFound) {
+				continue
+			}
 			rt.state.requeueRedeliveryFront(row)
 			return nil, "", false, err
 		}
-		return task, token, true, nil
-	}
 
-	minTaskID, maxTaskID, ok := rt.state.nextReadWindow()
-	if !ok {
-		return nil, "", false, nil
-	}
+		minTaskID, maxTaskID, ok := rt.state.nextReadWindow()
+		if !ok {
+			return nil, "", false, nil
+		}
 
-	tasks, err := rt.pq.store.GetTasks(
-		ctx,
-		rt.pq.queueName,
-		rt.pq.partitionID,
-		minTaskID,
-		maxTaskID,
-		1,
-	)
-	if err != nil {
-		return nil, "", false, fmt.Errorf("get tasks: %w", err)
-	}
-	if len(tasks) == 0 {
-		return nil, "", false, nil
-	}
+		tasks, err := rt.pq.store.GetTasks(
+			ctx,
+			rt.pq.queueName,
+			rt.pq.partitionID,
+			minTaskID,
+			maxTaskID,
+			1,
+		)
+		if err != nil {
+			return nil, "", false, fmt.Errorf("get tasks: %w", err)
+		}
+		if len(tasks) == 0 {
+			return nil, "", false, nil
+		}
 
-	row, token, err := rt.dispatchTask(ctx, tasks[0], true)
-	if err != nil {
-		return nil, "", false, err
+		row, token, err := rt.dispatchTask(ctx, tasks[0], true)
+		if errors.Is(err, errTaskNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, "", false, err
+		}
+		return row, token, true, nil
 	}
-	return row, token, true, nil
 }
 
 func (rt *taskRuntime) dispatchTask(ctx context.Context, row *TaskRow, advanceReadLevel bool) (*TaskRow, string, error) {

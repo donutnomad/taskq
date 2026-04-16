@@ -2,8 +2,11 @@ package membership
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 )
@@ -74,5 +77,217 @@ func TestBugRepro_GetReachableMembersDeduplicatesAddresses(t *testing.T) {
 	}
 	if len(members) != 1 || members[0] != "10.0.0.1:7235" {
 		t.Fatalf("expected one unique reachable member, got %v", members)
+	}
+}
+
+func TestBugRepro_LookupShouldSkipDrainingHosts(t *testing.T) {
+	resolver := newServiceResolver("matching", 200)
+	resolver.setMembers([]*hostInfo{
+		newHostInfo("10.0.0.1:7235", false, 0, 0),
+		newHostInfo("10.0.0.2:7235", true, 0, 0),
+	})
+
+	for i := range 1000 {
+		host, err := resolver.Lookup(fmt.Sprintf("key-%d", i))
+		if err != nil {
+			t.Fatalf("unexpected lookup error: %v", err)
+		}
+		if hi, ok := host.(*hostInfo); ok && isDraining(hi) {
+			t.Fatalf("expected lookup to avoid draining hosts, got %s for key-%d", hi.GetAddress(), i)
+		}
+	}
+}
+
+type retryingMemberStore struct {
+	stubStore
+
+	mu           sync.Mutex
+	upsertErrors []error
+	getErrors    []error
+	upsertCalls  int
+	getCalls     int
+}
+
+func (s *retryingMemberStore) UpsertMember(ctx context.Context, req UpsertMemberRequest) error {
+	s.mu.Lock()
+	s.upsertCalls++
+	var err error
+	if len(s.upsertErrors) > 0 {
+		err = s.upsertErrors[0]
+		s.upsertErrors = s.upsertErrors[1:]
+	}
+	s.mu.Unlock()
+
+	if err != nil {
+		return err
+	}
+	return s.stubStore.UpsertMember(ctx, req)
+}
+
+func (s *retryingMemberStore) GetActiveMembers(ctx context.Context, within time.Duration) ([]MemberRecord, error) {
+	s.mu.Lock()
+	s.getCalls++
+	var err error
+	if len(s.getErrors) > 0 {
+		err = s.getErrors[0]
+		s.getErrors = s.getErrors[1:]
+	}
+	s.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	return s.stubStore.GetActiveMembers(ctx, within)
+}
+
+func setMonitorRetryPolicyForTest(t *testing.T, attempts int, baseDelay, maxDelay, heartbeatInterval, heartbeatJitter time.Duration) {
+	t.Helper()
+
+	prevAttempts := membershipRetryMaxAttempts
+	prevBaseDelay := membershipRetryBaseDelay
+	prevMaxDelay := membershipRetryMaxDelay
+	prevHeartbeatInterval := membershipHeartbeatInterval
+	prevHeartbeatJitter := membershipHeartbeatJitterMax
+
+	membershipRetryMaxAttempts = attempts
+	membershipRetryBaseDelay = baseDelay
+	membershipRetryMaxDelay = maxDelay
+	membershipHeartbeatInterval = heartbeatInterval
+	membershipHeartbeatJitterMax = heartbeatJitter
+
+	t.Cleanup(func() {
+		membershipRetryMaxAttempts = prevAttempts
+		membershipRetryBaseDelay = prevBaseDelay
+		membershipRetryMaxDelay = prevMaxDelay
+		membershipHeartbeatInterval = prevHeartbeatInterval
+		membershipHeartbeatJitterMax = prevHeartbeatJitter
+	})
+}
+
+func TestBugRepro_StartShouldRetryTransientMembershipStoreFailures(t *testing.T) {
+	setMonitorRetryPolicyForTest(t, 3, 5*time.Millisecond, 20*time.Millisecond, time.Hour, 0)
+
+	store := &retryingMemberStore{
+		upsertErrors: []error{errors.New("upsert failed"), errors.New("upsert failed")},
+	}
+	store.members = []MemberRecord{
+		{RPCAddress: net.ParseIP("10.0.0.1"), RPCPort: 7235, ServiceName: "matching"},
+	}
+
+	m := NewMonitor(
+		[]string{"matching"},
+		store,
+		netip.MustParseAddrPort("10.0.0.1:7235"),
+		time.Hour,
+		time.Second,
+		time.Time{},
+		200,
+	)
+	m.Start()
+	defer m.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.WaitUntilInitialized(ctx); err != nil {
+		t.Fatalf("expected monitor to recover from transient startup failures, got %v", err)
+	}
+
+	store.mu.Lock()
+	upsertCalls := store.upsertCalls
+	store.mu.Unlock()
+	if upsertCalls < 3 {
+		t.Fatalf("expected startup to retry failed writes, got %d upsert attempts", upsertCalls)
+	}
+}
+
+func TestBugRepro_RuntimeSyncFailuresShouldEventuallyStopMonitor(t *testing.T) {
+	setMonitorRetryPolicyForTest(t, 3, 5*time.Millisecond, 20*time.Millisecond, time.Hour, 0)
+
+	store := &retryingMemberStore{
+		getErrors: []error{
+			nil,
+			errors.New("sync failed"),
+			errors.New("sync failed"),
+			errors.New("sync failed"),
+		},
+	}
+	store.members = []MemberRecord{
+		{RPCAddress: net.ParseIP("10.0.0.1"), RPCPort: 7235, ServiceName: "matching"},
+	}
+
+	m := NewMonitor(
+		[]string{"matching"},
+		store,
+		netip.MustParseAddrPort("10.0.0.1:7235"),
+		10*time.Millisecond,
+		time.Second,
+		time.Time{},
+		200,
+	)
+	m.Start()
+	defer m.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.WaitUntilInitialized(ctx); err != nil {
+		t.Fatalf("expected monitor to initialize before runtime sync failure test, got %v", err)
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		if m.(*monitor).lifecycleCtx.Err() != nil {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected monitor to stop after repeated runtime sync failures")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestBugRepro_RuntimeHeartbeatFailuresShouldEventuallyStopMonitor(t *testing.T) {
+	setMonitorRetryPolicyForTest(t, 3, 5*time.Millisecond, 20*time.Millisecond, 10*time.Millisecond, 0)
+
+	store := &retryingMemberStore{
+		upsertErrors: []error{
+			nil,
+			errors.New("heartbeat failed"),
+			errors.New("heartbeat failed"),
+			errors.New("heartbeat failed"),
+		},
+	}
+	store.members = []MemberRecord{
+		{RPCAddress: net.ParseIP("10.0.0.1"), RPCPort: 7235, ServiceName: "matching"},
+	}
+
+	m := NewMonitor(
+		[]string{"matching"},
+		store,
+		netip.MustParseAddrPort("10.0.0.1:7235"),
+		time.Hour,
+		time.Second,
+		time.Time{},
+		200,
+	)
+	m.Start()
+	defer m.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := m.WaitUntilInitialized(ctx); err != nil {
+		t.Fatalf("expected monitor to initialize before runtime heartbeat failure test, got %v", err)
+	}
+
+	deadline := time.After(time.Second)
+	for {
+		if m.(*monitor).lifecycleCtx.Err() != nil {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("expected monitor to stop after repeated heartbeat failures")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }

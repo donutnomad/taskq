@@ -54,16 +54,31 @@ func newPartitionManager(
 }
 
 // isOwner 检查本节点是否拥有指定分区
-func (pm *partitionManager) isOwner(queueName string, partitionID int) bool {
+func (pm *partitionManager) isOwner(queueName string, partitionID int) (bool, error) {
 	host, err := pm.resolver.Lookup(partitionKey(queueName, partitionID))
 	if err != nil {
-		return false
+		return false, err
 	}
-	return host.GetAddress() == pm.selfAddr
+	return host.GetAddress() == pm.selfAddr, nil
+}
+
+func (pm *partitionManager) validatePartition(queueName string, partitionID int) error {
+	numPartitions, ok := pm.queueConfigs[queueName]
+	if !ok {
+		return ErrUnknownQueue
+	}
+	if partitionID < 0 || partitionID >= numPartitions {
+		return ErrInvalidPartition
+	}
+	return nil
 }
 
 // getOrLoadPartition 获取分区实例，如果本节点拥有但尚未加载则延迟加载
 func (pm *partitionManager) getOrLoadPartition(queueName string, partitionID int) (*queue.PhysicalQueue, error) {
+	if err := pm.validatePartition(queueName, partitionID); err != nil {
+		return nil, err
+	}
+
 	key := partitionKey(queueName, partitionID)
 
 	// 快路径：读锁查找
@@ -83,7 +98,11 @@ func (pm *partitionManager) getOrLoadPartition(queueName string, partitionID int
 	}
 
 	// 检查所有权
-	if !pm.isOwner(queueName, partitionID) {
+	isOwner, err := pm.isOwner(queueName, partitionID)
+	if err != nil {
+		return nil, fmt.Errorf("lookup owner for %s: %w", key, err)
+	}
+	if !isOwner {
 		return nil, ErrNotOwner
 	}
 
@@ -100,7 +119,7 @@ func (pm *partitionManager) getOrLoadPartition(queueName string, partitionID int
 		}
 	}
 
-	pq, err := queue.NewPhysicalQueue(pm.ctx, pm.store, queueName, partitionID, pm.visTimeout, pm.leaseOwner)
+	pq, err = queue.NewPhysicalQueue(pm.ctx, pm.store, queueName, partitionID, pm.visTimeout, pm.leaseOwner)
 	if err != nil {
 		return nil, fmt.Errorf("load partition %s: %w", key, err)
 	}
@@ -119,7 +138,12 @@ func (pm *partitionManager) reconcile() {
 	owned := make(map[string]partitionID)
 	for queueName, numParts := range pm.queueConfigs {
 		for i := range numParts {
-			if pm.isOwner(queueName, i) {
+			isOwner, err := pm.isOwner(queueName, i)
+			if err != nil {
+				slog.Error("matching reconcile aborted: ownership lookup failed", "queue", queueName, "partition_id", i, "err", err)
+				return
+			}
+			if isOwner {
 				owned[partitionKey(queueName, i)] = partitionID{queueName, i}
 			}
 		}

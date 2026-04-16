@@ -97,7 +97,7 @@ func (s *sqliteStore) DispatchTask(
 	res, err := s.db.ExecContext(
 		ctx,
 		`UPDATE tasks SET dispatched_at = ?
-		 WHERE queue_name = ? AND partition_id = ? AND task_id = ?`,
+		 WHERE queue_name = ? AND partition_id = ? AND task_id = ? AND dispatched_at IS NULL`,
 		dispatchedAt,
 		queueName,
 		partitionID,
