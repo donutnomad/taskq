@@ -27,66 +27,115 @@ type taskWriter struct {
 	reqCh   chan *writeRequest
 	onFlush func(rows []*TaskRow) // sync match 回调
 
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	stateMu sync.RWMutex
+	started bool
+	closed  bool
+	ctx     context.Context
+	done    chan struct{}
+	startCh chan struct{}
 }
 
 func newTaskWriter(pq *PhysicalQueue, nextTaskID int64, onFlush func([]*TaskRow)) *taskWriter {
-	ctx, cancel := context.WithCancel(pq.ctx)
-	w := &taskWriter{
+	return &taskWriter{
 		pq:        pq,
 		nextID:    nextTaskID,
 		maxID:     nextTaskID,
 		blockSize: defaultBlockSize,
 		reqCh:     make(chan *writeRequest, 256),
 		onFlush:   onFlush,
-		ctx:       ctx,
-		cancel:    cancel,
+		done:      make(chan struct{}),
+		startCh:   make(chan struct{}),
 	}
-	w.wg.Add(1)
-	go w.loop()
-	return w
 }
 
 func (w *taskWriter) enqueue(data []byte) (int64, error) {
+	w.stateMu.RLock()
+	started := w.started
+	closed := w.closed
+	done := w.done
+	w.stateMu.RUnlock()
+
+	if !started || closed {
+		return 0, ErrQueueClosed
+	}
+
 	req := &writeRequest{data: data, done: make(chan error, 1)}
 	select {
 	case w.reqCh <- req:
-	case <-w.ctx.Done():
-		return 0, w.ctx.Err()
+	case <-done:
+		return 0, ErrQueueClosed
 	}
 	select {
 	case err := <-req.done:
 		return req.taskID, err
-	case <-w.ctx.Done():
-		return 0, w.ctx.Err()
+	case <-done:
+		select {
+		case err := <-req.done:
+			return req.taskID, err
+		default:
+			return 0, ErrQueueClosed
+		}
 	}
 }
 
-func (w *taskWriter) loop() {
-	defer w.wg.Done()
+func (w *taskWriter) run(ctx context.Context) error {
+	w.stateMu.Lock()
+	if w.closed {
+		w.stateMu.Unlock()
+		return ErrQueueClosed
+	}
+	if w.started {
+		w.stateMu.Unlock()
+		<-ctx.Done()
+		return nil
+	}
+	w.started = true
+	w.ctx = ctx
+	close(w.startCh)
+	w.stateMu.Unlock()
+
+	defer w.close()
+
 	for {
 		select {
 		case req := <-w.reqCh:
+			if req == nil {
+				continue
+			}
 			batch := []*writeRequest{req}
 			drain := true
 			for drain {
 				select {
 				case r := <-w.reqCh:
+					if r == nil {
+						continue
+					}
 					batch = append(batch, r)
 				default:
 					drain = false
 				}
 			}
-			w.flush(batch)
-		case <-w.ctx.Done():
-			return
+			if err := w.flush(batch); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return nil
 		}
 	}
 }
 
-func (w *taskWriter) flush(batch []*writeRequest) {
+func (w *taskWriter) waitUntilStarted(ctx context.Context) error {
+	select {
+	case <-w.startCh:
+		return nil
+	case <-w.done:
+		return ErrQueueClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (w *taskWriter) flush(batch []*writeRequest) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -96,7 +145,10 @@ func (w *taskWriter) flush(batch []*writeRequest) {
 			for _, req := range batch {
 				req.done <- fmt.Errorf("allocate range: %w", err)
 			}
-			return
+			if errors.Is(err, ErrOwnershipLost) {
+				return err
+			}
+			return nil
 		}
 	}
 
@@ -115,13 +167,14 @@ func (w *taskWriter) flush(batch []*writeRequest) {
 	}
 
 	err := w.pq.store.CreateTasks(w.ctx, rows)
-	for _, req := range batch {
-		req.done <- err
-	}
-
+	// 成功返回给写入方之前，先把新任务发布到本地可读状态。
 	if err == nil && w.onFlush != nil {
 		w.onFlush(rows)
 	}
+	for _, req := range batch {
+		req.done <- err
+	}
+	return nil
 }
 
 // allocateRange 通过 ownershipState CAS 分配新的 taskID 范围。
@@ -143,9 +196,6 @@ func (w *taskWriter) allocateRange(minSize int64) error {
 		NextTaskID:  newNextTaskID,
 	}
 	if err := w.pq.ownership.updateQueue(w.ctx, info); err != nil {
-		if errors.Is(err, ErrOwnershipLost) {
-			w.pq.cancel()
-		}
 		return err
 	}
 	w.maxID = newNextTaskID
@@ -153,6 +203,25 @@ func (w *taskWriter) allocateRange(minSize int64) error {
 }
 
 func (w *taskWriter) close() {
-	w.cancel()
-	w.wg.Wait()
+	w.stateMu.Lock()
+	if w.closed {
+		w.stateMu.Unlock()
+		return
+	}
+	w.closed = true
+	done := w.done
+	w.stateMu.Unlock()
+
+	close(done)
+
+	for {
+		select {
+		case req := <-w.reqCh:
+			if req != nil {
+				req.done <- ErrQueueClosed
+			}
+		default:
+			return
+		}
+	}
 }

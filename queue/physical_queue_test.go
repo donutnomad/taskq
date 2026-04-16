@@ -15,6 +15,18 @@ type flakyDispatchStore struct {
 	dispatchAttempts map[int64]int
 }
 
+type conditionFailedUpdateStore struct {
+	Store
+	failUpdate bool
+}
+
+func (s *conditionFailedUpdateStore) UpdateQueue(ctx context.Context, info *QueueInfo, prevRangeID int64) error {
+	if s.failUpdate {
+		return ErrConditionFailed
+	}
+	return s.Store.UpdateQueue(ctx, info, prevRangeID)
+}
+
 func newFlakyDispatchStore(base Store) *flakyDispatchStore {
 	return &flakyDispatchStore{
 		Store:            base,
@@ -52,8 +64,319 @@ func newTestPhysicalQueue(t *testing.T) (*PhysicalQueue, Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	startTestWriterTask(t, pq)
 	t.Cleanup(func() { pq.close() })
 	return pq, s
+}
+
+func startTestWriterTask(t *testing.T, pq *PhysicalQueue) {
+	t.Helper()
+	go func() {
+		_ = pq.RunWriter(pq.ctx)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		pq.writer.stateMu.RLock()
+		started := pq.writer.started
+		pq.writer.stateMu.RUnlock()
+		if started {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for writer task to start")
+}
+
+func tickTestRun(ctx context.Context, interval time.Duration, f func(context.Context) error) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	if err := f(ctx); err != nil {
+		return err
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := f(ctx); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func startTestGCTask(pq *PhysicalQueue) {
+	go func() {
+		_ = tickTestRun(pq.ctx, 20*time.Millisecond, pq.RunGCOnce)
+	}()
+}
+
+func startTestVisibilityTask(pq *PhysicalQueue) {
+	go func() {
+		_ = tickTestRun(pq.ctx, 20*time.Millisecond, func(ctx context.Context) error {
+			pq.RunVisibilityScanOnce(ctx)
+			return nil
+		})
+	}()
+}
+
+func TestPhysicalQueue_NewQueueDoesNotAcceptWritesUntilWriterTaskRuns(t *testing.T) {
+	s := newTestStore(t)
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pq.close() })
+
+	if err := pq.AddTask(context.Background(), []byte("task")); !errors.Is(err, ErrQueueClosed) {
+		t.Fatalf("expected AddTask to reject writes before writer task starts, got %v", err)
+	}
+}
+
+func TestPhysicalQueue_GCDoesNotRunUntilExplicitlyStarted(t *testing.T) {
+	s := newTestStore(t)
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq)
+	t.Cleanup(func() { pq.close() })
+
+	ctx := context.Background()
+	if err := pq.AddTask(ctx, []byte("task")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, token, ok := pq.TryPoll(ctx)
+	if !ok {
+		t.Fatal("expected task")
+	}
+	if err := pq.Ack(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(defaultGCInterval + 300*time.Millisecond)
+
+	info, err := s.GetQueue(ctx, "test-q", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.AckLevel != 0 {
+		t.Fatalf("expected ack level to stay at 0 before GC task starts, got %d", info.AckLevel)
+	}
+}
+
+func TestPhysicalQueue_GCRunsAfterExplicitStart(t *testing.T) {
+	s := newTestStore(t)
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq)
+	startTestGCTask(pq)
+	t.Cleanup(func() { pq.close() })
+
+	ctx := context.Background()
+	if err := pq.AddTask(ctx, []byte("task")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, token, ok := pq.TryPoll(ctx)
+	if !ok {
+		t.Fatal("expected task")
+	}
+	if err := pq.Ack(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		info, err := s.GetQueue(ctx, "test-q", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.AckLevel == 1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	info, err := s.GetQueue(ctx, "test-q", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("expected ack level to advance after GC task starts, got %d", info.AckLevel)
+}
+
+func TestPhysicalQueue_VisibilityScanDoesNotRunUntilExplicitlyStarted(t *testing.T) {
+	s := newTestStore(t)
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 50*time.Millisecond, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq)
+	t.Cleanup(func() { pq.close() })
+
+	ctx := context.Background()
+	if err := pq.AddTask(ctx, []byte("task")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, ok := pq.TryPoll(ctx)
+	if !ok {
+		t.Fatal("expected task")
+	}
+
+	time.Sleep(defaultVisScanInterval + 200*time.Millisecond)
+
+	if row, _, ok := pq.TryPoll(ctx); ok || row != nil {
+		t.Fatalf("expected timed out task to stay hidden before visibility task starts, got ok=%v row=%+v", ok, row)
+	}
+}
+
+func TestPhysicalQueue_VisibilityScanRunsAfterExplicitStart(t *testing.T) {
+	s := newTestStore(t)
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 50*time.Millisecond, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq)
+	startTestVisibilityTask(pq)
+	t.Cleanup(func() { pq.close() })
+
+	ctx := context.Background()
+	if err := pq.AddTask(ctx, []byte("task")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, ok := pq.TryPoll(ctx)
+	if !ok {
+		t.Fatal("expected task")
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		row, _, ok := pq.TryPoll(ctx)
+		if ok {
+			if string(row.Data) != "task" {
+				t.Fatalf("expected redelivered task, got %q", row.Data)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatal("expected timed out task to be redelivered after visibility task starts")
+}
+
+func TestPhysicalQueue_WriterOwnershipLossDoesNotLocallyCancelQueue(t *testing.T) {
+	base := newTestStore(t)
+	store := &conditionFailedUpdateStore{Store: base}
+
+	pq, err := newPhysicalQueue(context.Background(), store, "test-q", 0, 60*time.Second, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq)
+	t.Cleanup(func() { pq.close() })
+
+	store.failUpdate = true
+	err = pq.AddTask(context.Background(), []byte("task"))
+	if !errors.Is(err, ErrOwnershipLost) {
+		t.Fatalf("expected ErrOwnershipLost, got %v", err)
+	}
+	if pq.IsClosed() {
+		t.Fatal("expected ownership loss to be reported upward instead of locally canceling the queue")
+	}
+}
+
+func TestPhysicalQueue_GCOwnershipLossDoesNotLocallyCancelQueue(t *testing.T) {
+	base := newTestStore(t)
+	store := &conditionFailedUpdateStore{Store: base}
+
+	pq, err := newPhysicalQueue(context.Background(), store, "test-q", 0, 60*time.Second, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq)
+	t.Cleanup(func() { pq.close() })
+
+	ctx := context.Background()
+	if err := pq.AddTask(ctx, []byte("task")); err != nil {
+		t.Fatal(err)
+	}
+	_, token, ok := pq.TryPoll(ctx)
+	if !ok {
+		t.Fatal("expected task")
+	}
+	if err := pq.Ack(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+
+	store.failUpdate = true
+	if err := pq.gc.collect(ctx); !errors.Is(err, ErrOwnershipLost) {
+		t.Fatalf("expected ErrOwnershipLost, got %v", err)
+	}
+
+	if pq.IsClosed() {
+		t.Fatal("expected GC ownership loss to be reported upward instead of locally canceling the queue")
+	}
+}
+
+func TestPhysicalQueue_AddTaskWaitsUntilTaskBecomesReadable(t *testing.T) {
+	s := newTestStore(t)
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq)
+	t.Cleanup(func() { pq.close() })
+
+	enteredFlush := make(chan struct{})
+	releaseFlush := make(chan struct{})
+	originalOnFlush := pq.writer.onFlush
+	pq.writer.onFlush = func(rows []*TaskRow) {
+		close(enteredFlush)
+		<-releaseFlush
+		if originalOnFlush != nil {
+			originalOnFlush(rows)
+		}
+	}
+
+	addDone := make(chan error, 1)
+	go func() {
+		addDone <- pq.AddTask(context.Background(), []byte("task"))
+	}()
+
+	select {
+	case <-enteredFlush:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for flush hook")
+	}
+
+	select {
+	case err := <-addDone:
+		t.Fatalf("expected AddTask to stay blocked until task is readable, got %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFlush)
+
+	select {
+	case err := <-addDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for AddTask to finish")
+	}
+
+	row, _, ok := pq.TryPoll(context.Background())
+	if !ok || row == nil {
+		t.Fatal("expected task to be readable after AddTask returns")
+	}
 }
 
 func TestPhysicalQueue_AddAndPoll(t *testing.T) {
@@ -288,6 +611,7 @@ func TestPhysicalQueue_TryPollDoesNotSkipTaskAfterDispatchFailure(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	startTestWriterTask(t, pq)
 	t.Cleanup(func() { pq.close() })
 
 	if err := pq.AddTask(ctx, []byte("task-1")); err != nil {

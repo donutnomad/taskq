@@ -1,13 +1,13 @@
 # TaskQ — 分布式任务队列
 
-TaskQ 是一个 Temporal 风格的分布式任务队列系统，使用 Go 实现。支持多分区、at-least-once 投递语义、一致性哈希路由、DB lease 分区独占、长轮询消费和可见性超时自动重投递。
+TaskQ 是一个 Temporal 风格的分布式任务队列系统，使用 Go 实现。支持多分区、at-least-once 投递语义、一致性哈希路由、`dbleader` 分区独占、长轮询消费和可见性超时自动重投递。
 
 ## 核心特性
 
 - **多分区队列** — 水平扩展吞吐量，round-robin 分发写入
 - **At-least-once 投递** — 可见性超时 + 自动重投递，确保任务不丢失
 - **一致性哈希路由** — 基于虚拟节点的哈希环，分区自动分配到集群节点
-- **DB Lease + RangeID CAS** — 双层所有权保护，悲观锁 + 乐观锁防止脑裂
+- **`dbleader` 锁 + RangeID CAS** — 运行期开关由 `dbleader` 控制，写入围栏继续由 `rangeID` CAS 兜底
 - **长轮询消费** — 无任务时 worker 阻塞等待，任务到达即时唤醒
 - **Sync Match** — 写入时直接匹配等待中的消费者，零延迟投递
 
@@ -69,10 +69,11 @@ type Store interface {
     DeleteTasks(ctx, queueName, partitionID, maxTaskID) (int64, error)
     DeleteTask(ctx, queueName, partitionID, taskID) error
 
-    // 分区 Lease
-    AcquireLease(ctx, queueName, partitionID, owner, ttl) (*QueueInfo, error)
-    RenewLease(ctx, queueName, partitionID, owner, ttl) error
-    ReleaseLease(ctx, queueName, partitionID, owner) error
+    // dbleader 锁
+    TryAcquire(ctx, lockName, nodeIP, ttlSeconds) (AcquireResult, error)
+    Renew(ctx, lockName, nodeIP, ttlSeconds) (bool, error)
+    Release(ctx, lockName, nodeIP) (bool, error)
+    GetLeaderAddr(ctx, lockName) (string, error)
 
     Close() error
 }
@@ -82,12 +83,15 @@ type Store interface {
 
 | 表 | 关键列 | 用途 |
 |---|---|---|
-| `queue_info` | queue_name, partition_id, range_id, ack_level, next_task_id, lease_owner, lease_expires_at | 分区元数据 + Lease |
+| `queue_info` | queue_name, partition_id, range_id, ack_level, next_task_id | 分区元数据 |
 | `tasks` | task_id, queue_name, partition_id, data, created_at, dispatched_at | 任务数据 |
+| `taskq_partition_lock` | lock_name, leader_ip, expire_at_ms, version | `dbleader` 分区锁 |
 
 #### PhysicalQueue — 单分区核心
 
-每个 `PhysicalQueue` 管理一个分区的完整生命周期。它本身只负责统筹，内部再分成几个更小的子组件：
+每个 `PhysicalQueue` 管理一个分区的内存状态和对外服务逻辑。它本身不再在构造时自动启动后台循环；writer、GC、可见性扫描都由外层单独运行。
+
+当前生产路径里，这三个后台循环由 `matching` 为每个分区分别挂成独立的 `dbleader` tasks。
 
 ```mermaid
 graph TB
@@ -98,7 +102,6 @@ graph TB
         WR[waiterRegistry<br/>等待中的 poller]
         GC[taskGC<br/>已确认任务清理]
         VS[visibilityScanner<br/>超时检测]
-        LC[leaseController<br/>Lease 续期/释放]
     end
 
     W -->|onFlush 回调| RT
@@ -106,7 +109,6 @@ graph TB
     RT --> WR
     DS -->|ackLevel| GC
     VS -->|超时 taskID| RT
-    LC -->|每 5s 续期| DB[(DB)]
     W -->|批量写入| DB
     GC -->|DeleteTasks| DB
     VS -->|ResetTimedOutTasks| DB
@@ -114,38 +116,40 @@ graph TB
 
 | 组件 | 职责 | 周期 |
 |---|---|---|
-| **taskWriter** | 收集入队请求，批量 flush 到 DB，触发 sync match | 即时（channel 驱动） |
+| **taskWriter** | 收集入队请求，批量 flush 到 DB，触发 sync match | 由独立 leader task 显式运行 |
 | **taskRuntime** | 负责取任务、dispatch、ack/nack，把存储操作和内存状态衔接起来 | - |
 | **deliveryState** | 内存中维护 outstanding/redelivery/acked 集合，追踪 ackLevel/readLevel/maxReadLevel | - |
 | **waiterRegistry** | 管理长轮询阶段注册的等待者 | - |
-| **taskGC** | 根据 ackLevel 删除已确认的任务，通过 CAS 持久化 ackLevel | 每 5 秒 |
-| **visibilityScanner** | 检测超时的已分发任务，移入 redelivery 队列 | 每 1 秒 |
-| **leaseController** | 续期并释放 DB lease，续期失败时关闭分区 | 每 5 秒 |
-
+| **taskGC** | 根据 ackLevel 删除已确认的任务，通过 CAS 持久化 ackLevel | 由独立 leader task 显式运行 |
+| **visibilityScanner** | 检测超时的已分发任务，移入 redelivery 队列 | 由独立 leader task 显式运行 |
 多分区分配不在 `queue` 包内完成。真实链路是：
 
 - `membership` 负责一致性哈希，把 `queue/partition` 映射到节点
-- `matching` 负责按需加载对应分区，并通过 DB lease 独占该分区
+- `matching` 负责按需加载对应分区，并通过 `dbleader.Manager` 持锁运行、失锁停止
 - `PhysicalQueue` 只负责自己这一个分区的任务生命周期与长轮询
 
-#### 两层所有权保护
+#### 运行期开关与写入围栏
 
 ```mermaid
 graph TD
-    A[节点启动] -->|AcquireLease| B{DB Lease<br/>悲观锁}
-    B -->|成功: 获得独占权| C[加载 PhysicalQueue]
-    B -->|失败: ErrLeaseHeld| D[跳过，其他节点持有]
-    C -->|每 5s RenewLease| E{Lease 续期}
-    E -->|成功| E
-    E -->|失败| F[关闭分区]
-    C -->|写入/GC 时| G{RangeID CAS<br/>乐观锁}
-    G -->|成功: rangeID++| H[操作完成]
-    G -->|失败: ErrOwnershipLost| F
+    A[节点启动/分区被分配] -->|TryAcquire| B{dbleader 锁}
+    B -->|成功| C[创建 PhysicalQueue 状态]
+    C --> D[启动 writer task]
+    C --> E[启动 GC task]
+    C --> F[启动 visibility task]
+    B -->|失败| G[等待下一轮重试]
+    D -->|写入时| H{RangeID CAS}
+    E -->|清理时| H
+    D -->|锁续约失败/主动停止| I[关闭 PhysicalQueue]
+    E -->|锁续约失败/主动停止| I
+    F -->|锁续约失败/主动停止| I
+    H -->|成功| J[操作完成]
+    H -->|失败: ErrOwnershipLost| I
 ```
 
 | 层 | 机制 | 时机 | 作用 |
 |---|---|---|---|
-| **DB Lease** | 悲观锁：`lease_owner` + `lease_expires_at` | 加载分区前 | 防止多节点同时加载同一分区 |
+| **运行期开关** | `dbleader` 锁 | 分区状态创建、writer/GC/扫描器运行、停止 | 保证同一时刻只有一个节点真正对外服务 |
 | **RangeID CAS** | 乐观锁：`UPDATE WHERE range_id = prevRangeID` | 每次写入/GC | 检测写冲突，防止脑裂写入 |
 
 ### Membership 包
@@ -186,7 +190,7 @@ gRPC 分区管理服务，每个节点只处理哈希环分配给自己的分区
 **PartitionManager** 核心逻辑：
 
 - `isOwner(queue, pid)` — 通过哈希环判断本节点是否拥有该分区
-- `getOrLoadPartition` — 延迟加载，首次请求时通过 DB Lease 获取独占权
+- `getOrLoadPartition` — 延迟加载，首次请求时启动 `dbleader.Manager`，等分区真正可服务后再返回
 - `reconcile()` — 成员变更时重新计算分区分配，加载新分区、卸载失去的分区
 
 ### Frontend 包
@@ -311,30 +315,27 @@ sequenceDiagram
     participant N as 节点
     participant HR as HashRing
     participant DB as SQLite
+    participant L as dbleader.Manager
     participant PQ as PhysicalQueue
 
     Note over N,PQ: 启动 / 成员变更时
     N->>HR: Lookup(queue/pid) == self?
     alt 本节点拥有该分区
-        N->>DB: AcquireLease(owner, TTL=15s)
-        alt Lease 获取成功
-            DB-->>N: QueueInfo (rangeID++)
-            N->>PQ: 创建 PhysicalQueue
-            loop 每 5 秒
-                PQ->>DB: RenewLease(owner, TTL=15s)
-            end
-        else 其他节点持有 Lease
-            DB-->>N: ErrLeaseHeld
-            N->>N: 跳过（正常竞争）
+        N->>L: Start(lock=queue/pid)
+        L->>DB: TryAcquire / Renew
+        alt 成功持锁
+            L->>PQ: 创建并托管 PhysicalQueue
+        else 其他节点仍持锁
+            L->>L: 等待并重试
         end
     else 不属于本节点
         N->>N: 跳过
     end
 
     Note over N,PQ: 关闭分区时
-    PQ->>PQ: cancel context
-    PQ->>PQ: 关闭 writer, visScan, gc
-    PQ->>DB: ReleaseLease(owner)
+    N->>L: Stop()
+    L->>PQ: cancel context
+    L->>DB: Release(lock)
 ```
 
 ### 成员变更 → Reconcile
@@ -359,7 +360,7 @@ sequenceDiagram
     PM->>PM: reconcile()
     Note over PM: 计算本节点应拥有的分区
     PM->>PM: 卸载不再属于本节点的分区
-    PM->>PM: 加载新分配的分区 (AcquireLease)
+    PM->>PM: 加载新分配的分区 (启动 dbleader.Manager)
 
     FE->>FE: 清理已离开节点的 gRPC 连接
 ```
@@ -566,19 +567,20 @@ taskq/
 │   ├── store_sqlite.go         # SQLite 初始化与 schema
 │   ├── store_sqlite_queue.go   # queue_info 读写
 │   ├── store_sqlite_tasks.go   # tasks 读写
-│   ├── store_sqlite_lease.go   # lease 相关操作
+│   ├── store_sqlite_lease.go   # 兼容保留的 lease 存储接口
+│   ├── store_sqlite_lock.go    # dbleader 锁存储
+│   ├── session_claim.go        # PhysicalQueue 会话 claim
 │   ├── physical_queue.go       # 单分区队列总控
 │   ├── writer.go               # 批量写入器
 │   ├── task_runtime.go         # 任务获取 / ack / nack 编排
 │   ├── delivery_state.go       # 内存任务状态
 │   ├── waiter_registry.go      # 长轮询等待者管理
 │   ├── token.go                # token 生成与校验
-│   ├── lease_controller.go     # lease 续期与释放
 │   ├── gc.go                   # 已确认任务垃圾回收
 │   ├── visibility.go           # 可见性超时扫描器
 │   ├── ownership.go            # rangeID CAS 所有权
 │   ├── *_test.go               # 测试
-│   └── lease_test.go           # Lease 机制测试
+│   └── lease_test.go           # 兼容保留的 lease 存储测试
 ├── membership/                 # 成员发现 + 一致性哈希
 │   ├── membership.go           # 接口定义
 │   ├── monitor.go              # 心跳 + 成员同步

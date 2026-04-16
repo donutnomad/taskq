@@ -41,7 +41,10 @@ go test -race ./...
 | 对不存在任务的派发/回退/删除必须返回错误 | 缺失行时分别返回 `errTaskNotFound` | `TestDispatchTaskMissingRowReturnsError`, `TestUnDispatchTaskMissingRowReturnsError`, `TestDeleteTaskMissingRowReturnsError` |
 | 分区之间必须隔离 | 同名队列不同分区互不串读 | `TestPartitionIsolation` |
 
-### 2.2 Lease 与所有权
+### 2.2 底层 Lease 存储兼容接口
+
+这组用例只验证 `queue.Store` 里保留的 lease 读写接口仍然可用，方便兼容旧调用方。
+当前运行时分区的启动、停止、交接，已经改成由 `matching` 内部的 `dbleader` 锁控制。
 
 | 必须满足的行为 | 通过标准 | 对应用例 |
 |---|---|---|
@@ -71,6 +74,7 @@ go test -race ./...
 | 基本入队和取队正常 | 写入后可以取到任务和 token | `TestPhysicalQueue_AddAndPoll` |
 | waiter 存在时支持即时匹配 | 先挂起等待，再写任务，等待方能马上收到 | `TestPhysicalQueue_SyncMatch` |
 | `Ack` 完成确认，`Nack` 触发重投递 | nack 后同一任务可以再次被取出 | `TestPhysicalQueue_AckAndNack` |
+| 新建队列本身不能直接接收写入 | 只有 writer task 跑起来后才能成功 `AddTask` | `TestPhysicalQueue_NewQueueDoesNotAcceptWritesUntilWriterTaskRuns` |
 | 阻塞等待在无任务时不会误返回 | 空队列下 waiter 在超时前不应收到任务 | `TestPhysicalQueue_BlockingPoll` |
 | 已经可读的任务不会在注册 waiter 时丢失 | waiter 注册后能立刻拿到已经存在的任务 | `TestPhysicalQueue_RegisterWaiterImmediatelyGetsReadableTask` |
 | 队列关闭后必须停止对外服务 | 关闭后不再返回任务，`Ack/Nack` 返回 `ErrQueueClosed` | `TestPhysicalQueue_CanceledQueueStopsServingAndRejectsAckNack` |
@@ -78,6 +82,10 @@ go test -race ./...
 | 分区不匹配的 token 必须被拒绝 | token 中的分区号与当前分区不一致时返回 `ErrInvalidToken` | `TestPhysicalQueue_AckRejectsTokenForDifferentPartition` |
 | 重复 ack / nack 必须被拒绝 | 第二次调用返回 `ErrTaskNotOutstanding` | `TestPhysicalQueue_AckRejectsDuplicateToken`, `TestPhysicalQueue_NackRejectsDuplicateToken` |
 | 派发失败不能导致任务被跳过 | 某次派发失败后，后续重试仍必须能拿到该任务 | `TestPhysicalQueue_TryPollDoesNotSkipTaskAfterDispatchFailure` |
+| GC 不能在未启动时自己运行 | 未显式启动 GC task 前，`ackLevel` 不得自己推进 | `TestPhysicalQueue_GCDoesNotRunUntilExplicitlyStarted` |
+| GC 启动后必须真正生效 | 显式启动 GC task 后，`ackLevel` 会推进并落库 | `TestPhysicalQueue_GCRunsAfterExplicitStart` |
+| 可见性扫描不能在未启动时自己运行 | 未显式启动扫描 task 前，超时任务不得自己回到可取状态 | `TestPhysicalQueue_VisibilityScanDoesNotRunUntilExplicitlyStarted` |
+| 可见性扫描启动后必须真正生效 | 显式启动扫描 task 后，超时任务会重新可取 | `TestPhysicalQueue_VisibilityScanRunsAfterExplicitStart` |
 
 ### 2.5 Queue 回归用例
 
@@ -86,7 +94,7 @@ go test -race ./...
 | 非 CAS 存储错误不能被误判成所有权丢失 | 原始错误类型必须保留 | `TestBugRepro_UpdateQueueKeepsNonCASFailures` |
 | 同一条任务不能被并发重复发放 | 并发 `TryPoll` 时，同一任务最多只有一个成功结果 | `TestBugRepro_TryPollShouldNotDeliverSameTaskConcurrently` |
 | 重启或重新接管后不能丢掉库里已有未派发任务 | 新建 `PhysicalQueue` 后仍能继续读取旧任务 | `TestBugRepro_NewQueueInstanceShouldReadExistingUndispatchedTasks` |
-| lease 交接窗口内，同一条任务不能被旧 owner 和新 owner 同时发出去 | 两个 owner 并发拉取时，同一任务最多只允许一个成功结果 | `TestBugRepro_LeaseHandoverWindowDoesNotDoubleDeliverSameTask` |
+| 两个 `PhysicalQueue` 实例交接窗口内，同一条任务不能被同时发出去 | 两个实例并发拉取时，同一任务最多只允许一个成功结果 | `TestBugRepro_LeaseHandoverWindowDoesNotDoubleDeliverSameTask` |
 
 ## 三、Matching 包
 
@@ -100,6 +108,8 @@ go test -race ./...
 | 服务停止时，进行中的长轮询不能卡死 | `Stop` 必须能返回，进行中的长轮询必须被中断 | `TestMatchingServer_StopUnblocksInFlightLongPoll` |
 | `AckTask` / `NackTask` 必须校验 token 分区 | token 分区和请求分区不一致时返回 `InvalidArgument` | `TestMatchingServer_AckTaskRejectsTokenPartitionMismatch`, `TestMatchingServer_NackTaskRejectsTokenPartitionMismatch` |
 | 已关闭的分区实例必须能重新加载 | 旧实例关闭后再次访问，会重新创建新实例 | `TestPartitionManager_ReloadsClosedPartition` |
+| 分区实例启动必须等到真正可服务后才能对外返回 | 首次加载分区时，请求不会拿到“句柄已建好但还没真正启动”的空实例 | `TestMatchingServer_AddAndPoll`, `TestPartitionManager_ReloadsClosedPartition` |
+| 分区服务 readiness 必须覆盖 writer、GC、可见性扫描三个后台 task | 分区只有在这些 task 都进入运行态后才算真正 ready | `TestMatchingServer_AddAndPoll`, `TestFrontend_EndToEnd` |
 | 非 owner 节点不能接收该分区请求 | 返回 `FailedPrecondition` | `TestMatchingServer_NotOwner` |
 | 未配置队列必须被拒绝 | 对未知队列写入返回 `NotFound` | `TestBugRepro_AddTaskRejectsUnknownQueue` |
 | 越界分区必须被拒绝 | 对非法分区写入返回 `InvalidArgument` | `TestBugRepro_AddTaskRejectsOutOfRangePartition` |
@@ -117,9 +127,9 @@ go test -race ./...
 | 空队列时应返回明确的“暂无任务”错误 | 返回 `ErrNoTask` | `TestFrontend_DequeueEmpty_ReturnsErrNoTask` |
 | 所有分区都失败时，不能把真实故障伪装成空队列 | 必须把底层错误返回给调用方 | `TestFrontend_DequeueReturnsUnderlyingErrorWhenAllPartitionsFail` |
 | 同一个 resolver 上允许存在多个 Frontend 实例 | 多实例创建成功，不互相冲突 | `TestFrontend_AllowsMultipleInstancesOnSameResolver` |
-| 路由信息变更后，写入可以自动刷新并重试 | 原目标失效后，`Enqueue` 经过刷新仍能成功 | `TestFrontend_EnqueueRetriesAfterResolverRefresh` |
-| 路由信息变更后，确认也可以自动刷新并重试 | 原目标失效后，`Ack` 经过刷新仍能成功 | `TestFrontend_AckRetriesAfterResolverRefresh` |
-| 路由信息变更后，拒绝确认也可以自动刷新并重试 | 原目标失效后，`Nack` 经过刷新仍能成功 | `TestFrontend_NackRetriesAfterResolverRefresh` |
+| 路由信息变更后，写入可以自动刷新并重试 | 旧节点停掉并释放锁后，`Enqueue` 经过刷新仍能成功落到新节点 | `TestFrontend_EnqueueRetriesAfterResolverRefresh` |
+| 路由信息变更后，确认也可以自动刷新并重试 | 旧节点停掉并释放锁后，`Ack` 经过刷新仍能成功落到新节点 | `TestFrontend_AckRetriesAfterResolverRefresh` |
+| 路由信息变更后，拒绝确认也可以自动刷新并重试 | 旧节点停掉并释放锁后，`Nack` 经过刷新仍能成功落到新节点 | `TestFrontend_NackRetriesAfterResolverRefresh` |
 | 调用方取消后，`Dequeue` 必须尽快退出 | 调用方 context 超时或取消后，应快速返回对应取消错误 | `TestFrontend_DequeueReturnsPromptlyWhenCallerContextCanceled` |
 | 长轮询不能漏掉其他分区后来出现的任务 | 某个分区后到任务时，整体 `Dequeue` 仍能收到 | `TestBugRepro_DequeueLongPollMissesOtherPartitions` |
 | 所有权转移类错误必须进入重试集合 | `Aborted` 错误会被识别为可重试 | `TestBugRepro_IsRetryableForOwnershipLoss` |
@@ -174,7 +184,7 @@ go test -race ./...
 
 | 必须符合的行为 | 当前状态 | 建议补测方式 |
 |---|---|---|
-| `PhysicalQueue.Close()` 必须在可接受时间内返回，不能因为底层存储调用卡死而一直挂住 | 未覆盖 | 用会阻塞 `RenewLease` 或其他后台调用的假存储，启动队列后调用 `Close()`，断言它在预设超时时间内返回；即使后台调用仍未结束，也不能无限等待 |
+| `PhysicalQueue.Close()` 必须在可接受时间内返回，不能因为底层存储调用卡死而一直挂住 | 未覆盖 | 用会阻塞写入、清理或超时扫描调用的假存储，启动队列后调用 `Close()`，断言它在预设超时时间内返回；即使后台调用仍未结束，也不能无限等待 |
 | 启动阶段如果重试耗尽，`WaitUntilInitialized` 必须返回明确失败，而不是一直挂住 | 未覆盖 | 让 `UpsertMember` 或 `GetActiveMembers` 持续失败直到超过最大重试次数，断言 `WaitUntilInitialized` 返回非空失败，并且不会超过调用方设定的等待时间 |
 | 长轮询等待时间当前按设计不设服务端上限，必须遵从调用方 context、任务到达或服务停止这三类退出条件 | 未覆盖 | 发起超长 `PollTask/Dequeue`，分别验证任务到达、调用方取消、服务停止三种退出路径 |
 | payload 当前按设计不设应用层大小上限，至少要保证在系统允许范围内不会被代码层主动拒绝 | 未覆盖 | 使用多种大小的 payload 做写入、读取与确认，记录实际可工作范围 |

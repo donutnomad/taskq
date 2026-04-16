@@ -17,7 +17,7 @@ type matchingHandler struct {
 }
 
 func (h *matchingHandler) AddTask(ctx context.Context, req *AddTaskRequest) (*AddTaskResponse, error) {
-	pq, err := h.mgr.getOrLoadPartition(req.QueueName, int(req.PartitionId))
+	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId))
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
@@ -28,13 +28,15 @@ func (h *matchingHandler) AddTask(ctx context.Context, req *AddTaskRequest) (*Ad
 }
 
 func (h *matchingHandler) PollTask(ctx context.Context, req *PollTaskRequest) (*PollTaskResponse, error) {
-	pq, err := h.mgr.getOrLoadPartition(req.QueueName, int(req.PartitionId))
+	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId))
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
 
 	// 1. 非阻塞尝试
-	if row, token, ok := pq.TryPoll(ctx); ok {
+	if row, token, ok, err := pq.TryPoll(ctx); err != nil {
+		return nil, toGRPCError(err)
+	} else if ok {
 		return &PollTaskResponse{Data: row.Data, Token: token}, nil
 	}
 
@@ -45,8 +47,11 @@ func (h *matchingHandler) PollTask(ctx context.Context, req *PollTaskRequest) (*
 
 	// 3. 长轮询：注册 waiter，等待任务或超时
 	ch := make(chan queue.PollResult, 1)
-	elem := pq.RegisterWaiter(ch)
-	defer pq.RemoveWaiter(elem)
+	activePQ, elem, err := pq.RegisterWaiter(ch)
+	if err != nil {
+		return nil, toGRPCError(err)
+	}
+	defer activePQ.RemoveWaiter(elem)
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(req.PollTimeoutMs)*time.Millisecond)
 	defer cancel()
@@ -75,7 +80,7 @@ func (h *matchingHandler) AckTask(ctx context.Context, req *AckTaskRequest) (*Ac
 		return nil, status.Errorf(codes.InvalidArgument, "token partition %d does not match request partition %d", partID, req.PartitionId)
 	}
 
-	pq, err := h.mgr.getOrLoadPartition(req.QueueName, int(req.PartitionId))
+	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId))
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
@@ -97,7 +102,7 @@ func (h *matchingHandler) NackTask(ctx context.Context, req *NackTaskRequest) (*
 		return nil, status.Errorf(codes.InvalidArgument, "token partition %d does not match request partition %d", partID, req.PartitionId)
 	}
 
-	pq, err := h.mgr.getOrLoadPartition(req.QueueName, int(req.PartitionId))
+	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId))
 	if err != nil {
 		return nil, toGRPCError(err)
 	}

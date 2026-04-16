@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	dbleader "github.com/donutnomad/dbleader"
 	"github.com/donutnomad/taskq/membership"
 	"github.com/donutnomad/taskq/queue"
 	"github.com/google/uuid"
@@ -78,6 +79,11 @@ func NewServer(cfg Config) (*Server, error) {
 		cfg.LeaseOwner = uuid.New().String()
 	}
 
+	lockStore, ok := cfg.Store.(dbleader.LockStore)
+	if !ok {
+		return nil, fmt.Errorf("matching: Store must implement dbleader.LockStore")
+	}
+
 	resolver, err := cfg.Monitor.GetResolver(cfg.ServiceName)
 	if err != nil {
 		return nil, fmt.Errorf("matching: get resolver: %w", err)
@@ -85,7 +91,7 @@ func NewServer(cfg Config) (*Server, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	mgr := newPartitionManager(ctx, cfg.Store, cfg.BroadcastAddr, cfg.LeaseOwner, resolver, cfg.VisTimeout, cfg.QueueConfigs)
+	mgr := newPartitionManager(ctx, cfg.Store, lockStore, cfg.BroadcastAddr, cfg.LeaseOwner, resolver, cfg.VisTimeout, cfg.QueueConfigs)
 
 	grpcServer := grpc.NewServer(cfg.GRPCOptions...)
 	handler := &matchingHandler{mgr: mgr}

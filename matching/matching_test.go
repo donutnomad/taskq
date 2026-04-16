@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	dbleader "github.com/donutnomad/dbleader"
 	"github.com/donutnomad/taskq/membership"
 	"github.com/donutnomad/taskq/queue"
 	"google.golang.org/grpc"
@@ -424,6 +425,7 @@ func TestPartitionManager_ReloadsClosedPartition(t *testing.T) {
 	pm := newPartitionManager(
 		context.Background(),
 		store,
+		store.(dbleader.LockStore),
 		"127.0.0.1:9999",
 		"lease-owner",
 		resolver,
@@ -432,13 +434,13 @@ func TestPartitionManager_ReloadsClosedPartition(t *testing.T) {
 	)
 	defer pm.close()
 
-	pq1, err := pm.getOrLoadPartition("test-q", 0)
+	pq1, err := pm.getOrLoadPartition(context.Background(), "test-q", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	pq1.Close()
+	pq1.close()
 
-	pq2, err := pm.getOrLoadPartition("test-q", 0)
+	pq2, err := pm.getOrLoadPartition(context.Background(), "test-q", 0)
 	if err != nil {
 		t.Fatal(err)
 	}

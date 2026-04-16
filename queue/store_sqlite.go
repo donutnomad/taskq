@@ -30,6 +30,12 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_dispatch
 	ON tasks (queue_name, partition_id, dispatched_at)
 	WHERE dispatched_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS taskq_partition_lock (
+	lock_name    TEXT NOT NULL PRIMARY KEY,
+	leader_ip    TEXT NOT NULL,
+	expire_at_ms INTEGER NOT NULL,
+	version      INTEGER NOT NULL DEFAULT 0
+);
 `
 
 type sqliteStore struct {

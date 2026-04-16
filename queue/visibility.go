@@ -3,7 +3,6 @@ package queue
 import (
 	"context"
 	"log/slog"
-	"sync"
 	"time"
 )
 
@@ -12,43 +11,18 @@ const defaultVisScanInterval = 1 * time.Second
 type visibilityScanner struct {
 	pq      *PhysicalQueue
 	runtime *taskRuntime
-
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
 }
 
 func newVisibilityScanner(pq *PhysicalQueue, runtime *taskRuntime) *visibilityScanner {
-	ctx, cancel := context.WithCancel(pq.ctx)
-	vs := &visibilityScanner{
+	return &visibilityScanner{
 		pq:      pq,
 		runtime: runtime,
-		ctx:     ctx,
-		cancel:  cancel,
-	}
-	vs.wg.Add(1)
-	go vs.loop()
-	return vs
-}
-
-func (vs *visibilityScanner) loop() {
-	defer vs.wg.Done()
-	timer := time.NewTimer(defaultVisScanInterval)
-	defer timer.Stop()
-	for {
-		select {
-		case <-timer.C:
-			vs.scan()
-			timer.Reset(defaultVisScanInterval)
-		case <-vs.ctx.Done():
-			return
-		}
 	}
 }
 
-func (vs *visibilityScanner) scan() {
+func (vs *visibilityScanner) scan(ctx context.Context) {
 	ids, err := vs.pq.store.ResetTimedOutTasks(
-		vs.ctx,
+		ctx,
 		vs.pq.queueName,
 		vs.pq.partitionID,
 		vs.runtime.ackLevel(),
@@ -66,6 +40,4 @@ func (vs *visibilityScanner) scan() {
 }
 
 func (vs *visibilityScanner) close() {
-	vs.cancel()
-	vs.wg.Wait()
 }

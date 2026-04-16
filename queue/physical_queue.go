@@ -15,11 +15,6 @@ type PollResult struct {
 	Err   error
 }
 
-const (
-	defaultLeaseTTL   = 15 * time.Second
-	defaultLeaseRenew = 5 * time.Second
-)
-
 // PhysicalQueue 单分区队列核心，负责装配各个子组件。
 type PhysicalQueue struct {
 	store       Store
@@ -27,14 +22,12 @@ type PhysicalQueue struct {
 	partitionID int
 	ownership   *ownershipState
 	visTimeout  time.Duration
-	leaseOwner  string
 
-	waiters  *waiterRegistry
-	runtime  *taskRuntime
-	writer   *taskWriter
-	gc       *taskGC
-	visScan  *visibilityScanner
-	leaseCtl *leaseController
+	waiters *waiterRegistry
+	runtime *taskRuntime
+	writer  *taskWriter
+	gc      *taskGC
+	visScan *visibilityScanner
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -47,9 +40,9 @@ func newPhysicalQueue(
 	queueName string,
 	partitionID int,
 	visTimeout time.Duration,
-	leaseOwner string,
+	_ string,
 ) (*PhysicalQueue, error) {
-	info, err := store.AcquireLease(ctx, queueName, partitionID, leaseOwner, defaultLeaseTTL)
+	info, err := claimQueueOwnership(ctx, store, queueName, partitionID)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +54,6 @@ func newPhysicalQueue(
 		partitionID: partitionID,
 		ownership:   newOwnershipState(store, info.RangeID),
 		visTimeout:  visTimeout,
-		leaseOwner:  leaseOwner,
 		waiters:     newWaiterRegistry(),
 		ctx:         queueCtx,
 		cancel:      cancel,
@@ -74,7 +66,6 @@ func newPhysicalQueue(
 	pq.writer = newTaskWriter(pq, info.NextTaskID, pq.onFlush)
 	pq.gc = newTaskGC(pq, pq.runtime)
 	pq.visScan = newVisibilityScanner(pq, pq.runtime)
-	pq.leaseCtl = newLeaseController(pq)
 
 	return pq, nil
 }
@@ -185,14 +176,27 @@ func (pq *PhysicalQueue) close() {
 		pq.writer.close()
 		pq.visScan.close()
 		pq.gc.close()
-		pq.leaseCtl.wait()
-		pq.leaseCtl.release()
 	})
+}
+
+func (pq *PhysicalQueue) runWriter(ctx context.Context) error {
+	return pq.writer.run(ctx)
+}
+
+func (pq *PhysicalQueue) waitUntilWriterStarted(ctx context.Context) error {
+	return pq.writer.waitUntilStarted(ctx)
+}
+
+func (pq *PhysicalQueue) runGCOnce(ctx context.Context) error {
+	return pq.gc.collect(ctx)
+}
+
+func (pq *PhysicalQueue) runVisibilityScanOnce(ctx context.Context) {
+	pq.visScan.scan(ctx)
 }
 
 // NewPhysicalQueue 创建单个分区的物理队列。
 // 分布式模式下由 matching 服务调用，每个 PhysicalQueue 独立管理一个分区。
-// leaseOwner 用于 DB lease 独占分区，如果 lease 被其他节点持有则返回 ErrLeaseHeld。
 func NewPhysicalQueue(
 	ctx context.Context,
 	store Store,
@@ -242,6 +246,26 @@ func (pq *PhysicalQueue) Close() {
 // IsClosed 返回分区是否已停止服务。
 func (pq *PhysicalQueue) IsClosed() bool {
 	return pq.ctx.Err() != nil
+}
+
+// RunWriter 运行本分区的写入循环，通常由 leader task 托管。
+func (pq *PhysicalQueue) RunWriter(ctx context.Context) error {
+	return pq.runWriter(ctx)
+}
+
+// WaitUntilWriterStarted 等待写入循环真正进入运行态。
+func (pq *PhysicalQueue) WaitUntilWriterStarted(ctx context.Context) error {
+	return pq.waitUntilWriterStarted(ctx)
+}
+
+// RunGCOnce 执行一次 GC。
+func (pq *PhysicalQueue) RunGCOnce(ctx context.Context) error {
+	return pq.runGCOnce(ctx)
+}
+
+// RunVisibilityScanOnce 执行一次可见性扫描。
+func (pq *PhysicalQueue) RunVisibilityScanOnce(ctx context.Context) {
+	pq.runVisibilityScanOnce(ctx)
 }
 
 // ParseToken 解析 ack token，返回分区 ID 和任务 ID。

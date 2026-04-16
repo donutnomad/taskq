@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	dbleader "github.com/donutnomad/dbleader"
 	"github.com/donutnomad/taskq/membership"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -69,6 +70,7 @@ func TestBugRepro_ReconcileKeepsLoadedPartitionsWhenOwnershipLookupFails(t *test
 	pm := newPartitionManager(
 		context.Background(),
 		store,
+		store.(dbleader.LockStore),
 		"127.0.0.1:9999",
 		"owner-a",
 		resolver,
@@ -77,7 +79,7 @@ func TestBugRepro_ReconcileKeepsLoadedPartitionsWhenOwnershipLookupFails(t *test
 	)
 	t.Cleanup(pm.close)
 
-	pq, err := pm.getOrLoadPartition("known-q", 0)
+	pq, err := pm.getOrLoadPartition(context.Background(), "known-q", 0)
 	if err != nil {
 		t.Fatalf("expected partition to load before reproducing reconcile issue: %v", err)
 	}
@@ -85,7 +87,7 @@ func TestBugRepro_ReconcileKeepsLoadedPartitionsWhenOwnershipLookupFails(t *test
 	resolver.lookupErr = errors.New("membership lookup failed")
 	pm.reconcile()
 
-	if pq.IsClosed() {
+	if !pq.isActive() {
 		t.Fatal("expected transient membership lookup failure to keep loaded partition alive")
 	}
 	if _, ok := pm.partitions[partitionKey("known-q", 0)]; !ok {

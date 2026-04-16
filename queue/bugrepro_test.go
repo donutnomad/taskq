@@ -109,6 +109,7 @@ func TestBugRepro_TryPollShouldNotDeliverSameTaskConcurrently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	startTestWriterTask(t, pq)
 	t.Cleanup(func() { pq.Close() })
 
 	if err := pq.AddTask(context.Background(), []byte("task-1")); err != nil {
@@ -164,6 +165,7 @@ func TestBugRepro_NewQueueInstanceShouldReadExistingUndispatchedTasks(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	startTestWriterTask(t, pq1)
 	if err := pq1.AddTask(context.Background(), []byte("persisted-task")); err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +175,7 @@ func TestBugRepro_NewQueueInstanceShouldReadExistingUndispatchedTasks(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	startTestWriterTask(t, pq2)
 	t.Cleanup(func() { pq2.Close() })
 
 	row, _, ok := pq2.TryPoll(context.Background())
@@ -192,6 +195,7 @@ func TestBugRepro_LeaseHandoverWindowDoesNotDoubleDeliverSameTask(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	startTestWriterTask(t, pqOld)
 	defer pqOld.Close()
 
 	if err := pqOld.AddTask(context.Background(), []byte("task-1")); err != nil {
@@ -215,6 +219,7 @@ func TestBugRepro_LeaseHandoverWindowDoesNotDoubleDeliverSameTask(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	startTestWriterTask(t, pqNew)
 	defer pqNew.Close()
 
 	type pollResult struct {
