@@ -87,23 +87,26 @@ type Store interface {
 
 #### PhysicalQueue — 单分区核心
 
-每个 `PhysicalQueue` 管理一个分区的完整生命周期，包含 5 个后台组件：
+每个 `PhysicalQueue` 管理一个分区的完整生命周期。它本身只负责统筹，内部再分成几个更小的子组件：
 
 ```mermaid
 graph TB
     subgraph PhysicalQueue
         W[taskWriter<br/>批量写入]
-        DM[dbTaskManager<br/>内存任务状态]
+        RT[taskRuntime<br/>任务读写编排]
+        DS[deliveryState<br/>内存任务状态]
+        WR[waiterRegistry<br/>等待中的 poller]
         GC[taskGC<br/>已确认任务清理]
         VS[visibilityScanner<br/>超时检测]
-        LR[leaseRenewLoop<br/>Lease 续期]
+        LC[leaseController<br/>Lease 续期/释放]
     end
 
-    W -->|onFlush 回调| DM
-    DM -->|ackLevel| GC
-    VS -->|moveToRedelivery| DM
-    DM -->|redelivery/getTask| WAIT[waiters 等待队列]
-    LR -->|每 5s 续期| DB[(DB)]
+    W -->|onFlush 回调| RT
+    RT --> DS
+    RT --> WR
+    DS -->|ackLevel| GC
+    VS -->|超时 taskID| RT
+    LC -->|每 5s 续期| DB[(DB)]
     W -->|批量写入| DB
     GC -->|DeleteTasks| DB
     VS -->|ResetTimedOutTasks| DB
@@ -112,10 +115,12 @@ graph TB
 | 组件 | 职责 | 周期 |
 |---|---|---|
 | **taskWriter** | 收集入队请求，批量 flush 到 DB，触发 sync match | 即时（channel 驱动） |
-| **dbTaskManager** | 内存中维护 outstanding/redelivery/acked 集合，追踪 ackLevel | - |
+| **taskRuntime** | 负责取任务、dispatch、ack/nack，把存储操作和内存状态衔接起来 | - |
+| **deliveryState** | 内存中维护 outstanding/redelivery/acked 集合，追踪 ackLevel/readLevel/maxReadLevel | - |
+| **waiterRegistry** | 管理长轮询阶段注册的等待者 | - |
 | **taskGC** | 根据 ackLevel 删除已确认的任务，通过 CAS 持久化 ackLevel | 每 5 秒 |
 | **visibilityScanner** | 检测超时的已分发任务，移入 redelivery 队列 | 每 1 秒 |
-| **leaseRenewLoop** | 续期 DB lease，失败时关闭分区 | 每 5 秒 |
+| **leaseController** | 续期并释放 DB lease，续期失败时关闭分区 | 每 5 秒 |
 
 多分区分配不在 `queue` 包内完成。真实链路是：
 
@@ -275,27 +280,27 @@ sequenceDiagram
     participant F as Frontend
     participant M as Matching
     participant PQ as PhysicalQueue
-    participant DM as dbTaskManager
+    participant RT as taskRuntime
+    participant DS as deliveryState
     participant DB as SQLite
 
     Note over W,DB: Ack 流程
     W->>F: Ack(token="pid:taskID")
     F->>M: gRPC AckTask(token)
     M->>PQ: Ack(token)
-    PQ->>DM: ack(taskID)
-    DM->>DM: 从 outstanding 移除
-    DM->>DM: 标记 acked, 尝试推进 ackLevel
-    Note over DM: ackLevel 推进到最大连续已确认 ID
-    DM->>DB: (GC 周期) DeleteTasks(ackLevel)
+    PQ->>RT: ack(taskID)
+    RT->>DS: 从 outstanding 移除
+    DS->>DS: 标记 acked, 尝试推进 ackLevel
+    Note over DS: ackLevel 推进到最大连续已确认 ID
+    PQ->>DB: (GC 周期) DeleteTasks(ackLevel)
 
     Note over W,DB: Nack 流程
     W->>F: Nack(token)
     F->>M: gRPC NackTask(token)
     M->>PQ: Nack(token)
-    PQ->>DM: nack(taskID)
-    DM->>DM: 从 outstanding 移除
-    DM->>DB: UnDispatchTask(taskID)
-    DM->>DM: 放入 redelivery 队列
+    PQ->>RT: nack(taskID)
+    RT->>DB: UnDispatchTask(taskID)
+    RT->>DS: 从 outstanding 移除，放入 redelivery
     PQ->>PQ: wakeWaiters() → 投递给等待中的 poller
 ```
 
@@ -361,7 +366,7 @@ sequenceDiagram
 
 ## PhysicalQueue 内部结构
 
-### dbTaskManager 状态机
+### deliveryState 状态
 
 ```
 内存状态：
@@ -376,9 +381,9 @@ sequenceDiagram
 └─────────────────────────────────────────────────────┘
 
 任务状态流转：
-  DB → getTask() → outstanding → ack() → acked → advanceAckLevel → GC 删除
-                                 nack() → redelivery → getTask() → outstanding → ...
-                  visScan 超时 → redelivery → getTask() → outstanding → ...
+  DB → taskRuntime.tryGetTask() → outstanding → ack() → acked → advanceAckLevel → GC 删除
+                                             nack() → redelivery → taskRuntime.tryGetTask() → outstanding → ...
+                        visScan 超时 → redelivery → taskRuntime.tryGetTask() → outstanding → ...
 
 ackLevel 推进规则 (advanceAckLevel)：
   从 ackLevel+1 开始逐个检查：
@@ -388,7 +393,9 @@ ackLevel 推进规则 (advanceAckLevel)：
   - 其他 → 停止（还没读到）
 ```
 
-### Sync Match 与 waiters
+`deliveryState` 只维护内存中的任务状态；真正和 DB 打交道的是 `taskRuntime`。这样状态规则和存储调用分开，`PhysicalQueue` 自己只需要装配这些组件。
+
+### Sync Match 与 waiterRegistry
 
 ```
 任务写入 → taskWriter flush → onFlush 回调：
@@ -396,11 +403,12 @@ ackLevel 推进规则 (advanceAckLevel)：
   ┌─────────────────────────────┐
   │ 遍历 flush 的每个 row：      │
   │  1. setMaxReadLevel(taskID)  │
-  │  2. 有 waiter？              │
-  │     ├─ 是 → 取出 waiter      │
-  │     │     → dbMgr.getTask()  │
-  │     │     → 发送到 channel   │
-  │     └─ 否 → 保留在本分区      │
+  │  2. taskRuntime 尝试投递      │
+  │  3. waiterRegistry 有等待者？ │
+  │     ├─ 是 → 取出 waiter       │
+  │     │     → dispatch 任务     │
+  │     │     → 发送到 channel    │
+  │     └─ 否 → 保留在本分区       │
   └─────────────────────────────┘
   
   后续 `TryPoll` / `RegisterWaiter` 仍然只消费本分区中的可读任务。
@@ -555,11 +563,17 @@ go run ./example/
 taskq/
 ├── queue/                      # 核心存储引擎
 │   ├── store.go                # Store 接口定义
-│   ├── store_sqlite.go         # SQLite 实现（WAL 模式）
-│   ├── physical_queue.go       # 单分区队列（核心）
-│   ├── queue.go                # 多分区队列 + 转发模型
+│   ├── store_sqlite.go         # SQLite 初始化与 schema
+│   ├── store_sqlite_queue.go   # queue_info 读写
+│   ├── store_sqlite_tasks.go   # tasks 读写
+│   ├── store_sqlite_lease.go   # lease 相关操作
+│   ├── physical_queue.go       # 单分区队列总控
 │   ├── writer.go               # 批量写入器
-│   ├── db_task_manager.go      # 内存任务状态管理
+│   ├── task_runtime.go         # 任务获取 / ack / nack 编排
+│   ├── delivery_state.go       # 内存任务状态
+│   ├── waiter_registry.go      # 长轮询等待者管理
+│   ├── token.go                # token 生成与校验
+│   ├── lease_controller.go     # lease 续期与释放
 │   ├── gc.go                   # 已确认任务垃圾回收
 │   ├── visibility.go           # 可见性超时扫描器
 │   ├── ownership.go            # rangeID CAS 所有权

@@ -2,6 +2,8 @@ package queue
 
 import (
 	"context"
+	"errors"
+	"log"
 	"sync"
 	"time"
 )
@@ -9,28 +11,21 @@ import (
 const defaultGCInterval = 5 * time.Second
 
 type taskGC struct {
-	store       Store
-	queueName   string
-	partitionID int
-	dbManager   *dbTaskManager
-	ownership   *ownershipState
+	pq      *PhysicalQueue
+	runtime *taskRuntime
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
-func newTaskGC(ctx context.Context, store Store, queueName string,
-	partitionID int, ownership *ownershipState, dbManager *dbTaskManager) *taskGC {
-	ctx, cancel := context.WithCancel(ctx)
+func newTaskGC(pq *PhysicalQueue, runtime *taskRuntime) *taskGC {
+	ctx, cancel := context.WithCancel(pq.ctx)
 	g := &taskGC{
-		store:       store,
-		queueName:   queueName,
-		partitionID: partitionID,
-		dbManager:   dbManager,
-		ownership:   ownership,
-		ctx:         ctx,
-		cancel:      cancel,
+		pq:      pq,
+		runtime: runtime,
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 	g.wg.Add(1)
 	go g.loop()
@@ -53,20 +48,30 @@ func (g *taskGC) loop() {
 }
 
 func (g *taskGC) run() {
-	ackLevel := g.dbManager.getAckLevel()
+	ackLevel := g.runtime.ackLevel()
 	if ackLevel <= 0 {
 		return
 	}
-	g.store.DeleteTasks(g.ctx, g.queueName, g.partitionID, ackLevel)
+	if _, err := g.pq.store.DeleteTasks(g.ctx, g.pq.queueName, g.pq.partitionID, ackLevel); err != nil {
+		log.Printf("queue: gc delete failed for %s/%d: %v", g.pq.queueName, g.pq.partitionID, err)
+		return
+	}
 
 	// 通过 ownershipState CAS 同步 ackLevel 到 queue_info
-	info, err := g.store.GetQueue(g.ctx, g.queueName, g.partitionID)
+	info, err := g.pq.store.GetQueue(g.ctx, g.pq.queueName, g.pq.partitionID)
 	if err != nil {
+		log.Printf("queue: gc load queue info failed for %s/%d: %v", g.pq.queueName, g.pq.partitionID, err)
 		return
 	}
 	if info.AckLevel < ackLevel {
 		info.AckLevel = ackLevel
-		g.ownership.updateQueue(g.ctx, info)
+		if err := g.pq.ownership.updateQueue(g.ctx, info); err != nil {
+			if errors.Is(err, ErrOwnershipLost) {
+				g.pq.cancel()
+				return
+			}
+			log.Printf("queue: gc persist ack level failed for %s/%d: %v", g.pq.queueName, g.pq.partitionID, err)
+		}
 	}
 }
 

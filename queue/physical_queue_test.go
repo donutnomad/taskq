@@ -3,9 +3,46 @@ package queue
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
+
+type flakyDispatchStore struct {
+	Store
+	mu               sync.Mutex
+	failDispatchFor  map[int64]error
+	dispatchAttempts map[int64]int
+}
+
+func newFlakyDispatchStore(base Store) *flakyDispatchStore {
+	return &flakyDispatchStore{
+		Store:            base,
+		failDispatchFor:  make(map[int64]error),
+		dispatchAttempts: make(map[int64]int),
+	}
+}
+
+func (s *flakyDispatchStore) DispatchTask(
+	ctx context.Context,
+	queueName string,
+	partitionID int,
+	taskID int64,
+	dispatchedAt time.Time,
+) error {
+	s.mu.Lock()
+	err := s.failDispatchFor[taskID]
+	if err != nil {
+		delete(s.failDispatchFor, taskID)
+	}
+	s.dispatchAttempts[taskID]++
+	s.mu.Unlock()
+
+	if err != nil {
+		return err
+	}
+	return s.Store.DispatchTask(ctx, queueName, partitionID, taskID, dispatchedAt)
+}
 
 func newTestPhysicalQueue(t *testing.T) (*PhysicalQueue, Store) {
 	t.Helper()
@@ -162,5 +199,110 @@ func TestPhysicalQueue_CanceledQueueStopsServingAndRejectsAckNack(t *testing.T) 
 	}
 	if err := pq.nack(ctx, tok2); !errors.Is(err, ErrQueueClosed) {
 		t.Fatalf("expected ErrQueueClosed from nack after cancellation, got %v", err)
+	}
+}
+
+func TestPhysicalQueue_AckRejectsInvalidToken(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+
+	err := pq.Ack(context.Background(), "bad-token")
+	if !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("expected ErrInvalidToken, got %v", err)
+	}
+}
+
+func TestPhysicalQueue_AckRejectsTokenForDifferentPartition(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+	ctx := context.Background()
+
+	if err := pq.AddTask(ctx, []byte("task")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, token, ok := pq.TryPoll(ctx)
+	if !ok {
+		t.Fatal("expected task")
+	}
+
+	err := pq.Ack(ctx, "99:1")
+	if !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("expected ErrInvalidToken for mismatched partition, got %v", err)
+	}
+
+	if err := pq.Ack(ctx, token); err != nil {
+		t.Fatalf("expected original token to remain valid, got %v", err)
+	}
+}
+
+func TestPhysicalQueue_AckRejectsDuplicateToken(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+	ctx := context.Background()
+
+	if err := pq.AddTask(ctx, []byte("task")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, token, ok := pq.TryPoll(ctx)
+	if !ok {
+		t.Fatal("expected task")
+	}
+	if err := pq.Ack(ctx, token); err != nil {
+		t.Fatalf("expected first ack to succeed, got %v", err)
+	}
+
+	err := pq.Ack(ctx, token)
+	if !errors.Is(err, ErrTaskNotOutstanding) {
+		t.Fatalf("expected ErrTaskNotOutstanding, got %v", err)
+	}
+}
+
+func TestPhysicalQueue_NackRejectsDuplicateToken(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+	ctx := context.Background()
+
+	if err := pq.AddTask(ctx, []byte("task")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, token, ok := pq.TryPoll(ctx)
+	if !ok {
+		t.Fatal("expected task")
+	}
+	if err := pq.Nack(ctx, token); err != nil {
+		t.Fatalf("expected first nack to succeed, got %v", err)
+	}
+
+	err := pq.Nack(ctx, token)
+	if !errors.Is(err, ErrTaskNotOutstanding) {
+		t.Fatalf("expected ErrTaskNotOutstanding, got %v", err)
+	}
+}
+
+func TestPhysicalQueue_TryPollDoesNotSkipTaskAfterDispatchFailure(t *testing.T) {
+	base := newTestStore(t)
+	store := newFlakyDispatchStore(base)
+	store.failDispatchFor[1] = errors.New("transient dispatch failure")
+
+	ctx := context.Background()
+	pq, err := newPhysicalQueue(ctx, store, "test-q", 0, 60*time.Second, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pq.close() })
+
+	if err := pq.AddTask(ctx, []byte("task-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	if row, _, ok := pq.TryPoll(ctx); ok || row != nil {
+		t.Fatalf("expected first poll to fail closed over transient dispatch error, got ok=%v row=%+v", ok, row)
+	}
+
+	row, _, ok := pq.TryPoll(ctx)
+	if !ok {
+		t.Fatal("expected task after transient dispatch failure")
+	}
+	if string(row.Data) != "task-1" {
+		t.Fatalf("expected task-1, got %s", row.Data)
 	}
 }

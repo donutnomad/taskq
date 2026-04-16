@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"log"
 	"sync"
 	"time"
 )
@@ -9,30 +10,21 @@ import (
 const defaultVisScanInterval = 1 * time.Second
 
 type visibilityScanner struct {
-	store       Store
-	queueName   string
-	partitionID int
-	dbManager   *dbTaskManager
-	visTimeout  time.Duration
-	onReset     func() // 有任务被重置时调用（唤醒 waitingPollers）
+	pq      *PhysicalQueue
+	runtime *taskRuntime
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
-func newVisibilityScanner(ctx context.Context, store Store, queueName string,
-	partitionID int, dbManager *dbTaskManager, visTimeout time.Duration, onReset func()) *visibilityScanner {
-	ctx, cancel := context.WithCancel(ctx)
+func newVisibilityScanner(pq *PhysicalQueue, runtime *taskRuntime) *visibilityScanner {
+	ctx, cancel := context.WithCancel(pq.ctx)
 	vs := &visibilityScanner{
-		store:       store,
-		queueName:   queueName,
-		partitionID: partitionID,
-		dbManager:   dbManager,
-		visTimeout:  visTimeout,
-		onReset:     onReset,
-		ctx:         ctx,
-		cancel:      cancel,
+		pq:      pq,
+		runtime: runtime,
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 	vs.wg.Add(1)
 	go vs.loop()
@@ -55,18 +47,22 @@ func (vs *visibilityScanner) loop() {
 }
 
 func (vs *visibilityScanner) scan() {
-	ackLevel := vs.dbManager.getAckLevel()
-	ids, err := vs.store.ResetTimedOutTasks(vs.ctx, vs.queueName, vs.partitionID,
-		ackLevel, vs.visTimeout)
-	if err != nil || len(ids) == 0 {
+	ids, err := vs.pq.store.ResetTimedOutTasks(
+		vs.ctx,
+		vs.pq.queueName,
+		vs.pq.partitionID,
+		vs.runtime.ackLevel(),
+		vs.pq.visTimeout,
+	)
+	if err != nil {
+		log.Printf("queue: visibility scan failed for %s/%d: %v", vs.pq.queueName, vs.pq.partitionID, err)
 		return
 	}
-	for _, id := range ids {
-		vs.dbManager.moveToRedelivery(id)
+	if len(ids) == 0 {
+		return
 	}
-	if vs.onReset != nil {
-		vs.onReset()
-	}
+	vs.runtime.moveTimedOutTasksToRedelivery(ids)
+	vs.runtime.tryDeliverToWaiters()
 }
 
 func (vs *visibilityScanner) close() {

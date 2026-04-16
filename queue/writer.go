@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -16,10 +17,7 @@ type writeRequest struct {
 }
 
 type taskWriter struct {
-	store       Store
-	queueName   string
-	partitionID int
-	ownership   *ownershipState
+	pq *PhysicalQueue
 
 	mu        sync.Mutex
 	nextID    int64
@@ -34,21 +32,17 @@ type taskWriter struct {
 	wg     sync.WaitGroup
 }
 
-func newTaskWriter(ctx context.Context, store Store, queueName string,
-	partitionID int, ownership *ownershipState, nextTaskID int64, onFlush func([]*TaskRow)) *taskWriter {
-	ctx, cancel := context.WithCancel(ctx)
+func newTaskWriter(pq *PhysicalQueue, nextTaskID int64, onFlush func([]*TaskRow)) *taskWriter {
+	ctx, cancel := context.WithCancel(pq.ctx)
 	w := &taskWriter{
-		store:       store,
-		queueName:   queueName,
-		partitionID: partitionID,
-		ownership:   ownership,
-		nextID:      nextTaskID,
-		maxID:       nextTaskID,
-		blockSize:   defaultBlockSize,
-		reqCh:       make(chan *writeRequest, 256),
-		onFlush:     onFlush,
-		ctx:         ctx,
-		cancel:      cancel,
+		pq:        pq,
+		nextID:    nextTaskID,
+		maxID:     nextTaskID,
+		blockSize: defaultBlockSize,
+		reqCh:     make(chan *writeRequest, 256),
+		onFlush:   onFlush,
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 	w.wg.Add(1)
 	go w.loop()
@@ -111,8 +105,8 @@ func (w *taskWriter) flush(batch []*writeRequest) {
 	for i, req := range batch {
 		rows[i] = &TaskRow{
 			TaskID:      w.nextID,
-			QueueName:   w.queueName,
-			PartitionID: w.partitionID,
+			QueueName:   w.pq.queueName,
+			PartitionID: w.pq.partitionID,
 			Data:        req.data,
 			CreatedAt:   now,
 		}
@@ -120,7 +114,7 @@ func (w *taskWriter) flush(batch []*writeRequest) {
 		w.nextID++
 	}
 
-	err := w.store.CreateTasks(w.ctx, rows)
+	err := w.pq.store.CreateTasks(w.ctx, rows)
 	for _, req := range batch {
 		req.done <- err
 	}
@@ -138,17 +132,20 @@ func (w *taskWriter) allocateRange(minSize int64) error {
 		size = minSize
 	}
 	newNextTaskID := w.nextID + size
-	cur, err := w.store.GetQueue(w.ctx, w.queueName, w.partitionID)
+	cur, err := w.pq.store.GetQueue(w.ctx, w.pq.queueName, w.pq.partitionID)
 	if err != nil {
 		return err
 	}
 	info := &QueueInfo{
-		QueueName:   w.queueName,
-		PartitionID: w.partitionID,
+		QueueName:   w.pq.queueName,
+		PartitionID: w.pq.partitionID,
 		AckLevel:    cur.AckLevel,
 		NextTaskID:  newNextTaskID,
 	}
-	if err := w.ownership.updateQueue(w.ctx, info); err != nil {
+	if err := w.pq.ownership.updateQueue(w.ctx, info); err != nil {
+		if errors.Is(err, ErrOwnershipLost) {
+			w.pq.cancel()
+		}
 		return err
 	}
 	w.maxID = newNextTaskID

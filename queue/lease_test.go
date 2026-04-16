@@ -124,6 +124,21 @@ func TestReleaseLease(t *testing.T) {
 	}
 }
 
+func TestReleaseLeaseWrongOwnerReturnsErrLeaseHeld(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	_, err := s.AcquireLease(ctx, "q", 0, "owner-a", 15*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = s.ReleaseLease(ctx, "q", 0, "owner-b")
+	if !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("expected ErrLeaseHeld, got %v", err)
+	}
+}
+
 func TestRenewLease(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

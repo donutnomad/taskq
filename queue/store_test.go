@@ -166,6 +166,33 @@ func TestDeleteTask(t *testing.T) {
 	}
 }
 
+func TestDispatchTaskMissingRowReturnsError(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.DispatchTask(context.Background(), "q", 0, 42, time.Now())
+	if !errors.Is(err, errTaskNotFound) {
+		t.Fatalf("expected errTaskNotFound, got %v", err)
+	}
+}
+
+func TestUnDispatchTaskMissingRowReturnsError(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.UnDispatchTask(context.Background(), "q", 0, 42)
+	if !errors.Is(err, errTaskNotFound) {
+		t.Fatalf("expected errTaskNotFound, got %v", err)
+	}
+}
+
+func TestDeleteTaskMissingRowReturnsError(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.DeleteTask(context.Background(), "q", 0, 42)
+	if !errors.Is(err, errTaskNotFound) {
+		t.Fatalf("expected errTaskNotFound, got %v", err)
+	}
+}
+
 func TestPartitionIsolation(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

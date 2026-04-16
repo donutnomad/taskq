@@ -80,6 +80,9 @@ func (h *matchingHandler) AckTask(ctx context.Context, req *AckTaskRequest) (*Ac
 		return nil, toGRPCError(err)
 	}
 	if err := pq.Ack(ctx, req.Token); err != nil {
+		if errors.Is(err, queue.ErrTaskNotOutstanding) {
+			return &AckTaskResponse{}, nil
+		}
 		return nil, toGRPCError(err)
 	}
 	return &AckTaskResponse{}, nil
@@ -99,6 +102,9 @@ func (h *matchingHandler) NackTask(ctx context.Context, req *NackTaskRequest) (*
 		return nil, toGRPCError(err)
 	}
 	if err := pq.Nack(ctx, req.Token); err != nil {
+		if errors.Is(err, queue.ErrTaskNotOutstanding) {
+			return &NackTaskResponse{}, nil
+		}
 		return nil, toGRPCError(err)
 	}
 	return &NackTaskResponse{}, nil
