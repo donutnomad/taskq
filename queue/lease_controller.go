@@ -3,7 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -37,7 +37,7 @@ func (lc *leaseController) loop() {
 				defaultLeaseTTL,
 			)
 			if err != nil {
-				log.Printf("queue: lease renew failed for %s/%d: %v", lc.pq.queueName, lc.pq.partitionID, err)
+				slog.Error("queue lease renew failed", "queue", lc.pq.queueName, "partition_id", lc.pq.partitionID, "err", err)
 				lc.pq.cancel()
 				return
 			}
@@ -60,6 +60,6 @@ func (lc *leaseController) release() {
 		lc.pq.leaseOwner,
 	)
 	if err != nil && !errors.Is(err, ErrLeaseHeld) {
-		log.Printf("queue: failed to release lease for %s/%d: %v", lc.pq.queueName, lc.pq.partitionID, err)
+		slog.Error("queue lease release failed", "queue", lc.pq.queueName, "partition_id", lc.pq.partitionID, "err", err)
 	}
 }

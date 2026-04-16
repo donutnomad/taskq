@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -131,7 +131,7 @@ func (pm *partitionManager) reconcile() {
 	// 卸载不再属于本节点的分区
 	for key, pq := range pm.partitions {
 		if _, ok := owned[key]; !ok {
-			log.Printf("matching: unloading partition %s", key)
+			slog.Info("matching unloading partition", "partition", key)
 			pq.Close()
 			delete(pm.partitions, key)
 		}
@@ -147,10 +147,10 @@ func (pm *partitionManager) reconcile() {
 			continue // 正常竞争，其他节点持有 lease
 		}
 		if err != nil {
-			log.Printf("matching: failed to load partition %s: %v", key, err)
+			slog.Error("matching failed to load partition", "partition", key, "err", err)
 			continue
 		}
-		log.Printf("matching: loaded partition %s", key)
+		slog.Info("matching loaded partition", "partition", key)
 		pm.partitions[key] = pq
 	}
 }

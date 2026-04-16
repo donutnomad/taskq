@@ -2,7 +2,7 @@ package queue
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -55,7 +55,7 @@ func (vs *visibilityScanner) scan() {
 		vs.pq.visTimeout,
 	)
 	if err != nil {
-		log.Printf("queue: visibility scan failed for %s/%d: %v", vs.pq.queueName, vs.pq.partitionID, err)
+		slog.Error("queue visibility scan failed", "queue", vs.pq.queueName, "partition_id", vs.pq.partitionID, "err", err)
 		return
 	}
 	if len(ids) == 0 {

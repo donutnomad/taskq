@@ -3,7 +3,7 @@ package queue
 import (
 	"container/list"
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -102,7 +102,7 @@ func (pq *PhysicalQueue) tryPoll(ctx context.Context) (*TaskRow, string, bool) {
 
 	row, token, ok, err := pq.runtime.tryGetTask(ctx)
 	if err != nil {
-		log.Printf("queue: tryPoll failed for %s/%d: %v", pq.queueName, pq.partitionID, err)
+		slog.Error("queue tryPoll failed", "queue", pq.queueName, "partition_id", pq.partitionID, "err", err)
 		return nil, "", false
 	}
 	return row, token, ok
@@ -116,13 +116,13 @@ func (pq *PhysicalQueue) registerWaiter(ch chan PollResult) *list.Element {
 
 	row, token, ok, err := pq.runtime.tryGetTask(pq.ctx)
 	if err != nil {
-		log.Printf("queue: registerWaiter immediate poll failed for %s/%d: %v", pq.queueName, pq.partitionID, err)
+		slog.Error("queue registerWaiter immediate poll failed", "queue", pq.queueName, "partition_id", pq.partitionID, "err", err)
 	} else if ok {
 		if sendPollResult(ch, PollResult{Row: row, Token: token}) {
 			return nil
 		}
 		if nackErr := pq.runtime.nack(pq.ctx, row.TaskID); nackErr != nil {
-			log.Printf("queue: failed to return task %d after waiter immediate send failure: %v", row.TaskID, nackErr)
+			slog.Error("queue failed to return task after waiter immediate send failure", "queue", pq.queueName, "partition_id", pq.partitionID, "task_id", row.TaskID, "err", nackErr)
 		}
 		return nil
 	}

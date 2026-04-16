@@ -3,7 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -53,14 +53,14 @@ func (g *taskGC) run() {
 		return
 	}
 	if _, err := g.pq.store.DeleteTasks(g.ctx, g.pq.queueName, g.pq.partitionID, ackLevel); err != nil {
-		log.Printf("queue: gc delete failed for %s/%d: %v", g.pq.queueName, g.pq.partitionID, err)
+		slog.Error("queue gc delete failed", "queue", g.pq.queueName, "partition_id", g.pq.partitionID, "ack_level", ackLevel, "err", err)
 		return
 	}
 
 	// 通过 ownershipState CAS 同步 ackLevel 到 queue_info
 	info, err := g.pq.store.GetQueue(g.ctx, g.pq.queueName, g.pq.partitionID)
 	if err != nil {
-		log.Printf("queue: gc load queue info failed for %s/%d: %v", g.pq.queueName, g.pq.partitionID, err)
+		slog.Error("queue gc load queue info failed", "queue", g.pq.queueName, "partition_id", g.pq.partitionID, "err", err)
 		return
 	}
 	if info.AckLevel < ackLevel {
@@ -70,7 +70,7 @@ func (g *taskGC) run() {
 				g.pq.cancel()
 				return
 			}
-			log.Printf("queue: gc persist ack level failed for %s/%d: %v", g.pq.queueName, g.pq.partitionID, err)
+			slog.Error("queue gc persist ack level failed", "queue", g.pq.queueName, "partition_id", g.pq.partitionID, "ack_level", ackLevel, "err", err)
 		}
 	}
 }

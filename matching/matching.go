@@ -7,7 +7,7 @@ package matching
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -122,7 +122,7 @@ func (s *Server) Start() error {
 
 	s.wg.Go(func() {
 		if err := s.grpcServer.Serve(lis); err != nil {
-			log.Printf("matching: gRPC server stopped: %v", err)
+			slog.Error("matching gRPC server stopped", "listen_addr", s.cfg.ListenAddr, "err", err)
 		}
 	})
 

@@ -3,7 +3,7 @@ package queue
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"time"
 )
 
@@ -113,7 +113,7 @@ func (rt *taskRuntime) tryDeliverToWaiters() {
 	for rt.pq.waiters.hasWaiters() {
 		row, token, ok, err := rt.tryGetTask(rt.pq.ctx)
 		if err != nil {
-			log.Printf("queue: failed to fetch task for waiter delivery: %v", err)
+			slog.Error("queue failed to fetch task for waiter delivery", "queue", rt.pq.queueName, "partition_id", rt.pq.partitionID, "err", err)
 			return
 		}
 		if !ok {
@@ -123,7 +123,7 @@ func (rt *taskRuntime) tryDeliverToWaiters() {
 		ch, ok := rt.pq.waiters.pop()
 		if !ok {
 			if err := rt.nack(rt.pq.ctx, row.TaskID); err != nil {
-				log.Printf("queue: failed to return task %d after waiter disappeared: %v", row.TaskID, err)
+				slog.Error("queue failed to return task after waiter disappeared", "queue", rt.pq.queueName, "partition_id", rt.pq.partitionID, "task_id", row.TaskID, "err", err)
 			}
 			return
 		}
@@ -133,7 +133,7 @@ func (rt *taskRuntime) tryDeliverToWaiters() {
 		}
 
 		if err := rt.nack(rt.pq.ctx, row.TaskID); err != nil {
-			log.Printf("queue: failed to return task %d after waiter send failure: %v", row.TaskID, err)
+			slog.Error("queue failed to return task after waiter send failure", "queue", rt.pq.queueName, "partition_id", rt.pq.partitionID, "task_id", row.TaskID, "err", err)
 		}
 	}
 }
