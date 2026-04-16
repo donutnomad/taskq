@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/donutnomad/taskq/queue"
 )
 
-func (s *sqliteStore) CreateTasks(ctx context.Context, tasks []*TaskRow) error {
+func (s *sqliteStore) CreateTasks(ctx context.Context, tasks []*queue.TaskRow) error {
 	if len(tasks) == 0 {
 		return nil
 	}
@@ -50,7 +52,7 @@ func (s *sqliteStore) GetTasks(
 	minTaskID int64,
 	maxTaskID int64,
 	limit int,
-) ([]*TaskRow, error) {
+) ([]*queue.TaskRow, error) {
 	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT task_id, queue_name, partition_id, data, created_at
@@ -70,9 +72,9 @@ func (s *sqliteStore) GetTasks(
 	}
 	defer rows.Close()
 
-	var result []*TaskRow
+	var result []*queue.TaskRow
 	for rows.Next() {
-		task := &TaskRow{}
+		task := &queue.TaskRow{}
 		if err := rows.Scan(
 			&task.TaskID,
 			&task.QueueName,
@@ -106,7 +108,7 @@ func (s *sqliteStore) DispatchTask(
 	if err != nil {
 		return err
 	}
-	return requireAffectedRows(res, errTaskNotFound)
+	return requireAffectedRows(res, queue.ErrTaskNotFound)
 }
 
 func (s *sqliteStore) UnDispatchTask(ctx context.Context, queueName string, partitionID int, taskID int64) error {
@@ -121,7 +123,7 @@ func (s *sqliteStore) UnDispatchTask(ctx context.Context, queueName string, part
 	if err != nil {
 		return err
 	}
-	return requireAffectedRows(res, errTaskNotFound)
+	return requireAffectedRows(res, queue.ErrTaskNotFound)
 }
 
 func (s *sqliteStore) ResetTimedOutTasks(
@@ -186,7 +188,7 @@ func (s *sqliteStore) DeleteTask(ctx context.Context, queueName string, partitio
 	if err != nil {
 		return err
 	}
-	return requireAffectedRows(res, errTaskNotFound)
+	return requireAffectedRows(res, queue.ErrTaskNotFound)
 }
 
 func requireAffectedRows(res sql.Result, errWhenZero error) error {

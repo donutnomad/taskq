@@ -2,9 +2,11 @@ package example2
 
 import (
 	"context"
+
+	"github.com/donutnomad/taskq/queue"
 )
 
-func (s *sqliteStore) CreateQueue(ctx context.Context, info *QueueInfo) error {
+func (s *sqliteStore) CreateQueue(ctx context.Context, info *queue.QueueInfo) error {
 	_, err := s.db.ExecContext(
 		ctx,
 		`INSERT INTO queue_info (queue_name, partition_id, range_id, ack_level, next_task_id)
@@ -18,7 +20,7 @@ func (s *sqliteStore) CreateQueue(ctx context.Context, info *QueueInfo) error {
 	return err
 }
 
-func (s *sqliteStore) GetQueue(ctx context.Context, queueName string, partitionID int) (*QueueInfo, error) {
+func (s *sqliteStore) GetQueue(ctx context.Context, queueName string, partitionID int) (*queue.QueueInfo, error) {
 	row := s.db.QueryRowContext(
 		ctx,
 		`SELECT queue_name, partition_id, range_id, ack_level, next_task_id
@@ -27,7 +29,7 @@ func (s *sqliteStore) GetQueue(ctx context.Context, queueName string, partitionI
 		partitionID,
 	)
 
-	info := &QueueInfo{}
+	info := &queue.QueueInfo{}
 	if err := row.Scan(
 		&info.QueueName,
 		&info.PartitionID,
@@ -40,7 +42,7 @@ func (s *sqliteStore) GetQueue(ctx context.Context, queueName string, partitionI
 	return info, nil
 }
 
-func (s *sqliteStore) UpdateQueue(ctx context.Context, info *QueueInfo, prevRangeID int64) error {
+func (s *sqliteStore) UpdateQueue(ctx context.Context, info *queue.QueueInfo, prevRangeID int64) error {
 	res, err := s.db.ExecContext(
 		ctx,
 		`UPDATE queue_info
@@ -56,5 +58,5 @@ func (s *sqliteStore) UpdateQueue(ctx context.Context, info *QueueInfo, prevRang
 	if err != nil {
 		return err
 	}
-	return requireAffectedRows(res, ErrConditionFailed)
+	return requireAffectedRows(res, queue.ErrConditionFailed)
 }
