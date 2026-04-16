@@ -1,9 +1,10 @@
-package queue
+package example2
 
 import (
 	"database/sql"
 	"fmt"
 
+	"github.com/donutnomad/taskq/queue"
 	_ "modernc.org/sqlite"
 )
 
@@ -43,7 +44,7 @@ type sqliteStore struct {
 }
 
 // NewSQLiteStore 创建 SQLite 存储实例
-func NewSQLiteStore(dsn string) (Store, error) {
+func NewSQLiteStore(dsn string) (queue.Store, error) {
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)

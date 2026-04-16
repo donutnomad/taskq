@@ -48,25 +48,9 @@ type TaskStore interface {
 		taskID int64) error
 }
 
-// LeaseStore 管理分区 lease。
-type LeaseStore interface {
-	// AcquireLease 获取分区 lease（不存在则创建 queue_info）。
-	// 成功时同时递增 rangeID 并返回 QueueInfo。
-	// 如果 lease 被其他 owner 持有且未过期，返回 ErrLeaseHeld。
-	AcquireLease(ctx context.Context, queueName string, partitionID int,
-		owner string, ttl time.Duration) (*QueueInfo, error)
-	// RenewLease 续期 lease。owner 不匹配时返回 ErrLeaseHeld。
-	RenewLease(ctx context.Context, queueName string, partitionID int,
-		owner string, ttl time.Duration) error
-	// ReleaseLease 释放 lease。仅当 owner 匹配时清空。
-	ReleaseLease(ctx context.Context, queueName string, partitionID int,
-		owner string) error
-}
-
 // Store 持久化存储接口
 type Store interface {
 	QueueMetaStore
 	TaskStore
-	LeaseStore
 	Close() error
 }

@@ -1,13 +1,15 @@
-package queue
+package example2
 
 import (
 	"context"
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/donutnomad/taskq/queue"
 )
 
-func newTestStore(t *testing.T) Store {
+func newTestStore(t *testing.T) queue.Store {
 	t.Helper()
 	s, err := NewSQLiteStore(":memory:")
 	if err != nil {
@@ -20,7 +22,7 @@ func newTestStore(t *testing.T) Store {
 func TestCreateAndGetQueue(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	info := &QueueInfo{QueueName: "test", PartitionID: 0, RangeID: 1, AckLevel: 0, NextTaskID: 1}
+	info := &queue.QueueInfo{QueueName: "test", PartitionID: 0, RangeID: 1, AckLevel: 0, NextTaskID: 1}
 	if err := s.CreateQueue(ctx, info); err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +38,7 @@ func TestCreateAndGetQueue(t *testing.T) {
 func TestUpdateQueue_CAS(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	info := &QueueInfo{QueueName: "test", PartitionID: 0, RangeID: 1, AckLevel: 0, NextTaskID: 1}
+	info := &queue.QueueInfo{QueueName: "test", PartitionID: 0, RangeID: 1, AckLevel: 0, NextTaskID: 1}
 	s.CreateQueue(ctx, info)
 
 	// 成功更新
@@ -45,7 +47,7 @@ func TestUpdateQueue_CAS(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 冲突
-	if err := s.UpdateQueue(ctx, info, 1); !errors.Is(err, ErrConditionFailed) {
+	if err := s.UpdateQueue(ctx, info, 1); !errors.Is(err, queue.ErrConditionFailed) {
 		t.Fatalf("expected ErrConditionFailed, got %v", err)
 	}
 }
@@ -54,7 +56,7 @@ func TestCreateAndGetTasks(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now()
-	tasks := []*TaskRow{
+	tasks := []*queue.TaskRow{
 		{TaskID: 1, QueueName: "q", PartitionID: 0, Data: []byte("a"), CreatedAt: now},
 		{TaskID: 2, QueueName: "q", PartitionID: 0, Data: []byte("b"), CreatedAt: now},
 		{TaskID: 3, QueueName: "q", PartitionID: 0, Data: []byte("c"), CreatedAt: now},
@@ -75,7 +77,7 @@ func TestDispatchAndGetTasks(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now()
-	tasks := []*TaskRow{
+	tasks := []*queue.TaskRow{
 		{TaskID: 1, QueueName: "q", PartitionID: 0, Data: []byte("a"), CreatedAt: now},
 		{TaskID: 2, QueueName: "q", PartitionID: 0, Data: []byte("b"), CreatedAt: now},
 	}
@@ -102,7 +104,7 @@ func TestResetTimedOutTasks(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	past := time.Now().Add(-2 * time.Minute)
-	tasks := []*TaskRow{
+	tasks := []*queue.TaskRow{
 		{TaskID: 1, QueueName: "q", PartitionID: 0, Data: []byte("a"), CreatedAt: past},
 		{TaskID: 2, QueueName: "q", PartitionID: 0, Data: []byte("b"), CreatedAt: past},
 	}
@@ -130,7 +132,7 @@ func TestDeleteTasks(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now()
-	tasks := []*TaskRow{
+	tasks := []*queue.TaskRow{
 		{TaskID: 1, QueueName: "q", PartitionID: 0, Data: []byte("a"), CreatedAt: now},
 		{TaskID: 2, QueueName: "q", PartitionID: 0, Data: []byte("b"), CreatedAt: now},
 		{TaskID: 3, QueueName: "q", PartitionID: 0, Data: []byte("c"), CreatedAt: now},
@@ -153,7 +155,7 @@ func TestDeleteTask(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now()
-	tasks := []*TaskRow{
+	tasks := []*queue.TaskRow{
 		{TaskID: 5, QueueName: "q", PartitionID: 0, Data: []byte("x"), CreatedAt: now},
 	}
 	s.CreateTasks(ctx, tasks)
@@ -170,7 +172,7 @@ func TestDispatchTaskMissingRowReturnsError(t *testing.T) {
 	s := newTestStore(t)
 
 	err := s.DispatchTask(context.Background(), "q", 0, 42, time.Now())
-	if !errors.Is(err, errTaskNotFound) {
+	if !errors.Is(err, queue.ErrTaskNotFound) {
 		t.Fatalf("expected errTaskNotFound, got %v", err)
 	}
 }
@@ -179,7 +181,7 @@ func TestUnDispatchTaskMissingRowReturnsError(t *testing.T) {
 	s := newTestStore(t)
 
 	err := s.UnDispatchTask(context.Background(), "q", 0, 42)
-	if !errors.Is(err, errTaskNotFound) {
+	if !errors.Is(err, queue.ErrTaskNotFound) {
 		t.Fatalf("expected errTaskNotFound, got %v", err)
 	}
 }
@@ -188,7 +190,7 @@ func TestDeleteTaskMissingRowReturnsError(t *testing.T) {
 	s := newTestStore(t)
 
 	err := s.DeleteTask(context.Background(), "q", 0, 42)
-	if !errors.Is(err, errTaskNotFound) {
+	if !errors.Is(err, queue.ErrTaskNotFound) {
 		t.Fatalf("expected errTaskNotFound, got %v", err)
 	}
 }
@@ -198,10 +200,10 @@ func TestPartitionIsolation(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 	// 两个分区各写一条
-	s.CreateTasks(ctx, []*TaskRow{
+	s.CreateTasks(ctx, []*queue.TaskRow{
 		{TaskID: 1, QueueName: "q", PartitionID: 0, Data: []byte("p0"), CreatedAt: now},
 	})
-	s.CreateTasks(ctx, []*TaskRow{
+	s.CreateTasks(ctx, []*queue.TaskRow{
 		{TaskID: 1, QueueName: "q", PartitionID: 1, Data: []byte("p1"), CreatedAt: now},
 	})
 	// 各分区只能读到自己的

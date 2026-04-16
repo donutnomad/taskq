@@ -1,4 +1,4 @@
-package queue
+package example2
 
 import (
 	"context"

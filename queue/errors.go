@@ -23,4 +23,4 @@ var ErrTaskNotOutstanding = errors.New("task not outstanding")
 // ErrQueueClosed 队列已关闭
 var ErrQueueClosed = errors.New("queue closed")
 
-var errTaskNotFound = errors.New("task not found")
+var ErrTaskNotFound = errors.New("task not found")

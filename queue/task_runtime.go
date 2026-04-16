@@ -31,7 +31,7 @@ func (rt *taskRuntime) tryGetTask(ctx context.Context) (*TaskRow, string, bool, 
 			if err == nil {
 				return task, token, true, nil
 			}
-			if errors.Is(err, errTaskNotFound) {
+			if errors.Is(err, ErrTaskNotFound) {
 				continue
 			}
 			rt.state.requeueRedeliveryFront(row)
@@ -59,7 +59,7 @@ func (rt *taskRuntime) tryGetTask(ctx context.Context) (*TaskRow, string, bool, 
 		}
 
 		row, token, err := rt.dispatchTask(ctx, tasks[0], true)
-		if errors.Is(err, errTaskNotFound) {
+		if errors.Is(err, ErrTaskNotFound) {
 			continue
 		}
 		if err != nil {
