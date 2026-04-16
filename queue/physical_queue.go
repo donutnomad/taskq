@@ -34,13 +34,12 @@ type PhysicalQueue struct {
 	visTimeout  time.Duration
 	leaseOwner  string
 
-	waiters   *list.List // chan PollResult
-	forwardFn func()     // 非 root 分区：本地无 waiter 时转发到 root
-	dbMgr     *dbTaskManager
-	writer    *taskWriter
-	gc        *taskGC
-	visScan   *visibilityScanner
-	leaseWg   sync.WaitGroup
+	waiters *list.List // chan PollResult
+	dbMgr   *dbTaskManager
+	writer  *taskWriter
+	gc      *taskGC
+	visScan *visibilityScanner
+	leaseWg sync.WaitGroup
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -94,17 +93,13 @@ func (pq *PhysicalQueue) addTask(ctx context.Context, data []byte) error {
 	return err
 }
 
-// onFlush writer flush 后的回调，尝试 sync match。
-// 本地有 waiter 时直接投递；否则转发到 root 分区。
+// onFlush writer flush 后的回调，尝试将新任务直接投递给本分区 waiter。
 func (pq *PhysicalQueue) onFlush(rows []*TaskRow) {
 	pq.mu.Lock()
-
-	needForward := false
 	for _, row := range rows {
 		pq.dbMgr.setMaxReadLevel(row.TaskID)
 
 		if pq.waiters.Len() == 0 {
-			needForward = true
 			continue
 		}
 
@@ -117,7 +112,6 @@ func (pq *PhysicalQueue) onFlush(rows []*TaskRow) {
 		taskRow, ok := pq.dbMgr.getTask(pq.ctx)
 		if !ok {
 			pq.waiters.PushFront(ch)
-			needForward = true
 			continue
 		}
 		token := fmt.Sprintf("%d:%d", pq.partitionID, taskRow.TaskID)
@@ -128,10 +122,6 @@ func (pq *PhysicalQueue) onFlush(rows []*TaskRow) {
 	}
 
 	pq.mu.Unlock()
-
-	if needForward && pq.forwardFn != nil {
-		pq.forwardFn()
-	}
 }
 
 // tryPoll 非阻塞尝试获取任务
@@ -190,8 +180,7 @@ func (pq *PhysicalQueue) removeWaiter(elem *list.Element) {
 	pq.waiters.Remove(elem)
 }
 
-// wakeWaiters 有任务可读时唤醒 waiters（visibilityScanner/nack 后调用）。
-// 本地 waiter 优先；仍有可读任务但无本地 waiter 时转发到 root。
+// wakeWaiters 有任务可读时唤醒本分区 waiters（visibilityScanner/nack 后调用）。
 func (pq *PhysicalQueue) wakeWaiters() {
 	pq.mu.Lock()
 
@@ -211,13 +200,7 @@ func (pq *PhysicalQueue) wakeWaiters() {
 		default:
 		}
 	}
-
-	shouldForward := pq.forwardFn != nil && pq.waiters.Len() == 0 && pq.dbMgr.hasReadable()
 	pq.mu.Unlock()
-
-	if shouldForward {
-		pq.forwardFn()
-	}
 }
 
 func (pq *PhysicalQueue) ack(ctx context.Context, token string) error {

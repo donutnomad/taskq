@@ -10,7 +10,6 @@ TaskQ 是一个 Temporal 风格的分布式任务队列系统，使用 Go 实现
 - **DB Lease + RangeID CAS** — 双层所有权保护，悲观锁 + 乐观锁防止脑裂
 - **长轮询消费** — 无任务时 worker 阻塞等待，任务到达即时唤醒
 - **Sync Match** — 写入时直接匹配等待中的消费者，零延迟投递
-- **分区转发模型** — 非 root 分区转发到 root，统一协调长轮询
 
 ## 系统架构
 
@@ -118,28 +117,11 @@ graph TB
 | **visibilityScanner** | 检测超时的已分发任务，移入 redelivery 队列 | 每 1 秒 |
 | **leaseRenewLoop** | 续期 DB lease，失败时关闭分区 | 每 5 秒 |
 
-#### PartitionedQueue — 多分区 + 转发模型
+多分区分配不在 `queue` 包内完成。真实链路是：
 
-`PartitionedQueue` 封装 N 个 `PhysicalQueue`，采用 Temporal 风格的 root 转发模型：
-
-```mermaid
-graph LR
-    subgraph PartitionedQueue
-        P0[Partition 0<br/>ROOT]
-        P1[Partition 1]
-        P2[Partition 2]
-        P3[Partition 3]
-    end
-
-    P1 -->|forwardToRoot| P0
-    P2 -->|forwardToRoot| P0
-    P3 -->|forwardToRoot| P0
-    P0 ---|waiters 注册在此| POLL[长轮询 Poller]
-```
-
-- **写入**：round-robin 选分区
-- **消费**：尝试本地分区 → 尝试 root → 在 root 注册 waiter 等待
-- **转发**：非 root 分区有任务但无本地 waiter 时，转发给 root 上等待的 poller
+- `membership` 负责一致性哈希，把 `queue/partition` 映射到节点
+- `matching` 负责按需加载对应分区，并通过 DB lease 独占该分区
+- `PhysicalQueue` 只负责自己这一个分区的任务生命周期与长轮询
 
 #### 两层所有权保护
 
@@ -237,7 +219,7 @@ sequenceDiagram
     alt 有等待中的 waiter
         PQ->>PQ: sync match → 直接投递给 waiter
     else 无本地 waiter
-        PQ->>PQ: forwardFn() → 转发到 root
+        PQ->>PQ: 更新可读水位，等待后续 poll/长轮询领取
     end
 
     M-->>F: AddTaskResponse
@@ -406,7 +388,7 @@ ackLevel 推进规则 (advanceAckLevel)：
   - 其他 → 停止（还没读到）
 ```
 
-### Sync Match 与转发
+### Sync Match 与 waiters
 
 ```
 任务写入 → taskWriter flush → onFlush 回调：
@@ -418,31 +400,15 @@ ackLevel 推进规则 (advanceAckLevel)：
   │     ├─ 是 → 取出 waiter      │
   │     │     → dbMgr.getTask()  │
   │     │     → 发送到 channel   │
-  │     └─ 否 → 标记 needForward │
+  │     └─ 否 → 保留在本分区      │
   └─────────────────────────────┘
-           │
-           ▼ (释放 pq.mu 后)
-  ┌─────────────────────────────┐
-  │ needForward && forwardFn？   │
-  │  → forwardToRoot(root, src) │
-  │  → 从 source tryPoll        │
-  │  → 发给 root 上的 waiter    │
-  └─────────────────────────────┘
+  
+  后续 `TryPoll` / `RegisterWaiter` 仍然只消费本分区中的可读任务。
 ```
 
 ## 配置参考
 
-### Queue
-
-```go
-queue.Options{
-    QueueName:  "my-queue",        // 必填
-    Store:      sqliteStore,       // 必填，Store 接口实现
-    Partitions: 4,                 // 分区数，默认 4
-    VisTimeout: 60 * time.Second,  // 可见性超时，默认 60s
-    LeaseOwner: "",                // 为空时自动生成 UUID
-}
-```
+### Queue 内部常量
 
 | 内部常量 | 值 | 说明 |
 |---|---|---|
