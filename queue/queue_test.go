@@ -79,20 +79,16 @@ func TestPartitionedQueue_ConcurrentProducerConsumer(t *testing.T) {
 	total := 100
 
 	var wg sync.WaitGroup
-	for i := 0; i < total; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+	for i := range total {
+		wg.Go(func() {
 			q.EnqueueRaw([]byte(fmt.Sprintf("task-%d", i)))
-		}(i)
+		})
 	}
 	wg.Wait()
 
 	var consumed atomic.Int64
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 8 {
+		wg.Go(func() {
 			for {
 				if consumed.Load() >= int64(total) {
 					return
@@ -106,7 +102,7 @@ func TestPartitionedQueue_ConcurrentProducerConsumer(t *testing.T) {
 				q.Ack(token)
 				consumed.Add(1)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -147,11 +143,11 @@ func TestPartitionedQueue_AddPartition(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		q.EnqueueRaw([]byte(fmt.Sprintf("task-%d", i)))
 	}
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		dCtx, cancel := context.WithTimeout(ctx, time.Second)
 		_, token, err := q.DequeueRaw(dCtx)
 		cancel()

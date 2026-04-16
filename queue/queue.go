@@ -66,10 +66,10 @@ func New(ctx context.Context, opts Options) (*PartitionedQueue, error) {
 	}
 
 	pq.partitions = make([]*PhysicalQueue, opts.Partitions)
-	for i := 0; i < opts.Partitions; i++ {
+	for i := range opts.Partitions {
 		p, err := newPhysicalQueue(ctx, opts.Store, opts.QueueName, i, opts.VisTimeout, opts.LeaseOwner)
 		if err != nil {
-			for j := 0; j < i; j++ {
+			for j := range i {
 				pq.partitions[j].close()
 			}
 			cancel()

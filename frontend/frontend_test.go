@@ -372,3 +372,29 @@ func TestFrontend_WorkerLongPoll(t *testing.T) {
 		t.Fatal("worker did not receive task within 3s")
 	}
 }
+
+func TestFrontend_DequeueEmpty_ReturnsErrNoTask(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver()
+	startMatchingServer(t, store, resolver, map[string]int{"empty-q": 4})
+
+	monitor := &stubMonitor{resolver: resolver}
+	fe, err := New(Config{
+		Monitor:     monitor,
+		QueueName:   "empty-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 500 * time.Millisecond, // 短超时
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe.Close()
+
+	ctx := context.Background()
+
+	// 空队列 Dequeue 应返回 ErrNoTask，而不是 nil error
+	_, _, err = fe.Dequeue(ctx)
+	if !errors.Is(err, ErrNoTask) {
+		t.Fatalf("expected ErrNoTask on empty queue, got %v", err)
+	}
+}
