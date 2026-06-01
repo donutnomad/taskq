@@ -12,7 +12,6 @@ type serviceResolver struct {
 	replicaPoints int
 
 	shutdownCh chan struct{}
-	shutdownWG sync.WaitGroup
 
 	// ringAndHosts 原子存储，读操作完全无锁
 	ringAndHosts atomic.Value
@@ -42,10 +41,6 @@ func newServiceResolver(service string, replicaPoints int) *serviceResolver {
 	return r
 }
 
-func (r *serviceResolver) Start() {
-	// DB-based resolver 无需后台 goroutine：由 Monitor 驱动 setMembers
-}
-
 func (r *serviceResolver) Stop() {
 	r.listenerLock.Lock()
 	defer r.listenerLock.Unlock()
@@ -60,7 +55,6 @@ func (r *serviceResolver) Stop() {
 	})
 	r.listeners = make(map[string]chan<- *ChangedEvent)
 	close(r.shutdownCh)
-	r.shutdownWG.Wait()
 }
 
 // setMembers 由 Monitor 调用，注入最新成员列表，自动对比差异并发送 ChangedEvent。
@@ -72,16 +66,12 @@ func (r *serviceResolver) setMembers(hosts []*hostInfo) {
 
 	ring := newHashRing(r.replicaPoints)
 	for addr := range newMap {
-		if host := newMap[addr]; host != nil && !isDraining(host) {
+		if host := newMap[addr]; host != nil && !host.draining {
 			ring.AddMember(addr)
 		}
 	}
 	r.ringAndHosts.Store(ringAndHosts{ring: ring, hosts: newMap})
 	r.emitEvent(event)
-}
-
-func (r *serviceResolver) RequestRefresh() {
-	// no-op：DB 轮询由 Monitor 驱动
 }
 
 func (r *serviceResolver) Lookup(key string) (HostInfo, error) {
@@ -135,7 +125,7 @@ func (r *serviceResolver) AvailableMemberCount() int {
 	_, hosts := r.ring()
 	n := 0
 	for _, h := range hosts {
-		if !isDraining(h) {
+		if !h.draining {
 			n++
 		}
 	}
@@ -155,7 +145,7 @@ func (r *serviceResolver) AvailableMembers() []HostInfo {
 	_, hosts := r.ring()
 	var result []HostInfo
 	for _, h := range hosts {
-		if !isDraining(h) {
+		if !h.draining {
 			result = append(result, h)
 		}
 	}

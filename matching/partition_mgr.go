@@ -142,9 +142,6 @@ func (t *partitionLeaderTask) Start(ctx context.Context) error {
 	case <-ctx.Done():
 		return nil
 	case err := <-errCh:
-		if errors.Is(err, queue.ErrOwnershipLost) {
-			return dbleader.StepDown(err)
-		}
 		return err
 	}
 }
@@ -195,6 +192,7 @@ func (h *partitionHandle) close() {
 	h.notifyStateChangeLocked(false)
 	h.mu.Unlock()
 
+	h.manager.Offline()
 	h.manager.Stop()
 	h.clearActive()
 }
@@ -291,8 +289,7 @@ func (h *partitionHandle) TryPoll(ctx context.Context) (*queue.TaskRow, string, 
 	if err != nil {
 		return nil, "", false, err
 	}
-	row, token, ok := pq.TryPoll(ctx)
-	return row, token, ok, nil
+	return pq.TryPoll(ctx)
 }
 
 func (h *partitionHandle) RegisterWaiter(ch chan queue.PollResult) (*queue.PhysicalQueue, *list.Element, error) {

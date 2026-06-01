@@ -28,7 +28,12 @@ type QueueInfo struct {
 type QueueMetaStore interface {
 	CreateQueue(ctx context.Context, info *QueueInfo) error
 	GetQueue(ctx context.Context, queueName string, partitionID int) (*QueueInfo, error)
-	UpdateQueue(ctx context.Context, info *QueueInfo, prevRangeID int64) error
+	AllocateTaskIDRange(ctx context.Context,
+		queueName string, partitionID int,
+		newNextTaskID int64, prevRangeID int64) (newRangeID int64, err error)
+	AdvanceAckLevelAndDeleteTasks(ctx context.Context,
+		queueName string, partitionID int,
+		newAckLevel int64, prevRangeID int64) (newRangeID int64, deleted int64, err error)
 }
 
 // TaskStore 管理 tasks 表中的任务数据。
@@ -42,10 +47,6 @@ type TaskStore interface {
 		taskID int64) error
 	ResetTimedOutTasks(ctx context.Context, queueName string, partitionID int,
 		ackLevel int64, visTimeout time.Duration) ([]int64, error)
-	DeleteTasks(ctx context.Context, queueName string, partitionID int,
-		maxTaskID int64) (int64, error)
-	DeleteTask(ctx context.Context, queueName string, partitionID int,
-		taskID int64) error
 }
 
 // Store 持久化存储接口

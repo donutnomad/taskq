@@ -18,30 +18,34 @@ func newOwnershipState(store Store, rangeID int64) *ownershipState {
 	return &ownershipState{store: store, rangeID: rangeID}
 }
 
-// getRangeID 返回当前 rangeID（加锁）
-func (o *ownershipState) getRangeID() int64 {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.rangeID
-}
-
-// updateQueue 使用 CAS 更新 queue_info，成功后递增 rangeID。
-// 如果 CAS 失败（rangeID 不匹配），说明另一个进程已抢占所有权。
-func (o *ownershipState) updateQueue(ctx context.Context, info *QueueInfo) error {
+func (o *ownershipState) allocateTaskIDRange(ctx context.Context, queueName string, partitionID int, newNextTaskID int64) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
-	prevRangeID := o.rangeID
-	newRangeID := prevRangeID + 1
-	info.RangeID = newRangeID
-
-	if err := o.store.UpdateQueue(ctx, info, prevRangeID); err != nil {
+	prev := o.rangeID
+	newRangeID, err := o.store.AllocateTaskIDRange(ctx, queueName, partitionID, newNextTaskID, prev)
+	if err != nil {
 		if errors.Is(err, ErrConditionFailed) {
 			return ErrOwnershipLost
 		}
 		return err
 	}
-
 	o.rangeID = newRangeID
 	return nil
+}
+
+func (o *ownershipState) advanceAckLevelAndDelete(ctx context.Context, queueName string, partitionID int, newAckLevel int64) (int64, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	prev := o.rangeID
+	newRangeID, deleted, err := o.store.AdvanceAckLevelAndDeleteTasks(ctx, queueName, partitionID, newAckLevel, prev)
+	if err != nil {
+		if errors.Is(err, ErrConditionFailed) {
+			return 0, ErrOwnershipLost
+		}
+		return 0, err
+	}
+	o.rangeID = newRangeID
+	return deleted, nil
 }

@@ -163,34 +163,6 @@ func (s *sqliteStore) ResetTimedOutTasks(
 	return ids, rows.Err()
 }
 
-func (s *sqliteStore) DeleteTasks(ctx context.Context, queueName string, partitionID int, maxTaskID int64) (int64, error) {
-	res, err := s.db.ExecContext(
-		ctx,
-		`DELETE FROM tasks WHERE queue_name = ? AND partition_id = ? AND task_id <= ?`,
-		queueName,
-		partitionID,
-		maxTaskID,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-func (s *sqliteStore) DeleteTask(ctx context.Context, queueName string, partitionID int, taskID int64) error {
-	res, err := s.db.ExecContext(
-		ctx,
-		`DELETE FROM tasks WHERE queue_name = ? AND partition_id = ? AND task_id = ?`,
-		queueName,
-		partitionID,
-		taskID,
-	)
-	if err != nil {
-		return err
-	}
-	return requireAffectedRows(res, queue.ErrTaskNotFound)
-}
-
 func requireAffectedRows(res sql.Result, errWhenZero error) error {
 	affected, err := res.RowsAffected()
 	if err != nil {

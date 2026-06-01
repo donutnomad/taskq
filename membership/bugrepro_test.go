@@ -71,7 +71,10 @@ func TestBugRepro_GetReachableMembersDeduplicatesAddresses(t *testing.T) {
 		200,
 	)
 
-	members, err := m.GetReachableMembers()
+	reachable := m.(interface {
+		GetReachableMembers() ([]string, error)
+	})
+	members, err := reachable.GetReachableMembers()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +95,7 @@ func TestBugRepro_LookupShouldSkipDrainingHosts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected lookup error: %v", err)
 		}
-		if hi, ok := host.(*hostInfo); ok && isDraining(hi) {
+		if hi, ok := host.(*hostInfo); ok && hi.draining {
 			t.Fatalf("expected lookup to avoid draining hosts, got %s for key-%d", hi.GetAddress(), i)
 		}
 	}

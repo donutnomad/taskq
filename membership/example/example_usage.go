@@ -38,11 +38,6 @@ func (s *MySQLMemberStore) GetActiveMembers(ctx context.Context, lastHeartbeatWi
 	}, nil
 }
 
-func (s *MySQLMemberStore) PruneExpiredMembers(ctx context.Context, maxCount int) error {
-	// DELETE FROM cluster_members WHERE expires_at < NOW() LIMIT ?
-	return nil
-}
-
 // ---- 第二步：启动 Monitor ----
 
 func main() {

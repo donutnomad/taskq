@@ -12,6 +12,7 @@ import (
 	"github.com/donutnomad/taskq/matching"
 	"github.com/donutnomad/taskq/membership"
 	"github.com/donutnomad/taskq/queue"
+	"github.com/donutnomad/taskq/store/gormstore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -41,7 +42,6 @@ func (r *stubResolver) Lookup(key string) (membership.HostInfo, error) {
 	idx := len(key) % len(r.members)
 	return r.members[idx], nil
 }
-func (r *stubResolver) LookupN(_ string, _ int) []membership.HostInfo { return nil }
 func (r *stubResolver) AddListener(name string, ch chan<- *membership.ChangedEvent) error {
 	if _, ok := r.listeners[name]; ok {
 		return membership.ErrListenerAlreadyExist
@@ -53,11 +53,6 @@ func (r *stubResolver) RemoveListener(name string) error {
 	delete(r.listeners, name)
 	return nil
 }
-func (r *stubResolver) MemberCount() int                        { return len(r.members) }
-func (r *stubResolver) AvailableMemberCount() int               { return len(r.members) }
-func (r *stubResolver) Members() []membership.HostInfo          { return r.members }
-func (r *stubResolver) AvailableMembers() []membership.HostInfo { return r.members }
-func (r *stubResolver) RequestRefresh()                         {}
 
 type stubMonitor struct {
 	resolver *stubResolver
@@ -65,21 +60,18 @@ type stubMonitor struct {
 
 func (m *stubMonitor) Start()                                       {}
 func (m *stubMonitor) Stop()                                        {}
-func (m *stubMonitor) EvictSelf() error                             { return nil }
 func (m *stubMonitor) EvictSelfAt(time.Time) (time.Duration, error) { return 0, nil }
 func (m *stubMonitor) GetResolver(string) (membership.ServiceResolver, error) {
 	return m.resolver, nil
 }
-func (m *stubMonitor) GetReachableMembers() ([]string, error)       { return nil, nil }
-func (m *stubMonitor) WaitUntilInitialized(context.Context) error   { return nil }
-func (m *stubMonitor) SetDraining(bool) error                       { return nil }
-func (m *stubMonitor) ApproximateMaxPropagationTime() time.Duration { return 0 }
+func (m *stubMonitor) WaitUntilInitialized(context.Context) error { return nil }
+func (m *stubMonitor) SetDraining(bool) error                     { return nil }
 
 type refreshAwareResolver struct {
 	mu        sync.Mutex
 	current   string
 	next      string
-	refreshes int
+	switched  bool
 	listeners map[string]chan<- *membership.ChangedEvent
 }
 
@@ -94,13 +86,12 @@ func newRefreshAwareResolver(current, next string) *refreshAwareResolver {
 func (r *refreshAwareResolver) Lookup(_ string) (membership.HostInfo, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.refreshes > 0 {
+	if r.switched {
 		return membership.NewHostInfoFromAddress(r.next), nil
 	}
 	return membership.NewHostInfoFromAddress(r.current), nil
 }
 
-func (r *refreshAwareResolver) LookupN(_ string, _ int) []membership.HostInfo { return nil }
 func (r *refreshAwareResolver) AddListener(name string, ch chan<- *membership.ChangedEvent) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -116,14 +107,17 @@ func (r *refreshAwareResolver) RemoveListener(name string) error {
 	delete(r.listeners, name)
 	return nil
 }
-func (r *refreshAwareResolver) MemberCount() int                        { return 1 }
-func (r *refreshAwareResolver) AvailableMemberCount() int               { return 1 }
-func (r *refreshAwareResolver) Members() []membership.HostInfo          { return nil }
-func (r *refreshAwareResolver) AvailableMembers() []membership.HostInfo { return nil }
-func (r *refreshAwareResolver) RequestRefresh() {
+
+func (r *refreshAwareResolver) switchToNext() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.refreshes++
+	r.switched = true
+}
+
+func (r *refreshAwareResolver) isSwitched() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.switched
 }
 
 type refreshAwareMonitor struct {
@@ -132,19 +126,16 @@ type refreshAwareMonitor struct {
 
 func (m *refreshAwareMonitor) Start()                                       {}
 func (m *refreshAwareMonitor) Stop()                                        {}
-func (m *refreshAwareMonitor) EvictSelf() error                             { return nil }
 func (m *refreshAwareMonitor) EvictSelfAt(time.Time) (time.Duration, error) { return 0, nil }
 func (m *refreshAwareMonitor) GetResolver(string) (membership.ServiceResolver, error) {
 	return m.resolver, nil
 }
-func (m *refreshAwareMonitor) GetReachableMembers() ([]string, error)       { return nil, nil }
-func (m *refreshAwareMonitor) WaitUntilInitialized(context.Context) error   { return nil }
-func (m *refreshAwareMonitor) SetDraining(bool) error                       { return nil }
-func (m *refreshAwareMonitor) ApproximateMaxPropagationTime() time.Duration { return 0 }
+func (m *refreshAwareMonitor) WaitUntilInitialized(context.Context) error { return nil }
+func (m *refreshAwareMonitor) SetDraining(bool) error                     { return nil }
 
 func newTestSQLiteStore(t *testing.T) queue.Store {
 	t.Helper()
-	store, err := queue.NewSQLiteStore(":memory:")
+	store, err := gormstore.NewSQLite(":memory:", gormstore.Config{AutoMigrate: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,17 +547,18 @@ func TestFrontend_EnqueueRetriesAfterResolverRefresh(t *testing.T) {
 	defer fe.Close()
 
 	oldSrv.Stop()
+	time.AfterFunc(defaultRetryBackoff/2, routing.switchToNext)
 
 	if err := fe.Enqueue(context.Background(), []byte("rerouted")); err != nil {
-		t.Fatalf("expected enqueue to succeed after resolver refresh, got %v", err)
+		t.Fatalf("expected enqueue to succeed after resolver update, got %v", err)
 	}
 
-	if routing.refreshes == 0 {
-		t.Fatal("expected enqueue retry path to request a resolver refresh")
+	if !routing.isSwitched() {
+		t.Fatal("expected enqueue retry path to wait for resolver update")
 	}
 }
 
-func TestFrontend_AckRetriesAfterResolverRefresh(t *testing.T) {
+func TestFrontend_AckRejectsStaleTokenAfterResolverRefresh(t *testing.T) {
 	store := newTestSQLiteStore(t)
 
 	oldResolver := newStubResolver()
@@ -597,17 +589,18 @@ func TestFrontend_AckRetriesAfterResolverRefresh(t *testing.T) {
 	}
 
 	oldSrv.Stop()
+	time.AfterFunc(defaultRetryBackoff/2, routing.switchToNext)
 
-	if err := fe.Ack(ctx, token); err != nil {
-		t.Fatalf("expected ack to succeed after resolver refresh, got %v", err)
+	if err := fe.Ack(ctx, token); err == nil {
+		t.Fatal("expected ack with stale ownership token to fail")
 	}
 
-	if routing.refreshes == 0 {
-		t.Fatal("expected ack retry path to request a resolver refresh")
+	if !routing.isSwitched() {
+		t.Fatal("expected ack path to observe resolver update")
 	}
 }
 
-func TestFrontend_NackRetriesAfterResolverRefresh(t *testing.T) {
+func TestFrontend_NackRejectsStaleTokenAfterResolverRefresh(t *testing.T) {
 	store := newTestSQLiteStore(t)
 
 	oldResolver := newStubResolver()
@@ -638,13 +631,14 @@ func TestFrontend_NackRetriesAfterResolverRefresh(t *testing.T) {
 	}
 
 	oldSrv.Stop()
+	time.AfterFunc(defaultRetryBackoff/2, routing.switchToNext)
 
-	if err := fe.Nack(ctx, token); err != nil {
-		t.Fatalf("expected nack to succeed after resolver refresh, got %v", err)
+	if err := fe.Nack(ctx, token); err == nil {
+		t.Fatal("expected nack with stale ownership token to fail")
 	}
 
-	if routing.refreshes == 0 {
-		t.Fatal("expected nack retry path to request a resolver refresh")
+	if !routing.isSwitched() {
+		t.Fatal("expected nack path to observe resolver update")
 	}
 }
 

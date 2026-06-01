@@ -11,7 +11,6 @@ func makeHost(addr string, draining bool) *hostInfo {
 
 func TestServiceResolverLookup(t *testing.T) {
 	r := newServiceResolver("matching", 200)
-	r.Start()
 	defer r.Stop()
 
 	r.setMembers([]*hostInfo{
@@ -30,7 +29,6 @@ func TestServiceResolverLookup(t *testing.T) {
 
 func TestServiceResolverEmpty(t *testing.T) {
 	r := newServiceResolver("matching", 200)
-	r.Start()
 	defer r.Stop()
 
 	_, err := r.Lookup("any-key")
@@ -41,7 +39,6 @@ func TestServiceResolverEmpty(t *testing.T) {
 
 func TestServiceResolverMemberCount(t *testing.T) {
 	r := newServiceResolver("matching", 200)
-	r.Start()
 	defer r.Stop()
 
 	r.setMembers([]*hostInfo{
@@ -57,9 +54,56 @@ func TestServiceResolverMemberCount(t *testing.T) {
 	}
 }
 
+func TestServiceResolverListsMembersAndAvailableMembers(t *testing.T) {
+	r := newServiceResolver("matching", 200)
+	defer r.Stop()
+
+	r.setMembers([]*hostInfo{
+		makeHost("10.0.0.1:7235", false),
+		makeHost("10.0.0.2:7235", true),
+		makeHost("10.0.0.3:7235", false),
+	})
+
+	members := r.Members()
+	if len(members) != 3 {
+		t.Fatalf("expected 3 members, got %d", len(members))
+	}
+	available := r.AvailableMembers()
+	if len(available) != 2 {
+		t.Fatalf("expected 2 available members, got %d", len(available))
+	}
+	for _, host := range available {
+		if host.(*hostInfo).draining {
+			t.Fatalf("expected available members to skip draining hosts, got %+v", host)
+		}
+	}
+}
+
+func TestServiceResolverLookupN(t *testing.T) {
+	r := newServiceResolver("matching", 200)
+	defer r.Stop()
+
+	if got := r.LookupN("empty", 2); got != nil {
+		t.Fatalf("expected nil LookupN result on empty resolver, got %+v", got)
+	}
+	if got := r.LookupN("empty", 0); got != nil {
+		t.Fatalf("expected nil LookupN result for non-positive count, got %+v", got)
+	}
+
+	r.setMembers([]*hostInfo{
+		makeHost("10.0.0.1:7235", false),
+		makeHost("10.0.0.2:7235", false),
+		makeHost("10.0.0.3:7235", false),
+	})
+
+	hosts := r.LookupN("namespace:queue:1", 2)
+	if len(hosts) != 2 {
+		t.Fatalf("expected 2 lookup results, got %d", len(hosts))
+	}
+}
+
 func TestServiceResolverChangedEvent(t *testing.T) {
 	r := newServiceResolver("matching", 200)
-	r.Start()
 	defer r.Stop()
 
 	ch := make(chan *ChangedEvent, 5)
@@ -79,7 +123,6 @@ func TestServiceResolverChangedEvent(t *testing.T) {
 
 func TestServiceResolverDoubleStop(t *testing.T) {
 	r := newServiceResolver("matching", 200)
-	r.Start()
 	r.Stop()
 
 	// 第二次调用 Stop() 不应 panic
@@ -93,7 +136,6 @@ func TestServiceResolverDoubleStop(t *testing.T) {
 
 func TestServiceResolverDuplicateListener(t *testing.T) {
 	r := newServiceResolver("matching", 200)
-	r.Start()
 	defer r.Stop()
 
 	ch := make(chan *ChangedEvent, 1)
@@ -102,5 +144,25 @@ func TestServiceResolverDuplicateListener(t *testing.T) {
 	}
 	if err := r.AddListener("dup", ch); err != ErrListenerAlreadyExist {
 		t.Fatalf("expected ErrListenerAlreadyExist, got %v", err)
+	}
+}
+
+func TestServiceResolverRemoveListener(t *testing.T) {
+	r := newServiceResolver("matching", 200)
+	defer r.Stop()
+
+	ch := make(chan *ChangedEvent, 1)
+	if err := r.AddListener("removed", ch); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RemoveListener("removed"); err != nil {
+		t.Fatal(err)
+	}
+
+	r.setMembers([]*hostInfo{makeHost("10.0.0.1:7235", false)})
+	select {
+	case event := <-ch:
+		t.Fatalf("expected removed listener to receive no event, got %+v", event)
+	case <-time.After(50 * time.Millisecond):
 	}
 }

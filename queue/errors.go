@@ -17,6 +17,9 @@ var ErrOwnershipLost = fmt.Errorf("ownership lost: %w", ErrConditionFailed)
 // ErrInvalidToken 表示 ack/nack token 无效。
 var ErrInvalidToken = errors.New("invalid ack token")
 
+// ErrStaleToken 表示 token 来自旧的分区所有权任期。
+var ErrStaleToken = errors.New("stale ack token")
+
 // ErrTaskNotOutstanding 表示任务当前不在处理中，通常是重复 ack/nack 或过期 token。
 var ErrTaskNotOutstanding = errors.New("task not outstanding")
 

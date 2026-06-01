@@ -17,11 +17,12 @@ type PollResult struct {
 
 // PhysicalQueue 单分区队列核心，负责装配各个子组件。
 type PhysicalQueue struct {
-	store       Store
-	queueName   string
-	partitionID int
-	ownership   *ownershipState
-	visTimeout  time.Duration
+	store          Store
+	queueName      string
+	partitionID    int
+	ownership      *ownershipState
+	ownershipEpoch int64
+	visTimeout     time.Duration
 
 	waiters *waiterRegistry
 	runtime *taskRuntime
@@ -49,14 +50,15 @@ func newPhysicalQueue(
 
 	queueCtx, cancel := context.WithCancel(ctx)
 	pq := &PhysicalQueue{
-		store:       store,
-		queueName:   queueName,
-		partitionID: partitionID,
-		ownership:   newOwnershipState(store, info.RangeID),
-		visTimeout:  visTimeout,
-		waiters:     newWaiterRegistry(),
-		ctx:         queueCtx,
-		cancel:      cancel,
+		store:          store,
+		queueName:      queueName,
+		partitionID:    partitionID,
+		ownership:      newOwnershipState(store, info.RangeID),
+		ownershipEpoch: info.RangeID,
+		visTimeout:     visTimeout,
+		waiters:        newWaiterRegistry(),
+		ctx:            queueCtx,
+		cancel:         cancel,
 	}
 
 	pq.runtime = newTaskRuntime(pq, info.AckLevel)
@@ -89,17 +91,17 @@ func (pq *PhysicalQueue) onFlush(rows []*TaskRow) {
 	pq.runtime.tryDeliverToWaiters()
 }
 
-func (pq *PhysicalQueue) tryPoll(ctx context.Context) (*TaskRow, string, bool) {
+func (pq *PhysicalQueue) tryPoll(ctx context.Context) (*TaskRow, string, bool, error) {
 	if pq.IsClosed() {
-		return nil, "", false
+		return nil, "", false, ErrQueueClosed
 	}
 
 	row, token, ok, err := pq.runtime.tryGetTask(ctx)
 	if err != nil {
 		slog.Error("queue tryPoll failed", "queue", pq.queueName, "partition_id", pq.partitionID, "err", err)
-		return nil, "", false
+		return nil, "", false, err
 	}
-	return row, token, ok
+	return row, token, ok, nil
 }
 
 func (pq *PhysicalQueue) registerWaiter(ch chan PollResult) *list.Element {
@@ -137,16 +139,16 @@ func (pq *PhysicalQueue) ack(ctx context.Context, token string) error {
 		return ErrQueueClosed
 	}
 
-	partitionID, taskID, err := parseToken(token)
+	parsed, err := ParseTaskToken(token)
 	if err != nil {
 		return err
 	}
-	if err := validateTokenPartition(pq.partitionID, partitionID); err != nil {
+	if err := validateTaskToken(pq.queueName, pq.partitionID, pq.ownershipEpoch, parsed); err != nil {
 		return err
 	}
 
 	_ = ctx
-	return pq.runtime.ack(taskID)
+	return pq.runtime.ack(parsed.TaskID)
 }
 
 func (pq *PhysicalQueue) nack(ctx context.Context, token string) error {
@@ -154,15 +156,15 @@ func (pq *PhysicalQueue) nack(ctx context.Context, token string) error {
 		return ErrQueueClosed
 	}
 
-	partitionID, taskID, err := parseToken(token)
+	parsed, err := ParseTaskToken(token)
 	if err != nil {
 		return err
 	}
-	if err := validateTokenPartition(pq.partitionID, partitionID); err != nil {
+	if err := validateTaskToken(pq.queueName, pq.partitionID, pq.ownershipEpoch, parsed); err != nil {
 		return err
 	}
 
-	if err := pq.runtime.nack(ctx, taskID); err != nil {
+	if err := pq.runtime.nack(ctx, parsed.TaskID); err != nil {
 		return err
 	}
 	pq.wakeWaiters()
@@ -214,7 +216,7 @@ func (pq *PhysicalQueue) AddTask(ctx context.Context, data []byte) error {
 }
 
 // TryPoll 非阻塞尝试获取任务
-func (pq *PhysicalQueue) TryPoll(ctx context.Context) (*TaskRow, string, bool) {
+func (pq *PhysicalQueue) TryPoll(ctx context.Context) (*TaskRow, string, bool, error) {
 	return pq.tryPoll(ctx)
 }
 

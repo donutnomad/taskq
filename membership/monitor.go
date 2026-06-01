@@ -115,8 +115,10 @@ func (m *monitor) Start() {
 	m.status = 1
 	m.mu.Unlock()
 
-	if err := m.store.PruneExpiredMembers(m.lifecycleCtx, 10); err != nil {
-		slog.Warn("membership prune expired members failed", "err", err)
+	if pruner, ok := m.store.(ExpiredMemberPruner); ok {
+		if err := pruner.PruneExpiredMembers(m.lifecycleCtx, 10); err != nil {
+			slog.Warn("membership prune expired members failed", "err", err)
+		}
 	}
 
 	if err := m.retryMembershipOp("initialize membership heartbeats", m.writeHeartbeats); err != nil {
@@ -128,12 +130,6 @@ func (m *monitor) Start() {
 		m.fail(fmt.Errorf("failed to sync members on startup: %w", err))
 		return
 	}
-
-	m.mu.Lock()
-	for _, ring := range m.rings {
-		ring.Start()
-	}
-	m.mu.Unlock()
 
 	close(m.initialized)
 

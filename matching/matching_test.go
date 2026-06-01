@@ -9,6 +9,7 @@ import (
 	dbleader "github.com/donutnomad/dbleader"
 	"github.com/donutnomad/taskq/membership"
 	"github.com/donutnomad/taskq/queue"
+	"github.com/donutnomad/taskq/store/gormstore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -42,7 +43,6 @@ func (r *stubResolver) Lookup(key string) (membership.HostInfo, error) {
 	idx := len(key) % len(r.members)
 	return r.members[idx], nil
 }
-func (r *stubResolver) LookupN(key string, n int) []membership.HostInfo { return nil }
 func (r *stubResolver) AddListener(name string, ch chan<- *membership.ChangedEvent) error {
 	r.listeners[name] = ch
 	return nil
@@ -51,11 +51,6 @@ func (r *stubResolver) RemoveListener(name string) error {
 	delete(r.listeners, name)
 	return nil
 }
-func (r *stubResolver) MemberCount() int                        { return len(r.members) }
-func (r *stubResolver) AvailableMemberCount() int               { return len(r.members) }
-func (r *stubResolver) Members() []membership.HostInfo          { return r.members }
-func (r *stubResolver) AvailableMembers() []membership.HostInfo { return r.members }
-func (r *stubResolver) RequestRefresh()                         {}
 
 // stubMonitor 是一个简单的 Monitor mock
 type stubMonitor struct {
@@ -64,19 +59,16 @@ type stubMonitor struct {
 
 func (m *stubMonitor) Start()                                       {}
 func (m *stubMonitor) Stop()                                        {}
-func (m *stubMonitor) EvictSelf() error                             { return nil }
 func (m *stubMonitor) EvictSelfAt(time.Time) (time.Duration, error) { return 0, nil }
 func (m *stubMonitor) GetResolver(service string) (membership.ServiceResolver, error) {
 	return m.resolver, nil
 }
-func (m *stubMonitor) GetReachableMembers() ([]string, error)       { return nil, nil }
-func (m *stubMonitor) WaitUntilInitialized(context.Context) error   { return nil }
-func (m *stubMonitor) SetDraining(bool) error                       { return nil }
-func (m *stubMonitor) ApproximateMaxPropagationTime() time.Duration { return 0 }
+func (m *stubMonitor) WaitUntilInitialized(context.Context) error { return nil }
+func (m *stubMonitor) SetDraining(bool) error                     { return nil }
 
 func newTestSQLiteStore(t *testing.T) queue.Store {
 	t.Helper()
-	store, err := queue.NewSQLiteStore(":memory:")
+	store, err := gormstore.NewSQLite(":memory:", gormstore.Config{AutoMigrate: true})
 	if err != nil {
 		t.Fatal(err)
 	}

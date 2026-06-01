@@ -82,7 +82,7 @@ func (rt *taskRuntime) dispatchTask(ctx context.Context, row *TaskRow, advanceRe
 	}
 
 	rt.state.markDispatched(row, dispatchAt, advanceReadLevel)
-	return row, formatToken(rt.pq.partitionID, row.TaskID), nil
+	return row, formatToken(rt.pq.queueName, rt.pq.partitionID, row.TaskID, rt.pq.ownershipEpoch), nil
 }
 
 func (rt *taskRuntime) ack(taskID int64) error {

@@ -51,14 +51,15 @@ graph LR
 
 #### Store 接口
 
-`Store` 是可插拔的持久化抽象层，当前提供 SQLite（WAL 模式）实现。
+`Store` 是可插拔的持久化抽象层。公共实现位于 `store/gormstore`，基于 GORM 支持 SQLite 和 MySQL。
 
 ```go
 type Store interface {
     // 队列元数据
     CreateQueue(ctx, info) error
     GetQueue(ctx, queueName, partitionID) (*QueueInfo, error)
-    UpdateQueue(ctx, info, prevRangeID) error        // rangeID CAS
+    AllocateTaskIDRange(ctx, queueName, partitionID, newNextTaskID, prevRangeID) (int64, error)
+    AdvanceAckLevelAndDeleteTasks(ctx, queueName, partitionID, newAckLevel, prevRangeID) (int64, int64, error)
 
     // 任务 CRUD
     CreateTasks(ctx, tasks) error
@@ -66,18 +67,11 @@ type Store interface {
     DispatchTask(ctx, queueName, partitionID, taskID, dispatchedAt) error
     UnDispatchTask(ctx, queueName, partitionID, taskID) error
     ResetTimedOutTasks(ctx, queueName, partitionID, ackLevel, visTimeout) ([]int64, error)
-    DeleteTasks(ctx, queueName, partitionID, maxTaskID) (int64, error)
-    DeleteTask(ctx, queueName, partitionID, taskID) error
-
-    // dbleader 锁
-    TryAcquire(ctx, lockName, nodeIP, ttlSeconds) (AcquireResult, error)
-    Renew(ctx, lockName, nodeIP, ttlSeconds) (bool, error)
-    Release(ctx, lockName, nodeIP) (bool, error)
-    GetLeaderAddr(ctx, lockName) (string, error)
-
     Close() error
 }
 ```
+
+`matching.NewServer` 要求同一个 store 同时实现 `dbleader.LockStore`。`store/gormstore.Store` 覆盖 queue 元数据、任务表、分区锁表和锁成员表。
 
 **数据库表结构：**
 
@@ -86,6 +80,7 @@ type Store interface {
 | `queue_info` | queue_name, partition_id, range_id, ack_level, next_task_id | 分区元数据 |
 | `tasks` | task_id, queue_name, partition_id, data, created_at, dispatched_at | 任务数据 |
 | `taskq_partition_lock` | lock_name, leader_ip, expire_at_ms, version | `dbleader` 分区锁 |
+| `taskq_partition_lock_members` | lock_name, instance_id, node_ip, last_seen | `dbleader` 成员心跳 |
 
 #### PhysicalQueue — 单分区核心
 
@@ -485,7 +480,7 @@ import (
     "github.com/donutnomad/taskq/frontend"
     "github.com/donutnomad/taskq/matching"
     "github.com/donutnomad/taskq/membership"
-    "github.com/donutnomad/taskq/queue"
+    "github.com/donutnomad/taskq/store/gormstore"
     "google.golang.org/grpc"
     "google.golang.org/grpc/credentials/insecure"
 )
@@ -494,7 +489,7 @@ func main() {
     ctx := context.Background()
 
     // 1. 创建存储
-    store, _ := queue.NewSQLiteStore("taskq.db")
+    store, _ := gormstore.NewSQLite("taskq.db", gormstore.Config{AutoMigrate: true})
     defer store.Close()
 
     // 2. 准备 MemberStore
@@ -564,11 +559,6 @@ go run ./example/
 taskq/
 ├── queue/                      # 核心存储引擎
 │   ├── store.go                # Store 接口定义
-│   ├── store_sqlite.go         # SQLite 初始化与 schema
-│   ├── store_sqlite_queue.go   # queue_info 读写
-│   ├── store_sqlite_tasks.go   # tasks 读写
-│   ├── store_sqlite_lease.go   # 兼容保留的 lease 存储接口
-│   ├── store_sqlite_lock.go    # dbleader 锁存储
 │   ├── session_claim.go        # PhysicalQueue 会话 claim
 │   ├── physical_queue.go       # 单分区队列总控
 │   ├── writer.go               # 批量写入器
@@ -601,6 +591,10 @@ taskq/
 │   ├── frontend.go             # 路由器（Enqueue/Dequeue/Ack/Nack）
 │   ├── client.go               # gRPC 连接池
 │   └── frontend_test.go        # 端到端测试
+├── store/gormstore/            # GORM 持久化实现
+│   ├── store.go                # SQLite/MySQL queue.Store + dbleader.LockStore
+│   ├── store_test.go           # SQLite 契约测试
+│   └── mysql_integration_test.go # MySQL Docker 集成测试
 ├── example/
 │   └── main.go                 # 完整使用示例
 ├── go.mod
@@ -615,13 +609,19 @@ taskq/
 | `github.com/google/uuid` | UUID 生成 — 节点标识和 Lease Owner |
 | `google.golang.org/grpc` | gRPC 框架 — Matching 服务通信 |
 | `google.golang.org/protobuf` | Protobuf 序列化 |
-| `modernc.org/sqlite` | 纯 Go SQLite 驱动（无 CGO） |
+| `gorm.io/gorm` | GORM 持久化框架 |
+| `github.com/glebarez/sqlite` | 纯 Go SQLite GORM 驱动 |
+| `gorm.io/driver/mysql` | MySQL GORM 驱动 |
+| `testcontainers-go` | MySQL 集成测试容器 |
 
 ## 运行测试
 
 ```bash
 # 全量测试
 go test ./... -v
+
+# MySQL 集成测试
+go test -tags=integration ./store/gormstore -v
 
 # 主要包做 race 检测
 go test ./membership ./queue ./matching ./frontend -v -race

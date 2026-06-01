@@ -7,18 +7,15 @@ func TestHostInfoBasic(t *testing.T) {
 	if h.GetAddress() != "10.0.0.1:7233" {
 		t.Fatalf("unexpected address: %s", h.GetAddress())
 	}
-	if h.Identity() != "10.0.0.1:7233" {
-		t.Fatalf("unexpected identity: %s", h.Identity())
-	}
 }
 
 func TestHostInfoDraining(t *testing.T) {
 	h1 := newHostInfo("10.0.0.1:7233", false, 0, 0)
 	h2 := newHostInfo("10.0.0.1:7233", true, 0, 0)
-	if isDraining(h1) {
+	if h1.draining {
 		t.Fatal("h1 should not be draining")
 	}
-	if !isDraining(h2) {
+	if !h2.draining {
 		t.Fatal("h2 should be draining")
 	}
 }

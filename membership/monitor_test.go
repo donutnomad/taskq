@@ -78,7 +78,10 @@ func TestMonitorStartStop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	members, err := m.GetReachableMembers()
+	reachable := m.(interface {
+		GetReachableMembers() ([]string, error)
+	})
+	members, err := reachable.GetReachableMembers()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,8 +161,11 @@ func TestMonitorSetDraining(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 
 	resolver, _ := m.GetResolver("matching")
-	if resolver.AvailableMemberCount() != 0 {
-		t.Fatalf("expected 0 available after draining, got %d", resolver.AvailableMemberCount())
+	observable := resolver.(interface {
+		AvailableMemberCount() int
+	})
+	if observable.AvailableMemberCount() != 0 {
+		t.Fatalf("expected 0 available after draining, got %d", observable.AvailableMemberCount())
 	}
 
 	m.Stop()

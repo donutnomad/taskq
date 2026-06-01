@@ -45,14 +45,14 @@ func (s *stepDownLockStore) Renew(_ context.Context, _ string, nodeIP string, tt
 	return true, nil
 }
 
-func (s *stepDownLockStore) Release(_ context.Context, _ string, nodeIP string) (bool, error) {
+func (s *stepDownLockStore) Release(_ context.Context, _ string, nodeIP string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.leader != nodeIP || s.expire.Before(time.Now()) {
-		return false, nil
+		return nil
 	}
 	s.expire = time.Now().Add(-time.Second)
-	return true, nil
+	return nil
 }
 
 func (s *stepDownLockStore) GetLeaderAddr(_ context.Context, _ string) (string, error) {
@@ -65,7 +65,8 @@ func (s *stepDownLockStore) GetLeaderAddr(_ context.Context, _ string) (string, 
 }
 
 type stepDownTask struct {
-	once sync.Once
+	once    sync.Once
+	offline func()
 }
 
 func (t *stepDownTask) Name() string { return "step-down" }
@@ -73,7 +74,10 @@ func (t *stepDownTask) Name() string { return "step-down" }
 func (t *stepDownTask) Start(ctx context.Context) error {
 	var err error
 	t.once.Do(func() {
-		err = dbleader.StepDown(errors.New("ownership lost"))
+		if t.offline != nil {
+			go t.offline()
+		}
+		err = errors.New("ownership lost")
 	})
 	if err != nil {
 		return err
@@ -91,6 +95,30 @@ func (t *blockingLeaderTask) Start(ctx context.Context) error {
 	return nil
 }
 
+func (s *stepDownLockStore) ForceAssign(_ context.Context, _ string, newLeaderIP string, ttlSeconds int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.leader == "" {
+		return dbleader.ErrLockNotFound
+	}
+	s.version++
+	s.leader = newLeaderIP
+	s.expire = time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+	return nil
+}
+
+func (s *stepDownLockStore) UpsertMember(context.Context, dbleader.MemberInfo) error {
+	return nil
+}
+
+func (s *stepDownLockStore) ListMembers(context.Context, string, int) ([]dbleader.MemberInfo, error) {
+	return nil, nil
+}
+
+func (s *stepDownLockStore) PurgeStaleMembers(context.Context, string, int) (int64, error) {
+	return 0, nil
+}
+
 func TestDBLeaderStepDownErrorTransfersLeadership(t *testing.T) {
 	store := &stepDownLockStore{}
 	opts := []dbleader.Option{
@@ -99,7 +127,9 @@ func TestDBLeaderStepDownErrorTransfersLeadership(t *testing.T) {
 		dbleader.WithRetryInterval(50 * time.Millisecond),
 	}
 
-	m1 := dbleader.NewManager(store, "lock", "node-1", []dbleader.LeaderTask{&stepDownTask{}}, opts...)
+	task := &stepDownTask{}
+	m1 := dbleader.NewManager(store, "lock", "node-1", []dbleader.LeaderTask{task}, opts...)
+	task.offline = m1.Offline
 	m2 := dbleader.NewManager(store, "lock", "node-2", []dbleader.LeaderTask{&blockingLeaderTask{}}, opts...)
 
 	ctx, cancel := context.WithCancel(context.Background())

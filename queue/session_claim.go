@@ -14,9 +14,10 @@ func claimQueueOwnership(ctx context.Context, store Store, queueName string, par
 	}
 
 	for {
-		next := *info
-		next.RangeID = info.RangeID + 1
-		if err := store.UpdateQueue(ctx, &next, info.RangeID); err == nil {
+		newRangeID, err := store.AllocateTaskIDRange(ctx, queueName, partitionID, info.NextTaskID, info.RangeID)
+		if err == nil {
+			next := *info
+			next.RangeID = newRangeID
 			return &next, nil
 		} else if !errors.Is(err, ErrConditionFailed) {
 			return nil, err

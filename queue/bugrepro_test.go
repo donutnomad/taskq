@@ -8,47 +8,40 @@ import (
 	"time"
 )
 
-type updateQueueErrorStore struct {
+type allocateRangeErrorStore struct {
 	err error
 }
 
-func (s *updateQueueErrorStore) CreateQueue(context.Context, *QueueInfo) error { return nil }
-func (s *updateQueueErrorStore) GetQueue(context.Context, string, int) (*QueueInfo, error) {
+func (s *allocateRangeErrorStore) CreateQueue(context.Context, *QueueInfo) error { return nil }
+func (s *allocateRangeErrorStore) GetQueue(context.Context, string, int) (*QueueInfo, error) {
 	return nil, nil
 }
-func (s *updateQueueErrorStore) UpdateQueue(context.Context, *QueueInfo, int64) error { return s.err }
-func (s *updateQueueErrorStore) CreateTasks(context.Context, []*TaskRow) error        { return nil }
-func (s *updateQueueErrorStore) GetTasks(context.Context, string, int, int64, int64, int) ([]*TaskRow, error) {
+func (s *allocateRangeErrorStore) AllocateTaskIDRange(context.Context, string, int, int64, int64) (int64, error) {
+	return 0, s.err
+}
+func (s *allocateRangeErrorStore) AdvanceAckLevelAndDeleteTasks(context.Context, string, int, int64, int64) (int64, int64, error) {
+	return 0, 0, nil
+}
+func (s *allocateRangeErrorStore) CreateTasks(context.Context, []*TaskRow) error { return nil }
+func (s *allocateRangeErrorStore) GetTasks(context.Context, string, int, int64, int64, int) ([]*TaskRow, error) {
 	return nil, nil
 }
-func (s *updateQueueErrorStore) DispatchTask(context.Context, string, int, int64, time.Time) error {
+func (s *allocateRangeErrorStore) DispatchTask(context.Context, string, int, int64, time.Time) error {
 	return nil
 }
-func (s *updateQueueErrorStore) UnDispatchTask(context.Context, string, int, int64) error { return nil }
-func (s *updateQueueErrorStore) ResetTimedOutTasks(context.Context, string, int, int64, time.Duration) ([]int64, error) {
-	return nil, nil
-}
-func (s *updateQueueErrorStore) DeleteTasks(context.Context, string, int, int64) (int64, error) {
-	return 0, nil
-}
-func (s *updateQueueErrorStore) DeleteTask(context.Context, string, int, int64) error { return nil }
-func (s *updateQueueErrorStore) AcquireLease(context.Context, string, int, string, time.Duration) (*QueueInfo, error) {
-	return nil, nil
-}
-func (s *updateQueueErrorStore) RenewLease(context.Context, string, int, string, time.Duration) error {
+func (s *allocateRangeErrorStore) UnDispatchTask(context.Context, string, int, int64) error {
 	return nil
 }
-func (s *updateQueueErrorStore) ReleaseLease(context.Context, string, int, string) error { return nil }
-func (s *updateQueueErrorStore) Close() error                                            { return nil }
+func (s *allocateRangeErrorStore) ResetTimedOutTasks(context.Context, string, int, int64, time.Duration) ([]int64, error) {
+	return nil, nil
+}
+func (s *allocateRangeErrorStore) Close() error { return nil }
 
-func TestBugRepro_UpdateQueueKeepsNonCASFailures(t *testing.T) {
-	store := &updateQueueErrorStore{err: context.DeadlineExceeded}
+func TestBugRepro_AllocateTaskIDRangeKeepsNonCASFailures(t *testing.T) {
+	store := &allocateRangeErrorStore{err: context.DeadlineExceeded}
 	ownership := newOwnershipState(store, 7)
 
-	err := ownership.updateQueue(context.Background(), &QueueInfo{
-		QueueName:   "q",
-		PartitionID: 0,
-	})
+	err := ownership.allocateTaskIDRange(context.Background(), "q", 0, 10)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected original storage error, got %v", err)
 	}
@@ -127,8 +120,8 @@ func TestBugRepro_TryPollShouldNotDeliverSameTaskConcurrently(t *testing.T) {
 	for range 2 {
 		go func() {
 			<-start
-			_, token, ok := pq.TryPoll(context.Background())
-			results <- pollResult{ok: ok, token: token}
+			_, token, ok, err := pq.TryPoll(context.Background())
+			results <- pollResult{ok: ok, token: token, err: err}
 		}()
 	}
 	close(start)
@@ -178,7 +171,10 @@ func TestBugRepro_NewQueueInstanceShouldReadExistingUndispatchedTasks(t *testing
 	startTestWriterTask(t, pq2)
 	t.Cleanup(func() { pq2.Close() })
 
-	row, _, ok := pq2.TryPoll(context.Background())
+	row, _, ok, err := pq2.TryPoll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || row == nil {
 		t.Fatal("expected reopened queue to read existing undispatched task")
 	}
@@ -232,12 +228,12 @@ func TestBugRepro_LeaseHandoverWindowDoesNotDoubleDeliverSameTask(t *testing.T) 
 
 	go func() {
 		<-start
-		_, token, ok := pqOld.TryPoll(context.Background())
+		_, token, ok, _ := pqOld.TryPoll(context.Background())
 		results <- pollResult{ok: ok, token: token}
 	}()
 	go func() {
 		<-start
-		_, token, ok := pqNew.TryPoll(context.Background())
+		_, token, ok, _ := pqNew.TryPoll(context.Background())
 		results <- pollResult{ok: ok, token: token}
 	}()
 	close(start)

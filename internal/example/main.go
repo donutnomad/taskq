@@ -16,7 +16,7 @@ import (
 	"github.com/donutnomad/taskq/frontend"
 	"github.com/donutnomad/taskq/matching"
 	"github.com/donutnomad/taskq/membership"
-	"github.com/donutnomad/taskq/queue"
+	"github.com/donutnomad/taskq/store/gormstore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -56,17 +56,13 @@ func (s *memMemberStore) GetActiveMembers(_ context.Context, _ time.Duration) ([
 	return records, nil
 }
 
-func (s *memMemberStore) PruneExpiredMembers(_ context.Context, _ int) error {
-	return nil
-}
-
 // ---- 主流程 ----
 
 func main() {
 	const queueName = "demo-queue"
 
 	// 1. 创建 SQLite store（内存模式）
-	store, err := queue.NewSQLiteStore(":memory:")
+	store, err := gormstore.NewSQLite(":memory:", gormstore.Config{AutoMigrate: true})
 	if err != nil {
 		log.Fatal(err)
 	}

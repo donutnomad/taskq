@@ -37,6 +37,23 @@ CREATE TABLE IF NOT EXISTS taskq_partition_lock (
 	expire_at_ms INTEGER NOT NULL,
 	version      INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS taskq_partition_lock_members (
+	lock_name       TEXT NOT NULL,
+	instance_id     TEXT NOT NULL,
+	node_ip         TEXT NOT NULL,
+	mac_address     TEXT NOT NULL DEFAULT '',
+	hostname        TEXT NOT NULL DEFAULT '',
+	pid             INTEGER NOT NULL DEFAULT 0,
+	os              TEXT NOT NULL DEFAULT '',
+	go_version      TEXT NOT NULL DEFAULT '',
+	service_version TEXT NOT NULL DEFAULT '',
+	description     TEXT NOT NULL DEFAULT '',
+	start_time_ms   INTEGER NOT NULL,
+	last_seen_ms    INTEGER NOT NULL,
+	PRIMARY KEY (lock_name, instance_id)
+);
+CREATE INDEX IF NOT EXISTS idx_members_lock_lastseen
+	ON taskq_partition_lock_members(lock_name, last_seen_ms);
 `
 
 type sqliteStore struct {

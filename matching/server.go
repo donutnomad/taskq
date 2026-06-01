@@ -140,7 +140,16 @@ func toGRPCError(err error) error {
 	if errors.Is(err, queue.ErrOwnershipLost) {
 		return status.Error(codes.Aborted, err.Error())
 	}
+	if errors.Is(err, queue.ErrStaleToken) {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
 	if errors.Is(err, queue.ErrQueueClosed) {
+		return status.Error(codes.Unavailable, err.Error())
+	}
+	if errors.Is(err, context.Canceled) {
+		return status.Error(codes.Canceled, err.Error())
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
 		return status.Error(codes.Unavailable, err.Error())
 	}
 	return status.Error(codes.Internal, err.Error())

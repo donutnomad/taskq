@@ -20,11 +20,35 @@ type conditionFailedUpdateStore struct {
 	failUpdate bool
 }
 
-func (s *conditionFailedUpdateStore) UpdateQueue(ctx context.Context, info *QueueInfo, prevRangeID int64) error {
+type failOnceCreateTasksStore struct {
+	Store
+	mu  sync.Mutex
+	err error
+}
+
+func (s *conditionFailedUpdateStore) AllocateTaskIDRange(ctx context.Context, queueName string, partitionID int, newNextTaskID int64, prevRangeID int64) (int64, error) {
 	if s.failUpdate {
-		return ErrConditionFailed
+		return 0, ErrConditionFailed
 	}
-	return s.Store.UpdateQueue(ctx, info, prevRangeID)
+	return s.Store.AllocateTaskIDRange(ctx, queueName, partitionID, newNextTaskID, prevRangeID)
+}
+
+func (s *conditionFailedUpdateStore) AdvanceAckLevelAndDeleteTasks(ctx context.Context, queueName string, partitionID int, newAckLevel int64, prevRangeID int64) (int64, int64, error) {
+	if s.failUpdate {
+		return 0, 0, ErrConditionFailed
+	}
+	return s.Store.AdvanceAckLevelAndDeleteTasks(ctx, queueName, partitionID, newAckLevel, prevRangeID)
+}
+
+func (s *failOnceCreateTasksStore) CreateTasks(ctx context.Context, tasks []*TaskRow) error {
+	s.mu.Lock()
+	err := s.err
+	s.err = nil
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.Store.CreateTasks(ctx, tasks)
 }
 
 func newFlakyDispatchStore(base Store) *flakyDispatchStore {
@@ -135,6 +159,43 @@ func TestPhysicalQueue_NewQueueDoesNotAcceptWritesUntilWriterTaskRuns(t *testing
 	}
 }
 
+func TestCreateTasksRollbackOnFailure(t *testing.T) {
+	base := newTestStore(t)
+	createErr := errors.New("create tasks failed")
+	store := &failOnceCreateTasksStore{
+		Store: base,
+		err:   createErr,
+	}
+	pq, err := newPhysicalQueue(context.Background(), store, "rollback-q", 0, 60*time.Second, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq)
+	t.Cleanup(func() { pq.close() })
+
+	ctx := context.Background()
+	if err := pq.AddTask(ctx, []byte("failed-task")); !errors.Is(err, createErr) {
+		t.Fatalf("expected first add to return create failure, got %v", err)
+	}
+	if err := pq.AddTask(ctx, []byte("retry-task")); err != nil {
+		t.Fatal(err)
+	}
+
+	row, _, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected retried task")
+	}
+	if row.TaskID != 1 {
+		t.Fatalf("expected retry to reuse task ID 1, got %d", row.TaskID)
+	}
+	if string(row.Data) != "retry-task" {
+		t.Fatalf("expected retry-task, got %q", row.Data)
+	}
+}
+
 func TestPhysicalQueue_GCDoesNotRunUntilExplicitlyStarted(t *testing.T) {
 	s := newTestStore(t)
 	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, "test-owner")
@@ -149,7 +210,10 @@ func TestPhysicalQueue_GCDoesNotRunUntilExplicitlyStarted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, token, ok := pq.TryPoll(ctx)
+	_, token, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected task")
 	}
@@ -183,7 +247,10 @@ func TestPhysicalQueue_GCRunsAfterExplicitStart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, token, ok := pq.TryPoll(ctx)
+	_, token, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected task")
 	}
@@ -224,15 +291,18 @@ func TestPhysicalQueue_VisibilityScanDoesNotRunUntilExplicitlyStarted(t *testing
 		t.Fatal(err)
 	}
 
-	_, _, ok := pq.TryPoll(ctx)
+	_, _, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected task")
 	}
 
 	time.Sleep(defaultVisScanInterval + 200*time.Millisecond)
 
-	if row, _, ok := pq.TryPoll(ctx); ok || row != nil {
-		t.Fatalf("expected timed out task to stay hidden before visibility task starts, got ok=%v row=%+v", ok, row)
+	if row, _, ok, err := pq.TryPoll(ctx); err != nil || ok || row != nil {
+		t.Fatalf("expected timed out task to stay hidden before visibility task starts, got ok=%v row=%+v err=%v", ok, row, err)
 	}
 }
 
@@ -251,14 +321,20 @@ func TestPhysicalQueue_VisibilityScanRunsAfterExplicitStart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, _, ok := pq.TryPoll(ctx)
+	_, _, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected task")
 	}
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		row, _, ok := pq.TryPoll(ctx)
+		row, _, ok, err := pq.TryPoll(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if ok {
 			if string(row.Data) != "task" {
 				t.Fatalf("expected redelivered task, got %q", row.Data)
@@ -307,7 +383,10 @@ func TestPhysicalQueue_GCOwnershipLossDoesNotLocallyCancelQueue(t *testing.T) {
 	if err := pq.AddTask(ctx, []byte("task")); err != nil {
 		t.Fatal(err)
 	}
-	_, token, ok := pq.TryPoll(ctx)
+	_, token, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected task")
 	}
@@ -373,7 +452,10 @@ func TestPhysicalQueue_AddTaskWaitsUntilTaskBecomesReadable(t *testing.T) {
 		t.Fatal("timed out waiting for AddTask to finish")
 	}
 
-	row, _, ok := pq.TryPoll(context.Background())
+	row, _, ok, err := pq.TryPoll(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok || row == nil {
 		t.Fatal("expected task to be readable after AddTask returns")
 	}
@@ -387,7 +469,10 @@ func TestPhysicalQueue_AddAndPoll(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	row, token, ok := pq.tryPoll(ctx)
+	row, token, ok, err := pq.tryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected task")
 	}
@@ -426,8 +511,14 @@ func TestPhysicalQueue_AckAndNack(t *testing.T) {
 	pq.addTask(ctx, []byte("task1"))
 	pq.addTask(ctx, []byte("task2"))
 
-	r1, tok1, _ := pq.tryPoll(ctx)
-	r2, tok2, _ := pq.tryPoll(ctx)
+	r1, tok1, _, err := pq.tryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2, tok2, _, err := pq.tryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_ = r1
 	_ = r2
 
@@ -438,7 +529,10 @@ func TestPhysicalQueue_AckAndNack(t *testing.T) {
 	pq.nack(ctx, tok2)
 
 	// nack 后 task2 应可再次被 poll
-	r3, _, ok := pq.tryPoll(ctx)
+	r3, _, ok, err := pq.tryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected redelivered task after nack")
 	}
@@ -467,8 +561,8 @@ func TestPhysicalQueue_RegisterWaiterImmediatelyGetsReadableTask(t *testing.T) {
 	pq, _ := newTestPhysicalQueue(t)
 	ctx := context.Background()
 
-	if _, _, ok := pq.tryPoll(ctx); ok {
-		t.Fatal("expected empty queue before reproducing the wait registration gap")
+	if _, _, ok, err := pq.tryPoll(ctx); err != nil || ok {
+		t.Fatalf("expected empty queue before reproducing the wait registration gap, got ok=%v err=%v", ok, err)
 	}
 
 	if err := pq.addTask(ctx, []byte("already-readable")); err != nil {
@@ -503,19 +597,25 @@ func TestPhysicalQueue_CanceledQueueStopsServingAndRejectsAckNack(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	_, tok1, ok := pq.tryPoll(ctx)
+	_, tok1, ok, err := pq.tryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected first task")
 	}
-	_, tok2, ok := pq.tryPoll(ctx)
+	_, tok2, ok, err := pq.tryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected second task")
 	}
 
 	pq.cancel()
 
-	if row, _, ok := pq.tryPoll(ctx); ok || row != nil {
-		t.Fatalf("expected canceled queue to stop serving tasks, got ok=%v row=%+v", ok, row)
+	if row, _, ok, err := pq.tryPoll(ctx); !errors.Is(err, ErrQueueClosed) || ok || row != nil {
+		t.Fatalf("expected canceled queue to stop serving tasks, got ok=%v row=%+v err=%v", ok, row, err)
 	}
 	if err := pq.ack(ctx, tok1); !errors.Is(err, ErrQueueClosed) {
 		t.Fatalf("expected ErrQueueClosed from ack after cancellation, got %v", err)
@@ -542,18 +642,139 @@ func TestPhysicalQueue_AckRejectsTokenForDifferentPartition(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, token, ok := pq.TryPoll(ctx)
+	_, token, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected task")
 	}
 
-	err := pq.Ack(ctx, "99:1")
+	err = pq.Ack(ctx, "99:1")
 	if !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("expected ErrInvalidToken for mismatched partition, got %v", err)
 	}
 
 	if err := pq.Ack(ctx, token); err != nil {
 		t.Fatalf("expected original token to remain valid, got %v", err)
+	}
+}
+
+func TestPhysicalQueue_TokenIncludesQueueAndOwnershipEpoch(t *testing.T) {
+	pq, _ := newTestPhysicalQueue(t)
+	ctx := context.Background()
+
+	if err := pq.AddTask(ctx, []byte("task")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, token, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected task")
+	}
+
+	parsed, err := ParseTaskToken(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.QueueName != "test-q" {
+		t.Fatalf("expected queue name test-q, got %q", parsed.QueueName)
+	}
+	if parsed.PartitionID != 0 {
+		t.Fatalf("expected partition 0, got %d", parsed.PartitionID)
+	}
+	if parsed.TaskID != 1 {
+		t.Fatalf("expected task 1, got %d", parsed.TaskID)
+	}
+	if parsed.OwnershipEpoch == 0 {
+		t.Fatal("expected ownership epoch")
+	}
+}
+
+func TestPhysicalQueue_AckRejectsTokenForDifferentQueue(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	pqA, err := newPhysicalQueue(ctx, store, "queue-a", 0, 60*time.Second, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pqA)
+	defer pqA.Close()
+
+	pqB, err := newPhysicalQueue(ctx, store, "queue-b", 0, 60*time.Second, "owner-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pqB)
+	defer pqB.Close()
+
+	if err := pqA.AddTask(ctx, []byte("task-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := pqB.AddTask(ctx, []byte("task-b")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, tokenA, ok, err := pqA.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected queue-a task")
+	}
+	_, tokenB, ok, err := pqB.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected queue-b task")
+	}
+
+	err = pqB.Ack(ctx, tokenA)
+	if !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("expected ErrInvalidToken for mismatched queue, got %v", err)
+	}
+	if err := pqB.Ack(ctx, tokenB); err != nil {
+		t.Fatalf("expected queue-b token to remain valid, got %v", err)
+	}
+}
+
+func TestPhysicalQueue_AckRejectsTokenFromPreviousOwnershipEpoch(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	pq1, err := newPhysicalQueue(ctx, store, "epoch-q", 0, 60*time.Second, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq1)
+
+	if err := pq1.AddTask(ctx, []byte("task")); err != nil {
+		t.Fatal(err)
+	}
+	_, oldToken, ok, err := pq1.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected task")
+	}
+	pq1.Close()
+
+	pq2, err := newPhysicalQueue(ctx, store, "epoch-q", 0, 60*time.Second, "owner-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq2)
+	defer pq2.Close()
+
+	err = pq2.Ack(ctx, oldToken)
+	if !errors.Is(err, ErrStaleToken) {
+		t.Fatalf("expected ErrStaleToken, got %v", err)
 	}
 }
 
@@ -565,7 +786,10 @@ func TestPhysicalQueue_AckRejectsDuplicateToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, token, ok := pq.TryPoll(ctx)
+	_, token, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected task")
 	}
@@ -573,7 +797,7 @@ func TestPhysicalQueue_AckRejectsDuplicateToken(t *testing.T) {
 		t.Fatalf("expected first ack to succeed, got %v", err)
 	}
 
-	err := pq.Ack(ctx, token)
+	err = pq.Ack(ctx, token)
 	if !errors.Is(err, ErrTaskNotOutstanding) {
 		t.Fatalf("expected ErrTaskNotOutstanding, got %v", err)
 	}
@@ -587,7 +811,10 @@ func TestPhysicalQueue_NackRejectsDuplicateToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, token, ok := pq.TryPoll(ctx)
+	_, token, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected task")
 	}
@@ -595,7 +822,7 @@ func TestPhysicalQueue_NackRejectsDuplicateToken(t *testing.T) {
 		t.Fatalf("expected first nack to succeed, got %v", err)
 	}
 
-	err := pq.Nack(ctx, token)
+	err = pq.Nack(ctx, token)
 	if !errors.Is(err, ErrTaskNotOutstanding) {
 		t.Fatalf("expected ErrTaskNotOutstanding, got %v", err)
 	}
@@ -604,7 +831,8 @@ func TestPhysicalQueue_NackRejectsDuplicateToken(t *testing.T) {
 func TestPhysicalQueue_TryPollDoesNotSkipTaskAfterDispatchFailure(t *testing.T) {
 	base := newTestStore(t)
 	store := newFlakyDispatchStore(base)
-	store.failDispatchFor[1] = errors.New("transient dispatch failure")
+	dispatchErr := errors.New("transient dispatch failure")
+	store.failDispatchFor[1] = dispatchErr
 
 	ctx := context.Background()
 	pq, err := newPhysicalQueue(ctx, store, "test-q", 0, 60*time.Second, "test-owner")
@@ -618,11 +846,14 @@ func TestPhysicalQueue_TryPollDoesNotSkipTaskAfterDispatchFailure(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	if row, _, ok := pq.TryPoll(ctx); ok || row != nil {
-		t.Fatalf("expected first poll to fail closed over transient dispatch error, got ok=%v row=%+v", ok, row)
+	if row, _, ok, err := pq.TryPoll(ctx); !errors.Is(err, dispatchErr) || ok || row != nil {
+		t.Fatalf("expected first poll to return dispatch error, got ok=%v row=%+v err=%v", ok, row, err)
 	}
 
-	row, _, ok := pq.TryPoll(ctx)
+	row, _, ok, err := pq.TryPoll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected task after transient dispatch failure")
 	}

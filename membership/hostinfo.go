@@ -2,6 +2,14 @@ package membership
 
 import "github.com/dgryski/go-farm"
 
+var _ HostInfo = (*hostInfo)(nil)
+
+// HostInfo 代表环中的一个节点
+type HostInfo interface {
+	// GetAddress 返回 ip:port，必须是合法的 gRPC 地址
+	GetAddress() string
+}
+
 // hostInfo 代表哈希环中的一个节点实例，实现 HostInfo 接口。
 type hostInfo struct {
 	addr           string
@@ -10,8 +18,6 @@ type hostInfo struct {
 	stopAt         int64
 	labelsChecksum uint64
 }
-
-var _ HostInfo = (*hostInfo)(nil)
 
 func newHostInfo(addr string, draining bool, startAt, stopAt int64) *hostInfo {
 	h := &hostInfo{
@@ -25,8 +31,6 @@ func newHostInfo(addr string, draining bool, startAt, stopAt int64) *hostInfo {
 }
 
 func (hi *hostInfo) GetAddress() string { return hi.addr }
-func (hi *hostInfo) Identity() string   { return hi.addr }
-
 func (hi *hostInfo) computeChecksum() uint64 {
 	var c uint64
 	c ^= farm.Fingerprint64([]byte(hi.addr))
@@ -41,8 +45,4 @@ func (hi *hostInfo) computeChecksum() uint64 {
 	}
 	c ^= farm.Fingerprint64(buf[:])
 	return c
-}
-
-func isDraining(host *hostInfo) bool {
-	return host.draining
 }

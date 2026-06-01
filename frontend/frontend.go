@@ -387,8 +387,6 @@ func isRetryable(err error) bool {
 }
 
 func (f *Frontend) waitRetry(ctx context.Context) error {
-	f.resolver.RequestRefresh()
-
 	timer := time.NewTimer(defaultRetryBackoff)
 	defer timer.Stop()
 

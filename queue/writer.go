@@ -153,26 +153,34 @@ func (w *taskWriter) flush(batch []*writeRequest) error {
 	}
 
 	now := time.Now()
+	startID := w.nextID
 	rows := make([]*TaskRow, len(batch))
 	for i, req := range batch {
+		taskID := startID + int64(i)
 		rows[i] = &TaskRow{
-			TaskID:      w.nextID,
+			TaskID:      taskID,
 			QueueName:   w.pq.queueName,
 			PartitionID: w.pq.partitionID,
 			Data:        req.data,
 			CreatedAt:   now,
 		}
-		req.taskID = w.nextID
-		w.nextID++
+		req.taskID = taskID
 	}
 
 	err := w.pq.store.CreateTasks(w.ctx, rows)
+	if err != nil {
+		for _, req := range batch {
+			req.done <- err
+		}
+		return nil
+	}
+	w.nextID = startID + int64(len(batch))
 	// 成功返回给写入方之前，先把新任务发布到本地可读状态。
-	if err == nil && w.onFlush != nil {
+	if w.onFlush != nil {
 		w.onFlush(rows)
 	}
 	for _, req := range batch {
-		req.done <- err
+		req.done <- nil
 	}
 	return nil
 }
@@ -185,17 +193,7 @@ func (w *taskWriter) allocateRange(minSize int64) error {
 		size = minSize
 	}
 	newNextTaskID := w.nextID + size
-	cur, err := w.pq.store.GetQueue(w.ctx, w.pq.queueName, w.pq.partitionID)
-	if err != nil {
-		return err
-	}
-	info := &QueueInfo{
-		QueueName:   w.pq.queueName,
-		PartitionID: w.pq.partitionID,
-		AckLevel:    cur.AckLevel,
-		NextTaskID:  newNextTaskID,
-	}
-	if err := w.pq.ownership.updateQueue(w.ctx, info); err != nil {
+	if err := w.pq.ownership.allocateTaskIDRange(w.ctx, w.pq.queueName, w.pq.partitionID, newNextTaskID); err != nil {
 		return err
 	}
 	w.maxID = newNextTaskID
