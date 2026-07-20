@@ -29,6 +29,26 @@ func TestHashRingLookupDeterministic(t *testing.T) {
 	}
 }
 
+func TestHashRingLookupDeterministicWhenVNodesCollide(t *testing.T) {
+	constantHash := func([]byte) uint32 { return 42 }
+	left := newHashRingWithHash(2, constantHash)
+	right := newHashRingWithHash(2, constantHash)
+
+	left.AddMember("host-b:7233")
+	left.AddMember("host-a:7233")
+	right.AddMember("host-a:7233")
+	right.AddMember("host-b:7233")
+
+	leftOwner, leftFound := left.Lookup("same-key")
+	rightOwner, rightFound := right.Lookup("same-key")
+	if !leftFound || !rightFound {
+		t.Fatal("expected both rings to resolve the key")
+	}
+	if leftOwner != rightOwner {
+		t.Fatalf("colliding vnode order changed owner: left=%q right=%q", leftOwner, rightOwner)
+	}
+}
+
 func TestHashRingLookupNFirst(t *testing.T) {
 	ring := newHashRing(100)
 	ring.AddMember("host-a:7233")

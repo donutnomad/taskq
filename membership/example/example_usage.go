@@ -45,15 +45,15 @@ func main() {
 
 	myGRPCAddr := netip.MustParseAddrPort("10.0.0.2:7235") // 本节点 gRPC 地址
 
-	monitor := membership.NewMonitor(
-		[]string{"matching", "history", "frontend"}, // 本节点承担的服务角色列表
-		store,
-		myGRPCAddr,    // gRPC 广播地址
-		5*time.Second, // pollInterval：DB 轮询间隔
-		3*time.Second, // propagationTime：变更传播估计时间
-		time.Time{},   // joinTime：立即加入（零值表示无延迟）
-		200,           // replicaPoints：虚拟节点数
-	)
+	monitor := membership.NewMonitorWithConfig(membership.MonitorConfig{
+		AdvertisedServices: []string{"matching", "history"},
+		WatchedServices:    []string{"matching", "history"},
+		Store:              store,
+		BroadcastAddr:      myGRPCAddr,
+		PollInterval:       5 * time.Second,
+		PropagationTime:    3 * time.Second,
+		ReplicaPoints:      200,
+	})
 
 	monitor.Start()
 	if err := monitor.WaitUntilInitialized(context.Background()); err != nil {

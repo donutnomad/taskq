@@ -4,7 +4,7 @@ go 1.25.5
 
 require (
 	github.com/dgryski/go-farm v0.0.0-20200201041132-a6ae2369ad13
-	github.com/donutnomad/dbleader v0.0.0
+	github.com/donutnomad/dbleader v0.1.1
 	github.com/glebarez/sqlite v1.11.0
 	github.com/google/uuid v1.6.0
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.42.0
@@ -83,5 +83,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace github.com/donutnomad/dbleader => ../dbleader

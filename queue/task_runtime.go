@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 )
 
 type taskRuntime struct {
-	pq    *PhysicalQueue
-	state *deliveryState
+	pq             *PhysicalQueue
+	state          *deliveryState
+	transitionMu   sync.Mutex
+	nextDeliveryID int64
 }
 
 func newTaskRuntime(pq *PhysicalQueue, ackLevel int64) *taskRuntime {
@@ -24,32 +27,22 @@ func (rt *taskRuntime) setMaxReadLevel(level int64) {
 	rt.state.setMaxReadLevel(level)
 }
 
-func (rt *taskRuntime) tryGetTask(ctx context.Context) (*TaskRow, string, bool, error) {
+func (rt *taskRuntime) tryGetTask(ctx context.Context, opts PollOptions) (*TaskRow, string, bool, error) {
 	for {
-		if row := rt.state.takeRedelivery(); row != nil {
-			task, token, err := rt.dispatchTask(ctx, row, false)
-			if err == nil {
-				return task, token, true, nil
-			}
-			if errors.Is(err, ErrTaskNotFound) {
-				continue
-			}
-			rt.state.requeueRedeliveryFront(row)
-			return nil, "", false, err
-		}
-
+		fallbackAt := time.Now().UTC()
 		minTaskID, maxTaskID, ok := rt.state.nextReadWindow()
 		if !ok {
 			return nil, "", false, nil
 		}
 
-		tasks, err := rt.pq.store.GetTasks(
+		tasks, err := rt.pq.store.GetTasksWithOptions(
 			ctx,
 			rt.pq.queueName,
 			rt.pq.partitionID,
 			minTaskID,
 			maxTaskID,
 			1,
+			TaskQueryOptions{AcceptedRoutingKeys: opts.AcceptedRoutingKeys, RoutingFallbackAt: fallbackAt},
 		)
 		if err != nil {
 			return nil, "", false, fmt.Errorf("get tasks: %w", err)
@@ -58,7 +51,7 @@ func (rt *taskRuntime) tryGetTask(ctx context.Context) (*TaskRow, string, bool, 
 			return nil, "", false, nil
 		}
 
-		row, token, err := rt.dispatchTask(ctx, tasks[0], true)
+		row, token, err := rt.dispatchTask(ctx, tasks[0])
 		if errors.Is(err, ErrTaskNotFound) {
 			continue
 		}
@@ -69,7 +62,10 @@ func (rt *taskRuntime) tryGetTask(ctx context.Context) (*TaskRow, string, bool, 
 	}
 }
 
-func (rt *taskRuntime) dispatchTask(ctx context.Context, row *TaskRow, advanceReadLevel bool) (*TaskRow, string, error) {
+func (rt *taskRuntime) dispatchTask(ctx context.Context, row *TaskRow) (*TaskRow, string, error) {
+	rt.transitionMu.Lock()
+	defer rt.transitionMu.Unlock()
+
 	dispatchAt := time.Now()
 	if err := rt.pq.store.DispatchTask(
 		ctx,
@@ -81,16 +77,24 @@ func (rt *taskRuntime) dispatchTask(ctx context.Context, row *TaskRow, advanceRe
 		return nil, "", fmt.Errorf("dispatch task %d: %w", row.TaskID, err)
 	}
 
-	rt.state.markDispatched(row, dispatchAt, advanceReadLevel)
-	return row, formatToken(rt.pq.queueName, rt.pq.partitionID, row.TaskID, rt.pq.ownershipEpoch), nil
+	row.DispatchedAt = &dispatchAt
+	rt.nextDeliveryID++
+	deliveryID := rt.nextDeliveryID
+	rt.state.markDispatched(row, dispatchAt, deliveryID)
+	return row, formatToken(rt.pq.queueName, rt.pq.partitionID, row.TaskID, rt.pq.ownershipEpoch, deliveryID), nil
 }
 
-func (rt *taskRuntime) ack(taskID int64) error {
-	return rt.state.ack(taskID)
+func (rt *taskRuntime) ack(taskID, deliveryID int64) error {
+	rt.transitionMu.Lock()
+	defer rt.transitionMu.Unlock()
+	return rt.state.ack(taskID, deliveryID)
 }
 
-func (rt *taskRuntime) nack(ctx context.Context, taskID int64) error {
-	ot, err := rt.state.beginNack(taskID)
+func (rt *taskRuntime) nack(ctx context.Context, taskID, deliveryID int64) error {
+	rt.transitionMu.Lock()
+	defer rt.transitionMu.Unlock()
+
+	ot, err := rt.state.beginNack(taskID, deliveryID)
 	if err != nil {
 		return err
 	}
@@ -104,23 +108,40 @@ func (rt *taskRuntime) nack(ctx context.Context, taskID int64) error {
 	return nil
 }
 
-func (rt *taskRuntime) moveTimedOutTasksToRedelivery(taskIDs []int64) {
+func (rt *taskRuntime) resetTimedOutTasks(ctx context.Context, visTimeout time.Duration) error {
+	rt.transitionMu.Lock()
+	defer rt.transitionMu.Unlock()
+
+	taskIDs, err := rt.pq.store.ResetTimedOutTasks(
+		ctx,
+		rt.pq.queueName,
+		rt.pq.partitionID,
+		VisibilityResetOptions{
+			AckLevel:          rt.state.ackLevelValue(),
+			VisibilityTimeout: visTimeout,
+			AcknowledgedIDs:   rt.state.ackedTaskIDs(),
+		},
+	)
+	if err != nil {
+		return err
+	}
 	for _, taskID := range taskIDs {
 		rt.state.moveToRedelivery(taskID)
 	}
+	return nil
 }
 
 func (rt *taskRuntime) ackLevel() int64 {
 	return rt.state.ackLevelValue()
 }
 
-func (rt *taskRuntime) hasReadable() bool {
-	return rt.state.hasReadable()
-}
-
 func (rt *taskRuntime) tryDeliverToWaiters() {
-	for rt.pq.waiters.hasWaiters() {
-		row, token, ok, err := rt.tryGetTask(rt.pq.ctx)
+	for {
+		opts, hasWaiters := rt.pq.waiters.pollOptions()
+		if !hasWaiters {
+			return
+		}
+		row, token, ok, err := rt.tryGetTask(rt.pq.ctx, opts)
 		if err != nil {
 			slog.Error("queue failed to fetch task for waiter delivery", "queue", rt.pq.queueName, "partition_id", rt.pq.partitionID, "err", err)
 			return
@@ -129,20 +150,16 @@ func (rt *taskRuntime) tryDeliverToWaiters() {
 			return
 		}
 
-		ch, ok := rt.pq.waiters.pop()
-		if !ok {
-			if err := rt.nack(rt.pq.ctx, row.TaskID); err != nil {
+		if !rt.pq.waiters.deliver(PollResult{Row: row, Token: token}) {
+			parsed, parseErr := ParseTaskToken(token)
+			if parseErr != nil {
+				slog.Error("queue failed to parse internally generated task token", "queue", rt.pq.queueName, "partition_id", rt.pq.partitionID, "task_id", row.TaskID, "err", parseErr)
+				return
+			}
+			if err := rt.nack(rt.pq.ctx, row.TaskID, parsed.DeliveryID); err != nil {
 				slog.Error("queue failed to return task after waiter disappeared", "queue", rt.pq.queueName, "partition_id", rt.pq.partitionID, "task_id", row.TaskID, "err", err)
 			}
 			return
-		}
-
-		if sendPollResult(ch, PollResult{Row: row, Token: token}) {
-			continue
-		}
-
-		if err := rt.nack(rt.pq.ctx, row.TaskID); err != nil {
-			slog.Error("queue failed to return task after waiter send failure", "queue", rt.pq.queueName, "partition_id", rt.pq.partitionID, "task_id", row.TaskID, "err", err)
 		}
 	}
 }

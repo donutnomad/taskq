@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 	queue_name    TEXT NOT NULL,
 	partition_id  INTEGER NOT NULL,
 	task_id       INTEGER NOT NULL,
+	routing_key   TEXT NOT NULL DEFAULT '',
+	routing_deadline TIMESTAMP,
 	data          BLOB NOT NULL,
 	created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	dispatched_at TIMESTAMP,
@@ -207,7 +209,7 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, tasks []*TaskRow) error {
 
 	stmt, err := tx.PrepareContext(
 		ctx,
-		`INSERT INTO tasks (task_id, queue_name, partition_id, data, created_at) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (task_id, queue_name, partition_id, routing_key, routing_deadline, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return err
@@ -220,6 +222,8 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, tasks []*TaskRow) error {
 			task.TaskID,
 			task.QueueName,
 			task.PartitionID,
+			task.RoutingKey,
+			nullableTestTime(task.RoutingDeadline),
 			task.Data,
 			task.CreatedAt,
 		); err != nil {
@@ -230,6 +234,71 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, tasks []*TaskRow) error {
 	return tx.Commit()
 }
 
+func (s *sqliteStore) CreateTasksAndAdvanceRange(
+	ctx context.Context,
+	queueName string,
+	partitionID int,
+	tasks []*TaskRow,
+	newNextTaskID int64,
+	prevRangeID int64,
+) (int64, error) {
+	if len(tasks) == 0 {
+		return prevRangeID, nil
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	newRangeID := prevRangeID + 1
+	res, err := tx.ExecContext(
+		ctx,
+		`UPDATE queue_info
+		 SET range_id = ?, next_task_id = ?
+		 WHERE queue_name = ? AND partition_id = ? AND range_id = ?`,
+		newRangeID,
+		newNextTaskID,
+		queueName,
+		partitionID,
+		prevRangeID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if err := requireTestAffectedRows(res, ErrConditionFailed); err != nil {
+		return 0, err
+	}
+
+	stmt, err := tx.PrepareContext(
+		ctx,
+		`INSERT INTO tasks (task_id, queue_name, partition_id, routing_key, routing_deadline, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	defer stmt.Close()
+	for _, task := range tasks {
+		if _, err := stmt.ExecContext(
+			ctx,
+			task.TaskID,
+			task.QueueName,
+			task.PartitionID,
+			task.RoutingKey,
+			nullableTestTime(task.RoutingDeadline),
+			task.Data,
+			task.CreatedAt,
+		); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return newRangeID, nil
+}
+
 func (s *sqliteStore) GetTasks(
 	ctx context.Context,
 	queueName string,
@@ -238,19 +307,55 @@ func (s *sqliteStore) GetTasks(
 	maxTaskID int64,
 	limit int,
 ) ([]*TaskRow, error) {
+	return s.queryTasks(ctx, queueName, partitionID, minTaskID, maxTaskID, limit, nil)
+}
+
+func (s *sqliteStore) GetTasksWithOptions(
+	ctx context.Context,
+	queueName string,
+	partitionID int,
+	minTaskID int64,
+	maxTaskID int64,
+	limit int,
+	opts TaskQueryOptions,
+) ([]*TaskRow, error) {
+	return s.queryTasks(ctx, queueName, partitionID, minTaskID, maxTaskID, limit, &opts)
+}
+
+func (s *sqliteStore) queryTasks(
+	ctx context.Context,
+	queueName string,
+	partitionID int,
+	minTaskID int64,
+	maxTaskID int64,
+	limit int,
+	opts *TaskQueryOptions,
+) ([]*TaskRow, error) {
+	args := []any{queueName, partitionID, minTaskID, maxTaskID}
+	routingClause := ""
+	if opts != nil {
+		routingClause = " AND (routing_key = ''"
+		for _, key := range opts.AcceptedRoutingKeys {
+			routingClause += " OR routing_key = ?"
+			args = append(args, key)
+		}
+		if !opts.RoutingFallbackAt.IsZero() {
+			routingClause += " OR (routing_deadline IS NOT NULL AND routing_deadline <= ?)"
+			args = append(args, opts.RoutingFallbackAt)
+		}
+		routingClause += ")"
+	}
+	args = append(args, limit)
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT task_id, queue_name, partition_id, data, created_at
+		`SELECT task_id, queue_name, partition_id, routing_key, routing_deadline, data, created_at
 		 FROM tasks
 		 WHERE queue_name = ? AND partition_id = ?
 		   AND task_id > ? AND task_id <= ?
 		   AND dispatched_at IS NULL
+		   `+routingClause+`
 		 ORDER BY task_id ASC LIMIT ?`,
-		queueName,
-		partitionID,
-		minTaskID,
-		maxTaskID,
-		limit,
+		args...,
 	)
 	if err != nil {
 		return nil, err
@@ -260,18 +365,31 @@ func (s *sqliteStore) GetTasks(
 	var result []*TaskRow
 	for rows.Next() {
 		task := &TaskRow{}
+		var routingDeadline sql.NullTime
 		if err := rows.Scan(
 			&task.TaskID,
 			&task.QueueName,
 			&task.PartitionID,
+			&task.RoutingKey,
+			&routingDeadline,
 			&task.Data,
 			&task.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
+		if routingDeadline.Valid {
+			task.RoutingDeadline = routingDeadline.Time
+		}
 		result = append(result, task)
 	}
 	return result, rows.Err()
+}
+
+func nullableTestTime(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value
 }
 
 func (s *sqliteStore) DispatchTask(
@@ -315,37 +433,80 @@ func (s *sqliteStore) ResetTimedOutTasks(
 	ctx context.Context,
 	queueName string,
 	partitionID int,
-	ackLevel int64,
-	visTimeout time.Duration,
+	opts VisibilityResetOptions,
 ) ([]int64, error) {
-	cutoff := time.Now().Add(-visTimeout)
-	rows, err := s.db.QueryContext(
+	cutoff := time.Now().Add(-opts.VisibilityTimeout)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(
 		ctx,
-		`UPDATE tasks SET dispatched_at = NULL
+		`SELECT task_id FROM tasks
 		 WHERE queue_name = ? AND partition_id = ?
 		   AND task_id > ?
 		   AND dispatched_at IS NOT NULL
-		   AND dispatched_at < ?
-		 RETURNING task_id`,
+		   AND dispatched_at < ?`,
 		queueName,
 		partitionID,
-		ackLevel,
+		opts.AckLevel,
 		cutoff,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("reset timed out tasks: %w", err)
 	}
-	defer rows.Close()
-
-	var ids []int64
+	var candidates []int64
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		ids = append(ids, id)
+		candidates = append(candidates, id)
 	}
-	return ids, rows.Err()
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	acknowledged := make(map[int64]struct{}, len(opts.AcknowledgedIDs))
+	for _, taskID := range opts.AcknowledgedIDs {
+		acknowledged[taskID] = struct{}{}
+	}
+	resetIDs := make([]int64, 0, len(candidates))
+	for _, taskID := range candidates {
+		if _, ok := acknowledged[taskID]; ok {
+			continue
+		}
+		result, err := tx.ExecContext(
+			ctx,
+			`UPDATE tasks SET dispatched_at = NULL
+			 WHERE queue_name = ? AND partition_id = ? AND task_id = ?
+			   AND dispatched_at IS NOT NULL AND dispatched_at < ?`,
+			queueName,
+			partitionID,
+			taskID,
+			cutoff,
+		)
+		if err != nil {
+			return nil, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if affected > 0 {
+			resetIDs = append(resetIDs, taskID)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return resetIDs, nil
 }
 
 func requireTestAffectedRows(res sql.Result, errWhenZero error) error {

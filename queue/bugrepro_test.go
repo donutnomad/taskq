@@ -8,40 +8,46 @@ import (
 	"time"
 )
 
-type allocateRangeErrorStore struct {
+type rangeUpdateErrorStore struct {
 	err error
 }
 
-func (s *allocateRangeErrorStore) CreateQueue(context.Context, *QueueInfo) error { return nil }
-func (s *allocateRangeErrorStore) GetQueue(context.Context, string, int) (*QueueInfo, error) {
+func (s *rangeUpdateErrorStore) CreateQueue(context.Context, *QueueInfo) error { return nil }
+func (s *rangeUpdateErrorStore) GetQueue(context.Context, string, int) (*QueueInfo, error) {
 	return nil, nil
 }
-func (s *allocateRangeErrorStore) AllocateTaskIDRange(context.Context, string, int, int64, int64) (int64, error) {
+func (s *rangeUpdateErrorStore) AllocateTaskIDRange(context.Context, string, int, int64, int64) (int64, error) {
 	return 0, s.err
 }
-func (s *allocateRangeErrorStore) AdvanceAckLevelAndDeleteTasks(context.Context, string, int, int64, int64) (int64, int64, error) {
+func (s *rangeUpdateErrorStore) AdvanceAckLevelAndDeleteTasks(context.Context, string, int, int64, int64) (int64, int64, error) {
 	return 0, 0, nil
 }
-func (s *allocateRangeErrorStore) CreateTasks(context.Context, []*TaskRow) error { return nil }
-func (s *allocateRangeErrorStore) GetTasks(context.Context, string, int, int64, int64, int) ([]*TaskRow, error) {
+func (s *rangeUpdateErrorStore) CreateTasks(context.Context, []*TaskRow) error { return nil }
+func (s *rangeUpdateErrorStore) CreateTasksAndAdvanceRange(context.Context, string, int, []*TaskRow, int64, int64) (int64, error) {
+	return 0, s.err
+}
+func (s *rangeUpdateErrorStore) GetTasks(context.Context, string, int, int64, int64, int) ([]*TaskRow, error) {
 	return nil, nil
 }
-func (s *allocateRangeErrorStore) DispatchTask(context.Context, string, int, int64, time.Time) error {
-	return nil
-}
-func (s *allocateRangeErrorStore) UnDispatchTask(context.Context, string, int, int64) error {
-	return nil
-}
-func (s *allocateRangeErrorStore) ResetTimedOutTasks(context.Context, string, int, int64, time.Duration) ([]int64, error) {
+func (s *rangeUpdateErrorStore) GetTasksWithOptions(context.Context, string, int, int64, int64, int, TaskQueryOptions) ([]*TaskRow, error) {
 	return nil, nil
 }
-func (s *allocateRangeErrorStore) Close() error { return nil }
+func (s *rangeUpdateErrorStore) DispatchTask(context.Context, string, int, int64, time.Time) error {
+	return nil
+}
+func (s *rangeUpdateErrorStore) UnDispatchTask(context.Context, string, int, int64) error {
+	return nil
+}
+func (s *rangeUpdateErrorStore) ResetTimedOutTasks(context.Context, string, int, VisibilityResetOptions) ([]int64, error) {
+	return nil, nil
+}
+func (s *rangeUpdateErrorStore) Close() error { return nil }
 
-func TestBugRepro_AllocateTaskIDRangeKeepsNonCASFailures(t *testing.T) {
-	store := &allocateRangeErrorStore{err: context.DeadlineExceeded}
+func TestBugRepro_CreateTasksAndAdvanceRangeKeepsNonCASFailures(t *testing.T) {
+	store := &rangeUpdateErrorStore{err: context.DeadlineExceeded}
 	ownership := newOwnershipState(store, 7)
 
-	err := ownership.allocateTaskIDRange(context.Background(), "q", 0, 10)
+	err := ownership.createTasksAndAdvanceRange(context.Background(), "q", 0, []*TaskRow{{TaskID: 1}}, 2)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected original storage error, got %v", err)
 	}
@@ -74,6 +80,23 @@ func (s *getTasksBarrierStore) GetTasks(
 	limit int,
 ) ([]*TaskRow, error) {
 	rows, err := s.Store.GetTasks(ctx, queueName, partitionID, minTaskID, maxTaskID, limit)
+	return s.waitForConcurrentReads(ctx, rows, err)
+}
+
+func (s *getTasksBarrierStore) GetTasksWithOptions(
+	ctx context.Context,
+	queueName string,
+	partitionID int,
+	minTaskID int64,
+	maxTaskID int64,
+	limit int,
+	opts TaskQueryOptions,
+) ([]*TaskRow, error) {
+	rows, err := s.Store.GetTasksWithOptions(ctx, queueName, partitionID, minTaskID, maxTaskID, limit, opts)
+	return s.waitForConcurrentReads(ctx, rows, err)
+}
+
+func (s *getTasksBarrierStore) waitForConcurrentReads(ctx context.Context, rows []*TaskRow, err error) ([]*TaskRow, error) {
 	if err != nil || len(rows) == 0 {
 		return rows, err
 	}

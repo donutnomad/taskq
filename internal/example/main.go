@@ -83,15 +83,15 @@ func main() {
 
 	// 3. 创建真实 Monitor（内存 MemberStore + 单节点）
 	memberStore := newMemMemberStore()
-	monitor := membership.NewMonitor(
-		[]string{"matching"},
-		memberStore,
-		addrPort,
-		1*time.Second, // pollInterval
-		1*time.Second, // propagationTime
-		time.Time{},   // joinTime：立即加入
-		100,           // replicaPoints
-	)
+	monitor := membership.NewMonitorWithConfig(membership.MonitorConfig{
+		AdvertisedServices: []string{"matching"},
+		WatchedServices:    []string{"matching"},
+		Store:              memberStore,
+		BroadcastAddr:      addrPort,
+		PollInterval:       time.Second,
+		PropagationTime:    time.Second,
+		ReplicaPoints:      100,
+	})
 	monitor.Start()
 	if err := monitor.WaitUntilInitialized(context.Background()); err != nil {
 		log.Fatal(err)
@@ -121,10 +121,10 @@ func main() {
 
 	// 5. 创建真实 Frontend
 	fe, err := frontend.New(frontend.Config{
-		Monitor:     monitor,
-		QueueName:   queueName,
-		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-		PollTimeout: 5 * time.Second,
+		ResolverProvider: monitor,
+		QueueName:        queueName,
+		DialOpts:         []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout:      5 * time.Second,
 	})
 	if err != nil {
 		log.Fatal(err)

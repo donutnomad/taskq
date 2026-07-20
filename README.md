@@ -10,6 +10,7 @@ TaskQ 是一个 Temporal 风格的分布式任务队列系统，使用 Go 实现
 - **`dbleader` 锁 + RangeID CAS** — 运行期开关由 `dbleader` 控制，写入围栏继续由 `rangeID` CAS 兜底
 - **长轮询消费** — 无任务时 worker 阻塞等待，任务到达即时唤醒
 - **Sync Match** — 写入时直接匹配等待中的消费者，零延迟投递
+- **定向投递与原行 fallback** — RoutingKey 在 deadline 前定向到指定 worker，过期后由同一 TaskID 参与普通消费
 
 ## 系统架构
 
@@ -64,29 +65,31 @@ type Store interface {
     // 任务 CRUD
     CreateTasks(ctx, tasks) error
     GetTasks(ctx, queueName, partitionID, min, max, limit) ([]*TaskRow, error)
+    GetTasksWithOptions(ctx, queueName, partitionID, min, max, limit, opts) ([]*TaskRow, error)
     DispatchTask(ctx, queueName, partitionID, taskID, dispatchedAt) error
     UnDispatchTask(ctx, queueName, partitionID, taskID) error
-    ResetTimedOutTasks(ctx, queueName, partitionID, ackLevel, visTimeout) ([]int64, error)
+    ResetTimedOutTasks(ctx, queueName, partitionID, opts VisibilityResetOptions) ([]int64, error)
     Close() error
 }
 ```
 
-`matching.NewServer` 要求同一个 store 同时实现 `dbleader.LockStore`。`store/gormstore.Store` 覆盖 queue 元数据、任务表、分区锁表和锁成员表。
+`matching.Config.Store` 使用显式的 `matching.Store` 契约，组合 `queue.Store` 与 `dbleader.LockStore`。`store/gormstore.Store` 覆盖 queue 元数据、任务表、分区锁表和锁成员表。连接生命周期由调用者管理；`Matching.Stop` 只停止服务自身。`Store.Membership()` 返回共享同一 GORM 连接的 `membership.MemberStore` 适配器，连接由父 `Store.Close()` 统一释放。
 
 **数据库表结构：**
 
 | 表 | 关键列 | 用途 |
 |---|---|---|
 | `queue_info` | queue_name, partition_id, range_id, ack_level, next_task_id | 分区元数据 |
-| `tasks` | task_id, queue_name, partition_id, data, created_at, dispatched_at | 任务数据 |
+| `tasks` | task_id, queue_name, partition_id, routing_key, routing_deadline, data, created_at, dispatched_at | 任务数据与定向 fallback |
 | `taskq_partition_lock` | lock_name, leader_ip, expire_at_ms, version | `dbleader` 分区锁 |
 | `taskq_partition_lock_members` | lock_name, instance_id, node_ip, last_seen | `dbleader` 成员心跳 |
+| `taskq_membership_members` | service_name, rpc_address, rpc_port, heartbeat_at, expires_at | `membership.Monitor` 服务发现心跳 |
 
 #### PhysicalQueue — 单分区核心
 
 每个 `PhysicalQueue` 管理一个分区的内存状态和对外服务逻辑。它本身不再在构造时自动启动后台循环；writer、GC、可见性扫描都由外层单独运行。
 
-当前生产路径里，这三个后台循环由 `matching` 为每个分区分别挂成独立的 `dbleader` tasks。
+当前生产路径为每个分区创建一个 `dbleader` LeaderTask。LeaderTask 获得锁后创建 `PhysicalQueue`，等待 writer 就绪，再并行运行 writer、GC ticker 和 visibility ticker；任一循环返回错误会取消另外两个循环并关闭该分区。
 
 ```mermaid
 graph TB
@@ -111,12 +114,12 @@ graph TB
 
 | 组件 | 职责 | 周期 |
 |---|---|---|
-| **taskWriter** | 收集入队请求，批量 flush 到 DB，触发 sync match | 由独立 leader task 显式运行 |
+| **taskWriter** | 收集入队请求，批量 flush 到 DB，触发 sync match | LeaderTask 持锁期间持续运行 |
 | **taskRuntime** | 负责取任务、dispatch、ack/nack，把存储操作和内存状态衔接起来 | - |
-| **deliveryState** | 内存中维护 outstanding/redelivery/acked 集合，追踪 ackLevel/readLevel/maxReadLevel | - |
+| **deliveryState** | 内存中维护 outstanding/redelivery/acked 集合，追踪 ackLevel/maxReadLevel | - |
 | **waiterRegistry** | 管理长轮询阶段注册的等待者 | - |
-| **taskGC** | 根据 ackLevel 删除已确认的任务，通过 CAS 持久化 ackLevel | 由独立 leader task 显式运行 |
-| **visibilityScanner** | 检测超时的已分发任务，移入 redelivery 队列 | 由独立 leader task 显式运行 |
+| **taskGC** | 根据 ackLevel 删除已确认的任务，通过 CAS 持久化 ackLevel | LeaderTask 内每 5s 执行一次 |
+| **visibilityScanner** | 检测超时的已分发任务，移入 redelivery 队列 | LeaderTask 内每 1s 执行一次 |
 多分区分配不在 `queue` 包内完成。真实链路是：
 
 - `membership` 负责一致性哈希，把 `queue/partition` 映射到节点
@@ -129,17 +132,16 @@ graph TB
 graph TD
     A[节点启动/分区被分配] -->|TryAcquire| B{dbleader 锁}
     B -->|成功| C[创建 PhysicalQueue 状态]
-    C --> D[启动 writer task]
-    C --> E[启动 GC task]
-    C --> F[启动 visibility task]
-    B -->|失败| G[等待下一轮重试]
-    D -->|写入时| H{RangeID CAS}
-    E -->|清理时| H
-    D -->|锁续约失败/主动停止| I[关闭 PhysicalQueue]
-    E -->|锁续约失败/主动停止| I
-    F -->|锁续约失败/主动停止| I
-    H -->|成功| J[操作完成]
-    H -->|失败: ErrOwnershipLost| I
+    C --> D[启动单个 partition LeaderTask]
+    D --> E[writer goroutine]
+    D --> F[GC ticker goroutine]
+    D --> G[visibility ticker goroutine]
+    B -->|失败| H[等待下一轮重试]
+    E -->|写入时| I{RangeID CAS}
+    F -->|清理时| I
+    D -->|锁续约失败/主动停止/子循环失败| J[关闭 PhysicalQueue]
+    I -->|成功| K[操作完成]
+    I -->|失败: ErrOwnershipLost| J
 ```
 
 | 层 | 机制 | 时机 | 作用 |
@@ -153,8 +155,8 @@ graph TD
 
 ```mermaid
 graph TB
-    MON[Monitor] -->|UpsertMember 心跳| MS[(MemberStore)]
-    MON -->|GetActiveMembers 轮询| MS
+    MON[Monitor] -->|advertised services 心跳| MS[(MemberStore)]
+    MON -->|watched services 轮询| MS
     MON -->|setMembers| SR[ServiceResolver]
     SR -->|原子替换| HR[HashRing<br/>虚拟节点]
     SR -->|ChangedEvent| L1[Matching Listener]
@@ -163,7 +165,7 @@ graph TB
 
 | 组件 | 职责 |
 |---|---|
-| **Monitor** | 周期性写心跳、拉取成员列表、通知 ServiceResolver 更新 |
+| **Monitor** | 为 advertised services 写心跳，为 watched services 维护 ServiceResolver |
 | **ServiceResolver** | 维护哈希环，提供 `Lookup(key)` 路由查询，广播成员变更事件 |
 | **HashRing** | 虚拟节点（默认 100 个/节点），farm.Fingerprint32 哈希，顺时针查找 |
 | **HostInfo** | 节点元数据：地址、draining 状态、定时加入/退出 |
@@ -178,6 +180,7 @@ gRPC 分区管理服务，每个节点只处理哈希环分配给自己的分区
 |---|---|
 | `AddTask` | 写入任务到指定分区 |
 | `PollTask` | 消费任务（支持非阻塞和长轮询） |
+| `PollQueue` | 一次轮询同一 owner 的多个分区，返回一个任务并回收同时命中的其他 lease |
 | `AckTask` | 确认消费完成 |
 | `NackTask` | 拒绝消费，触发重投递 |
 | `GetQueueInfo` | 查询队列的分区数 |
@@ -230,46 +233,66 @@ sequenceDiagram
     F-->>W: nil (成功)
 ```
 
+### At-least-once 与业务幂等契约
+
+`Frontend.Enqueue` 对可重试的 AddTask 路由或 gRPC 错误最多尝试 3 次，重试间隔为 50ms。Matching 可能已经提交任务，而 AddTask 响应在网络中丢失；后续重试会写入另一条任务。消费者进程退出、visibility timeout 和 Nack 也会触发重新投递。
+
+生产接入遵循以下约定：
+
+1. 生产者在 payload 中携带稳定的业务幂等键，例如 `order_id + operation`，应用层重试继续使用同一个键。
+2. 消费者在业务数据库事务内写入幂等键唯一记录并执行副作用；唯一键冲突表示该任务已经处理。
+3. 业务事务提交成功后调用 `Ack`。处理失败时返回错误或调用 `Nack`，让任务重新投递。
+4. 外部系统调用使用同一个幂等键作为对方接口的 idempotency key，覆盖“外部调用成功、消费者提交前退出”的窗口。
+
+```sql
+CREATE UNIQUE INDEX uk_task_effect_idempotency_key
+ON task_effects (idempotency_key);
+```
+
+TaskQ 提供 at-least-once delivery；业务幂等键定义一次业务效果。
+
 ### Dequeue 流程
 
 ```mermaid
 sequenceDiagram
     participant W as Worker
     participant F as Frontend
-    participant M as Matching (gRPC)
+    participant M1 as Matching owner A
+    participant M2 as Matching owner B
     participant PQ as PhysicalQueue
 
     W->>F: Dequeue(ctx)
+	F->>F: 按一致性哈希 owner 聚合 partitions
 
-    Note over F: 阶段 1：快速扫描所有分区
-    loop 每个分区 (非阻塞)
-        F->>M: PollTask(pid, timeout=0)
-        M->>PQ: TryPoll()
-        PQ-->>M: 空 / 有任务
-        M-->>F: Empty=true / data+token
+    Note over F,M2: 阶段 1：按 owner 顺序快速扫描
+    loop 每个 owner
+        F->>M1: PollQueue(partitions, timeout=0)
+        M1->>PQ: 按轮转顺序 TryPoll()
+        M1-->>F: Empty=true / data+token
     end
 
     alt 快速扫描命中
         F-->>W: data, token, nil
-    else 全部为空
-        Note over F: 阶段 2：并发长轮询所有分区
-        par 每个分区并发等待
-            F->>M: PollTask(pid, timeout=30s)
-            M->>PQ: TryPoll()
-            PQ-->>M: 空
-            M->>PQ: RegisterWaiter(ch)
-            alt 该分区有任务到达
-                PQ-->>M: PollResult via channel
-                M-->>F: data, token
-            else 超时
-                M-->>F: Empty=true
-            end
-        and 其他分区
-            F->>M: PollTask(otherPid, timeout=30s)
+    else 所有 owner 均为空
+        Note over F,M2: 阶段 2：每个 owner 一个并发长轮询
+        par owner A
+            F->>M1: PollQueue(partitions, timeout=30s)
+            M1->>PQ: 每个 partition 注册 waiter
+            PQ-->>M1: 首批可领取任务
+            M1->>PQ: Nack 同 owner loser lease
+            M1-->>F: winner data+token
+        and owner B
+            F->>M2: PollQueue(partitions, timeout=30s)
         end
-        F-->>W: 首个返回任务的数据；若全部超时则 ErrNoTask
+        F->>F: 首个 owner 胜出并取消其他请求
+		F->>M2: Nack 已返回的其他 owner loser lease
+		F-->>W: winner；所有 owner 超时则 ErrNoTask
     end
 ```
+
+Frontend 兼容仅实现旧契约的 Matching 节点：`PollQueue` 返回 `Unimplemented` 时，同一 owner 内回退为并发 `PollTask`。Matching 和 Frontend 都使用独立的一秒清理上下文回收 loser lease；调用方取消与 delivery 同时发生时，Matching 先 Nack 已领取的 lease，再返回 `Canceled`。
+
+`PollQueue` 将一次 Dequeue 的 RPC fan-out 从分区数量 `O(partitions)` 收敛为 Matching owner 数量 `O(owners)`；快速阶段顺序扫描 owner，长轮询阶段并发等待 owner。
 
 ### Ack / Nack 流程
 
@@ -284,10 +307,10 @@ sequenceDiagram
     participant DB as SQLite
 
     Note over W,DB: Ack 流程
-    W->>F: Ack(token="pid:taskID")
+    W->>F: Ack(token=queue/partition/taskID/ownershipEpoch/deliveryID)
     F->>M: gRPC AckTask(token)
     M->>PQ: Ack(token)
-    PQ->>RT: ack(taskID)
+    PQ->>RT: ack(taskID, deliveryID)
     RT->>DS: 从 outstanding 移除
     DS->>DS: 标记 acked, 尝试推进 ackLevel
     Note over DS: ackLevel 推进到最大连续已确认 ID
@@ -297,7 +320,7 @@ sequenceDiagram
     W->>F: Nack(token)
     F->>M: gRPC NackTask(token)
     M->>PQ: Nack(token)
-    PQ->>RT: nack(taskID)
+    PQ->>RT: nack(taskID, deliveryID)
     RT->>DB: UnDispatchTask(taskID)
     RT->>DS: 从 outstanding 移除，放入 redelivery
     PQ->>PQ: wakeWaiters() → 投递给等待中的 poller
@@ -416,25 +439,29 @@ ackLevel 推进规则 (advanceAckLevel)：
 
 | 内部常量 | 值 | 说明 |
 |---|---|---|
-| Lease TTL | 15s | Lease 过期时间 |
-| Lease Renew | 5s | 续期间隔 |
+| Partition lease TTL | 3s | `matching` 分区锁过期时间 |
+| Partition lease renew | 1s | `matching` 分区锁续期间隔 |
+| Partition lease retry | 200ms | 抢锁与续约故障重试间隔 |
 | GC Interval | 5s | 已确认任务清理间隔 |
 | Vis Scan Interval | 1s | 超时任务检测间隔 |
 | Writer Buffer | 256 | 写入 channel 大小 |
+| Matching Reconcile | 5s | 成员事件之外的分区归属周期校验 |
 
 ### Membership
 
 ```go
-monitor := membership.NewMonitor(
-    []string{"matching"},      // 服务角色名列表
-    memberStore,               // MemberStore 接口实现
-    netip.MustParseAddrPort("10.0.0.1:7235"), // 广播地址
-    3 * time.Second,           // 轮询间隔
-    5 * time.Second,           // 最大传播时间
-    time.Time{},               // 加入时间（零值=立即）
-    100,                       // 虚拟节点数
-)
+monitor := membership.NewMonitorWithConfig(membership.MonitorConfig{
+    AdvertisedServices: []string{"matching"},
+    WatchedServices:    []string{"matching"},
+    Store:              memberStore,
+    BroadcastAddr:      netip.MustParseAddrPort("10.0.0.1:7235"),
+    PollInterval:       3*time.Second,
+    PropagationTime:    5*time.Second,
+    ReplicaPoints:      100,
+})
 ```
+
+`AdvertisedServices` 决定本进程写入哪些服务心跳；`WatchedServices` 决定本进程维护哪些服务的 resolver。Matching 进程通常同时 advertise 和 watch `matching`。旧 `NewMonitor(serviceNames, ...)` 保持兼容，它会把 `serviceNames` 同时映射到两个集合。
 
 ### Matching
 
@@ -448,6 +475,7 @@ matching.Config{
     VisTimeout:    60 * time.Second,                // 默认 60s
     QueueConfigs:  map[string]int{"my-queue": 4},   // 队列名 → 分区数
     LeaseOwner:    "",                              // 为空时自动生成 UUID
+    ReconcileInterval: 5 * time.Second,             // 默认 5s
     GRPCOptions:   []grpc.ServerOption{},           // 可选
 }
 ```
@@ -456,13 +484,15 @@ matching.Config{
 
 ```go
 frontend.Config{
-    Monitor:     monitor,                          // 必填
-    ServiceName: "matching",                       // 默认 "matching"
-    QueueName:   "my-queue",                       // 必填
-    DialOpts:    []grpc.DialOption{...},           // gRPC 拨号选项
-    PollTimeout: 30 * time.Second,                 // 长轮询超时，默认 30s
+    ResolverProvider: monitor,                     // 推荐：只依赖 resolver provider
+    ServiceName:      "matching",                  // 默认 "matching"
+    QueueName:        "my-queue",                  // 必填
+    DialOpts:         []grpc.DialOption{...},       // gRPC 拨号选项
+    PollTimeout:      30 * time.Second,             // 长轮询超时，默认 30s
 }
 ```
+
+`Monitor` 字段继续兼容已有调用；新装配使用 `ResolverProvider`，Frontend 只依赖 `GetResolver`。
 
 ## 快速开始
 
@@ -492,10 +522,8 @@ func main() {
     store, _ := gormstore.NewSQLite("taskq.db", gormstore.Config{AutoMigrate: true})
     defer store.Close()
 
-    // 2. 准备 MemberStore
-    // 这里需要你自己的 membership.MemberStore 实现。
-    // 可直接参考 ./example/main.go 里的 memMemberStore，或接入 MySQL/PostgreSQL。
-    memberStore := newYourMemberStore()
+    // 2. Membership 适配器与 queue/leader store 共享连接
+    memberStore := store.Membership()
 
     // 3. 启动成员发现
     lis, _ := net.Listen("tcp", "127.0.0.1:0")
@@ -503,10 +531,15 @@ func main() {
     addrPort, _ := netip.ParseAddrPort(addr)
     lis.Close()
 
-    monitor := membership.NewMonitor(
-        []string{"matching"}, memberStore, addrPort,
-        1*time.Second, 1*time.Second, time.Time{}, 100,
-    )
+    monitor := membership.NewMonitorWithConfig(membership.MonitorConfig{
+        AdvertisedServices: []string{"matching"},
+        WatchedServices:    []string{"matching"},
+        Store:              memberStore,
+        BroadcastAddr:      addrPort,
+        PollInterval:       time.Second,
+        PropagationTime:    time.Second,
+        ReplicaPoints:      100,
+    })
     monitor.Start()
     monitor.WaitUntilInitialized(ctx)
     defer monitor.Stop()
@@ -524,10 +557,10 @@ func main() {
 
     // 5. 创建 Frontend
     fe, _ := frontend.New(frontend.Config{
-        Monitor:     monitor,
-        QueueName:   "demo-queue",
-        DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
-        PollTimeout: 5 * time.Second,
+        ResolverProvider: monitor,
+        QueueName:        "demo-queue",
+        DialOpts:         []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+        PollTimeout:      5 * time.Second,
     })
     defer fe.Close()
 
@@ -547,10 +580,121 @@ func main() {
 }
 ```
 
-上面的代码片段省略了 `MemberStore` 的具体实现。可直接运行仓库里的完整示例：
+可直接运行仓库里的完整示例：
 
 ```bash
-go run ./example/
+go run ./internal/example/
+```
+
+### 生产装配
+
+生产环境先通过发布系统迁移 `queue_info`、`tasks`、`taskq_partition_lock`、`taskq_partition_lock_members` 和 `taskq_membership_members` 五张表，再以 `AutoMigrate: false` 启动进程：
+
+从 routed delivery 之前的版本升级时，MySQL 使用以下兼容迁移：
+
+```sql
+ALTER TABLE tasks
+	ADD COLUMN routing_key VARCHAR(191) NOT NULL DEFAULT '',
+    ADD COLUMN routing_deadline DATETIME(6) NULL;
+
+CREATE INDEX idx_tasks_visibility
+    ON tasks (queue_name, partition_id, dispatched_at, routing_key, task_id);
+
+CREATE INDEX idx_tasks_routing_deadline
+    ON tasks (queue_name, partition_id, dispatched_at, routing_deadline, task_id);
+```
+
+SQLite 使用以下兼容迁移：
+
+```sql
+ALTER TABLE tasks ADD COLUMN routing_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN routing_deadline DATETIME NULL;
+
+CREATE INDEX idx_tasks_visibility
+    ON tasks (queue_name, partition_id, dispatched_at, routing_key, task_id);
+
+CREATE INDEX idx_tasks_routing_deadline
+    ON tasks (queue_name, partition_id, dispatched_at, routing_deadline, task_id);
+```
+
+已经部署 Slice D routing key 的环境保留现有 `routing_key` 与 `idx_tasks_visibility`，只执行 deadline 列和 deadline 索引语句。上线顺序为先创建列与索引，再部署读写 routing 字段的 TaskQ 二进制。零值 deadline 持久化为 `NULL`，表示永久按 routing key 定向；非空 deadline 到期后由原任务行直接参与普通 poll，原任务行、TaskID 和 AckLevel 保持连续。每次 delivery 生成新的 token；旧 attempt token 无法 Ack 或 Nack 后续 delivery。
+
+```go
+store, err := gormstore.NewMySQL(os.Getenv("TASKQ_MYSQL_DSN"), gormstore.Config{
+    AutoMigrate: false,
+})
+if err != nil {
+    return err
+}
+
+monitor := membership.NewMonitorWithConfig(membership.MonitorConfig{
+    AdvertisedServices: []string{"matching"},
+    WatchedServices:    []string{"matching"},
+    Store:              store.Membership(),
+    BroadcastAddr:      netip.MustParseAddrPort(broadcastAddr),
+    PollInterval:       3*time.Second,
+    PropagationTime:    5*time.Second,
+    ReplicaPoints:      200,
+})
+monitor.Start()
+initCtx, cancelInit := context.WithTimeout(ctx, 30*time.Second)
+defer cancelInit()
+if err := monitor.WaitUntilInitialized(initCtx); err != nil {
+    monitor.Stop()
+    _ = store.Close()
+    return err
+}
+
+server, err := matching.NewServer(matching.Config{
+    Store:             store,
+    Monitor:           monitor,
+    ListenAddr:        listenAddr,
+    BroadcastAddr:     broadcastAddr,
+    QueueConfigs:      queueConfigs,
+    ReconcileInterval: 5 * time.Second,
+})
+if err != nil {
+    monitor.Stop()
+    _ = store.Close()
+    return err
+}
+if err := server.Start(); err != nil {
+    monitor.Stop()
+    _ = store.Close()
+    return err
+}
+
+<-ctx.Done()
+
+// Shutdown 顺序：停止流量与分区，再停止成员心跳，最后关闭共享 DB。
+server.Stop()
+monitor.Stop()
+return store.Close()
+```
+
+每个进程创建一个父 `gormstore.Store`，Matching 与 Membership 共用该连接池。应用负责在 `Store.Close()` 前停止所有 Server、Monitor 和 Frontend 实例。`AutoMigrate: true` 适用于本地开发和测试。
+
+独立 Worker 使用 observer-only Monitor。该进程读取 Matching 成员记录并维护 resolver，成员表只保留真实 Matching 节点：
+
+```go
+observer := membership.NewMonitorWithConfig(membership.MonitorConfig{
+    WatchedServices: []string{"matching"},
+    Store:           store.Membership(),
+    PollInterval:    3*time.Second,
+    PropagationTime: 5*time.Second,
+    ReplicaPoints:   200,
+})
+observer.Start()
+if err := observer.WaitUntilInitialized(ctx); err != nil {
+    return err
+}
+defer observer.Stop()
+
+workflowTasks, err := frontend.New(frontend.Config{
+    ResolverProvider: observer,
+    QueueName:        "workflow-tasks",
+    PollTimeout:      30*time.Second,
+})
 ```
 
 ## 项目结构
@@ -593,9 +737,10 @@ taskq/
 │   └── frontend_test.go        # 端到端测试
 ├── store/gormstore/            # GORM 持久化实现
 │   ├── store.go                # SQLite/MySQL queue.Store + dbleader.LockStore
+│   ├── membership.go           # membership.MemberStore 独立表适配器
 │   ├── store_test.go           # SQLite 契约测试
 │   └── mysql_integration_test.go # MySQL Docker 集成测试
-├── example/
+├── internal/example/
 │   └── main.go                 # 完整使用示例
 ├── go.mod
 └── go.sum
@@ -627,5 +772,5 @@ go test -tags=integration ./store/gormstore -v
 go test ./membership ./queue ./matching ./frontend -v -race
 
 # 运行示例
-go run ./example/
+go run ./internal/example/
 ```

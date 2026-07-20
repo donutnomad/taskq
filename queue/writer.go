@@ -3,26 +3,23 @@ package queue
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 )
 
-const defaultBlockSize = 100
-
 type writeRequest struct {
-	data   []byte
-	taskID int64 // flush 后填入
-	done   chan error
+	data            []byte
+	routingKey      string
+	routingDeadline time.Time
+	taskID          int64 // flush 后填入
+	done            chan error
 }
 
 type taskWriter struct {
 	pq *PhysicalQueue
 
-	mu        sync.Mutex
-	nextID    int64
-	maxID     int64
-	blockSize int64
+	mu     sync.Mutex
+	nextID int64
 
 	reqCh   chan *writeRequest
 	onFlush func(rows []*TaskRow) // sync match 回调
@@ -33,49 +30,43 @@ type taskWriter struct {
 	ctx     context.Context
 	done    chan struct{}
 	startCh chan struct{}
+	senders sync.WaitGroup
 }
 
 func newTaskWriter(pq *PhysicalQueue, nextTaskID int64, onFlush func([]*TaskRow)) *taskWriter {
 	return &taskWriter{
-		pq:        pq,
-		nextID:    nextTaskID,
-		maxID:     nextTaskID,
-		blockSize: defaultBlockSize,
-		reqCh:     make(chan *writeRequest, 256),
-		onFlush:   onFlush,
-		done:      make(chan struct{}),
-		startCh:   make(chan struct{}),
+		pq:      pq,
+		nextID:  nextTaskID,
+		reqCh:   make(chan *writeRequest, 256),
+		onFlush: onFlush,
+		done:    make(chan struct{}),
+		startCh: make(chan struct{}),
 	}
 }
 
-func (w *taskWriter) enqueue(data []byte) (int64, error) {
-	w.stateMu.RLock()
-	started := w.started
-	closed := w.closed
-	done := w.done
-	w.stateMu.RUnlock()
-
-	if !started || closed {
+func (w *taskWriter) enqueue(data []byte, opts EnqueueOptions) (int64, error) {
+	w.stateMu.Lock()
+	if !w.started || w.closed {
+		w.stateMu.Unlock()
 		return 0, ErrQueueClosed
 	}
+	w.senders.Add(1)
+	done := w.done
+	w.stateMu.Unlock()
 
-	req := &writeRequest{data: data, done: make(chan error, 1)}
+	req := &writeRequest{
+		data: data, routingKey: opts.RoutingKey, routingDeadline: opts.RoutingDeadline,
+		done: make(chan error, 1),
+	}
 	select {
 	case w.reqCh <- req:
+		w.senders.Done()
 	case <-done:
+		w.senders.Done()
 		return 0, ErrQueueClosed
 	}
-	select {
-	case err := <-req.done:
-		return req.taskID, err
-	case <-done:
-		select {
-		case err := <-req.done:
-			return req.taskID, err
-		default:
-			return 0, ErrQueueClosed
-		}
-	}
+	err := <-req.done
+	return req.taskID, err
 }
 
 func (w *taskWriter) run(ctx context.Context) error {
@@ -85,8 +76,12 @@ func (w *taskWriter) run(ctx context.Context) error {
 		return ErrQueueClosed
 	}
 	if w.started {
+		done := w.done
 		w.stateMu.Unlock()
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-done:
+		}
 		return nil
 	}
 	w.started = true
@@ -120,6 +115,8 @@ func (w *taskWriter) run(ctx context.Context) error {
 			}
 		case <-ctx.Done():
 			return nil
+		case <-w.done:
+			return nil
 		}
 	}
 }
@@ -139,42 +136,41 @@ func (w *taskWriter) flush(batch []*writeRequest) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	needed := int64(len(batch))
-	if w.nextID+needed > w.maxID {
-		if err := w.allocateRange(needed); err != nil {
-			for _, req := range batch {
-				req.done <- fmt.Errorf("allocate range: %w", err)
-			}
-			if errors.Is(err, ErrOwnershipLost) {
-				return err
-			}
-			return nil
-		}
-	}
-
 	now := time.Now()
 	startID := w.nextID
 	rows := make([]*TaskRow, len(batch))
 	for i, req := range batch {
 		taskID := startID + int64(i)
 		rows[i] = &TaskRow{
-			TaskID:      taskID,
-			QueueName:   w.pq.queueName,
-			PartitionID: w.pq.partitionID,
-			Data:        req.data,
-			CreatedAt:   now,
+			TaskID:          taskID,
+			QueueName:       w.pq.queueName,
+			PartitionID:     w.pq.partitionID,
+			RoutingKey:      req.routingKey,
+			RoutingDeadline: req.routingDeadline,
+			Data:            req.data,
+			CreatedAt:       now,
 		}
 		req.taskID = taskID
 	}
 
-	err := w.pq.store.CreateTasks(w.ctx, rows)
+	newNextID := startID + int64(len(batch))
+	err := w.pq.ownership.createTasksAndAdvanceRange(
+		w.ctx,
+		w.pq.queueName,
+		w.pq.partitionID,
+		rows,
+		newNextID,
+	)
 	if err != nil {
 		for _, req := range batch {
 			req.done <- err
 		}
+		if errors.Is(err, ErrOwnershipLost) {
+			return err
+		}
 		return nil
 	}
-	w.nextID = startID + int64(len(batch))
+	w.nextID = newNextID
 	// 成功返回给写入方之前，先把新任务发布到本地可读状态。
 	if w.onFlush != nil {
 		w.onFlush(rows)
@@ -182,21 +178,6 @@ func (w *taskWriter) flush(batch []*writeRequest) error {
 	for _, req := range batch {
 		req.done <- nil
 	}
-	return nil
-}
-
-// allocateRange 通过 ownershipState CAS 分配新的 taskID 范围。
-// 每次成功后 rangeID 递增，确保多进程竞争下能检测到所有权丢失。
-func (w *taskWriter) allocateRange(minSize int64) error {
-	size := w.blockSize
-	if size < minSize {
-		size = minSize
-	}
-	newNextTaskID := w.nextID + size
-	if err := w.pq.ownership.allocateTaskIDRange(w.ctx, w.pq.queueName, w.pq.partitionID, newNextTaskID); err != nil {
-		return err
-	}
-	w.maxID = newNextTaskID
 	return nil
 }
 
@@ -211,6 +192,7 @@ func (w *taskWriter) close() {
 	w.stateMu.Unlock()
 
 	close(done)
+	w.senders.Wait()
 
 	for {
 		select {

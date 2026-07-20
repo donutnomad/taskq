@@ -1,6 +1,7 @@
 package membership
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -17,7 +18,18 @@ type serviceResolver struct {
 	ringAndHosts atomic.Value
 
 	listenerLock sync.RWMutex
-	listeners    map[string]chan<- *ChangedEvent
+	listeners    map[string]*resolverListener
+}
+
+type resolverListener struct {
+	out      chan<- *ChangedEvent
+	notify   chan struct{}
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	stopOnce sync.Once
+
+	mu      sync.Mutex
+	pending *ChangedEvent
 }
 
 type ringAndHosts struct {
@@ -32,7 +44,7 @@ func newServiceResolver(service string, replicaPoints int) *serviceResolver {
 		service:       service,
 		replicaPoints: replicaPoints,
 		shutdownCh:    make(chan struct{}),
-		listeners:     make(map[string]chan<- *ChangedEvent),
+		listeners:     make(map[string]*resolverListener),
 	}
 	r.ringAndHosts.Store(ringAndHosts{
 		ring:  newHashRing(replicaPoints),
@@ -43,9 +55,9 @@ func newServiceResolver(service string, replicaPoints int) *serviceResolver {
 
 func (r *serviceResolver) Stop() {
 	r.listenerLock.Lock()
-	defer r.listenerLock.Unlock()
 	select {
 	case <-r.shutdownCh:
+		r.listenerLock.Unlock()
 		return // already stopped
 	default:
 	}
@@ -53,8 +65,14 @@ func (r *serviceResolver) Stop() {
 		ring:  newHashRing(r.replicaPoints),
 		hosts: nil,
 	})
-	r.listeners = make(map[string]chan<- *ChangedEvent)
+	listeners := r.listeners
+	r.listeners = make(map[string]*resolverListener)
 	close(r.shutdownCh)
+	r.listenerLock.Unlock()
+
+	for _, listener := range listeners {
+		listener.stop()
+	}
 }
 
 // setMembers 由 Monitor 调用，注入最新成员列表，自动对比差异并发送 ChangedEvent。
@@ -102,17 +120,30 @@ func (r *serviceResolver) LookupN(key string, n int) []HostInfo {
 func (r *serviceResolver) AddListener(name string, ch chan<- *ChangedEvent) error {
 	r.listenerLock.Lock()
 	defer r.listenerLock.Unlock()
+	select {
+	case <-r.shutdownCh:
+		return ErrResolverStopped
+	default:
+	}
 	if _, ok := r.listeners[name]; ok {
 		return ErrListenerAlreadyExist
 	}
-	r.listeners[name] = ch
+	listener := newResolverListener(ch)
+	r.listeners[name] = listener
+	go listener.run()
 	return nil
 }
 
 func (r *serviceResolver) RemoveListener(name string) error {
 	r.listenerLock.Lock()
-	defer r.listenerLock.Unlock()
-	delete(r.listeners, name)
+	listener := r.listeners[name]
+	if listener != nil {
+		delete(r.listeners, name)
+	}
+	r.listenerLock.Unlock()
+	if listener != nil {
+		listener.stop()
+	}
 	return nil
 }
 
@@ -181,12 +212,145 @@ func (r *serviceResolver) compareMembers(hosts []*hostInfo) (map[string]*hostInf
 
 func (r *serviceResolver) emitEvent(event *ChangedEvent) {
 	r.listenerLock.RLock()
-	defer r.listenerLock.RUnlock()
-	for _, ch := range r.listeners {
+	listeners := make([]*resolverListener, 0, len(r.listeners))
+	for _, listener := range r.listeners {
+		listeners = append(listeners, listener)
+	}
+	r.listenerLock.RUnlock()
+
+	for _, listener := range listeners {
+		listener.publish(event)
+	}
+}
+
+func newResolverListener(out chan<- *ChangedEvent) *resolverListener {
+	return &resolverListener{
+		out:    out,
+		notify: make(chan struct{}, 1),
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+	}
+}
+
+func (l *resolverListener) publish(event *ChangedEvent) {
+	l.mu.Lock()
+	l.pending = mergeChangedEvents(l.pending, event)
+	l.mu.Unlock()
+	select {
+	case l.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (l *resolverListener) run() {
+	defer close(l.doneCh)
+	for {
 		select {
-		case ch <- event:
-		default:
+		case <-l.stopCh:
+			return
+		case <-l.notify:
+			l.mu.Lock()
+			event := l.pending
+			l.pending = nil
+			l.mu.Unlock()
+			if event == nil {
+				continue
+			}
+			select {
+			case l.out <- event:
+			case <-l.stopCh:
+				return
+			}
 		}
+	}
+}
+
+func (l *resolverListener) stop() {
+	l.stopOnce.Do(func() { close(l.stopCh) })
+	<-l.doneCh
+}
+
+func mergeChangedEvents(current, next *ChangedEvent) *ChangedEvent {
+	changes := make(map[string]pendingHostChange)
+	mergeEventChanges(changes, current)
+	mergeEventChanges(changes, next)
+
+	addresses := make([]string, 0, len(changes))
+	for address := range changes {
+		addresses = append(addresses, address)
+	}
+	sort.Strings(addresses)
+
+	merged := &ChangedEvent{}
+	for _, address := range addresses {
+		change := changes[address]
+		switch change.kind {
+		case hostAdded:
+			merged.HostsAdded = append(merged.HostsAdded, change.host)
+		case hostRemoved:
+			merged.HostsRemoved = append(merged.HostsRemoved, change.host)
+		case hostChanged:
+			merged.HostsChanged = append(merged.HostsChanged, change.host)
+		}
+	}
+	return merged
+}
+
+type hostChangeKind uint8
+
+const (
+	hostAdded hostChangeKind = iota + 1
+	hostRemoved
+	hostChanged
+)
+
+type pendingHostChange struct {
+	kind hostChangeKind
+	host HostInfo
+}
+
+func mergeEventChanges(changes map[string]pendingHostChange, event *ChangedEvent) {
+	if event == nil {
+		return
+	}
+	for _, host := range event.HostsAdded {
+		mergeHostChange(changes, host, hostAdded)
+	}
+	for _, host := range event.HostsRemoved {
+		mergeHostChange(changes, host, hostRemoved)
+	}
+	for _, host := range event.HostsChanged {
+		mergeHostChange(changes, host, hostChanged)
+	}
+}
+
+func mergeHostChange(changes map[string]pendingHostChange, host HostInfo, next hostChangeKind) {
+	address := host.GetAddress()
+	current, ok := changes[address]
+	if !ok {
+		changes[address] = pendingHostChange{kind: next, host: host}
+		return
+	}
+
+	switch current.kind {
+	case hostAdded:
+		if next == hostRemoved {
+			delete(changes, address)
+			return
+		}
+		changes[address] = pendingHostChange{kind: hostAdded, host: host}
+	case hostRemoved:
+		if next == hostRemoved {
+			changes[address] = pendingHostChange{kind: hostRemoved, host: host}
+			return
+		}
+		changes[address] = pendingHostChange{kind: hostChanged, host: host}
+	case hostChanged:
+		if next == hostRemoved {
+			changes[address] = pendingHostChange{kind: hostRemoved, host: host}
+			return
+		}
+		changes[address] = pendingHostChange{kind: hostChanged, host: host}
 	}
 }
 

@@ -8,13 +8,13 @@ import (
 type outstandingTask struct {
 	row        *TaskRow
 	dispatchAt time.Time
+	deliveryID int64
 }
 
 type deliveryState struct {
 	mu sync.Mutex
 
 	ackLevel     int64
-	readLevel    int64
 	maxReadLevel int64
 
 	outstanding map[int64]*outstandingTask
@@ -25,7 +25,6 @@ type deliveryState struct {
 func newDeliveryState(ackLevel int64) *deliveryState {
 	return &deliveryState{
 		ackLevel:    ackLevel,
-		readLevel:   ackLevel,
 		outstanding: make(map[int64]*outstandingTask),
 		acked:       make(map[int64]bool),
 	}
@@ -44,50 +43,39 @@ func (s *deliveryState) nextReadWindow() (int64, int64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.readLevel >= s.maxReadLevel {
+	if s.ackLevel >= s.maxReadLevel {
 		return 0, 0, false
 	}
-	return s.readLevel, s.maxReadLevel, true
+	return s.ackLevel, s.maxReadLevel, true
 }
 
-func (s *deliveryState) markDispatched(row *TaskRow, dispatchAt time.Time, advanceReadLevel bool) {
+func (s *deliveryState) markDispatched(row *TaskRow, dispatchAt time.Time, deliveryID int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if advanceReadLevel && row.TaskID > s.readLevel {
-		s.readLevel = row.TaskID
-	}
 	s.outstanding[row.TaskID] = &outstandingTask{
 		row:        row,
 		dispatchAt: dispatchAt,
+		deliveryID: deliveryID,
+	}
+	for i, pending := range s.redelivery {
+		if pending.TaskID == row.TaskID {
+			s.redelivery = append(s.redelivery[:i], s.redelivery[i+1:]...)
+			break
+		}
 	}
 }
 
-func (s *deliveryState) takeRedelivery() *TaskRow {
+func (s *deliveryState) ack(taskID, deliveryID int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.redelivery) == 0 {
-		return nil
-	}
-
-	row := s.redelivery[0]
-	s.redelivery = s.redelivery[1:]
-	return row
-}
-
-func (s *deliveryState) requeueRedeliveryFront(row *TaskRow) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.redelivery = append([]*TaskRow{row}, s.redelivery...)
-}
-
-func (s *deliveryState) ack(taskID int64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, ok := s.outstanding[taskID]; !ok {
+	ot, ok := s.outstanding[taskID]
+	if !ok {
 		return ErrTaskNotOutstanding
+	}
+	if ot.deliveryID != deliveryID {
+		return ErrStaleToken
 	}
 
 	delete(s.outstanding, taskID)
@@ -96,13 +84,16 @@ func (s *deliveryState) ack(taskID int64) error {
 	return nil
 }
 
-func (s *deliveryState) beginNack(taskID int64) (*outstandingTask, error) {
+func (s *deliveryState) beginNack(taskID, deliveryID int64) (*outstandingTask, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	ot, ok := s.outstanding[taskID]
 	if !ok {
 		return nil, ErrTaskNotOutstanding
+	}
+	if ot.deliveryID != deliveryID {
+		return nil, ErrStaleToken
 	}
 	delete(s.outstanding, taskID)
 	return ot, nil
@@ -133,16 +124,21 @@ func (s *deliveryState) moveToRedelivery(taskID int64) bool {
 	return true
 }
 
+func (s *deliveryState) ackedTaskIDs() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := make([]int64, 0, len(s.acked))
+	for taskID := range s.acked {
+		ids = append(ids, taskID)
+	}
+	return ids
+}
+
 func (s *deliveryState) ackLevelValue() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ackLevel
-}
-
-func (s *deliveryState) hasReadable() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.redelivery) > 0 || s.readLevel < s.maxReadLevel
 }
 
 func (s *deliveryState) advanceAckLevelLocked() {

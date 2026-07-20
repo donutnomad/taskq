@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	dbleader "github.com/donutnomad/dbleader"
@@ -20,14 +21,24 @@ import (
 )
 
 const (
-	defaultVisTimeout  = 60 * time.Second
-	defaultServiceName = "matching"
+	defaultVisTimeout        = 60 * time.Second
+	defaultServiceName       = "matching"
+	defaultReconcileInterval = 5 * time.Second
 )
+
+var matchingListenerSeq atomic.Int64
+
+// Store provides durable queue operations and fenced partition leadership.
+// The caller owns the Store connection lifecycle.
+type Store interface {
+	queue.Store
+	dbleader.LockStore
+}
 
 // Config 是 matching 服务的配置
 type Config struct {
-	// Store 任务存储接口（所有节点共享同一个 DB）
-	Store queue.Store
+	// Store 任务与分区所有权存储（所有节点共享同一个 DB）
+	Store Store
 	// Monitor membership 监控器
 	Monitor membership.Monitor
 	// ServiceName 服务名称，用于 GetResolver，默认 "matching"
@@ -44,6 +55,8 @@ type Config struct {
 	LeaseOwner string
 	// GRPCOptions 额外的 gRPC server 选项
 	GRPCOptions []grpc.ServerOption
+	// ReconcileInterval 周期校验分区归属，默认 5s
+	ReconcileInterval time.Duration
 }
 
 // Server 是 matching 服务实例
@@ -53,9 +66,11 @@ type Server struct {
 	mgr        *partitionManager
 	resolver   membership.ServiceResolver
 	changeCh   chan *membership.ChangedEvent
+	listener   string
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
+	stopOnce   sync.Once
 }
 
 // NewServer 创建 matching 服务实例
@@ -78,10 +93,8 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.LeaseOwner == "" {
 		cfg.LeaseOwner = uuid.New().String()
 	}
-
-	lockStore, ok := cfg.Store.(dbleader.LockStore)
-	if !ok {
-		return nil, fmt.Errorf("matching: Store must implement dbleader.LockStore")
+	if cfg.ReconcileInterval <= 0 {
+		cfg.ReconcileInterval = defaultReconcileInterval
 	}
 
 	resolver, err := cfg.Monitor.GetResolver(cfg.ServiceName)
@@ -91,7 +104,7 @@ func NewServer(cfg Config) (*Server, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	mgr := newPartitionManager(ctx, cfg.Store, lockStore, cfg.BroadcastAddr, cfg.LeaseOwner, resolver, cfg.VisTimeout, cfg.QueueConfigs)
+	mgr := newPartitionManager(ctx, cfg.Store, cfg.Store, cfg.BroadcastAddr, cfg.LeaseOwner, resolver, cfg.VisTimeout, cfg.QueueConfigs)
 
 	grpcServer := grpc.NewServer(cfg.GRPCOptions...)
 	handler := &matchingHandler{mgr: mgr}
@@ -102,49 +115,64 @@ func NewServer(cfg Config) (*Server, error) {
 		grpcServer: grpcServer,
 		mgr:        mgr,
 		resolver:   resolver,
+		listener:   fmt.Sprintf("matching-server-%d", matchingListenerSeq.Add(1)),
 		ctx:        ctx,
 		cancel:     cancel,
 	}, nil
 }
 
-// Start 启动 matching 服务：初始 reconcile → 监听成员变化 → 启动 gRPC 监听
-func (s *Server) Start() error {
-	// 初始对账：加载本节点应拥有的分区
-	s.mgr.reconcile()
+// Start acquires external resources before starting background work. Any
+// failed phase releases resources acquired by earlier phases.
+func (s *Server) Start() (err error) {
+	started := false
+	defer func() {
+		if !started {
+			s.stop()
+		}
+	}()
 
-	// 监听成员变化
-	s.changeCh = make(chan *membership.ChangedEvent, 10)
-	if err := s.resolver.AddListener("matching-server", s.changeCh); err != nil {
-		return fmt.Errorf("matching: add listener: %w", err)
-	}
-
-	s.wg.Go(s.watchMembershipChanges)
-
-	// 启动 gRPC 监听
 	lis, err := net.Listen("tcp", s.cfg.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("matching: listen %s: %w", s.cfg.ListenAddr, err)
 	}
 
+	s.changeCh = make(chan *membership.ChangedEvent, 10)
+	if err := s.resolver.AddListener(s.listener, s.changeCh); err != nil {
+		_ = lis.Close()
+		return fmt.Errorf("matching: add listener: %w", err)
+	}
+
+	// Reconcile starts partition leaders only after socket and listener setup.
+	s.mgr.reconcile()
+	s.wg.Go(s.watchMembershipChanges)
 	s.wg.Go(func() {
 		if err := s.grpcServer.Serve(lis); err != nil {
 			slog.Error("matching gRPC server stopped", "listen_addr", s.cfg.ListenAddr, "err", err)
 		}
 	})
 
+	started = true
 	return nil
 }
 
 // Stop 优雅停止 matching 服务
 func (s *Server) Stop() {
-	s.cancel()
-	_ = s.resolver.RemoveListener("matching-server")
-	s.mgr.close()
-	s.grpcServer.GracefulStop()
-	s.wg.Wait()
+	s.stop()
+}
+
+func (s *Server) stop() {
+	s.stopOnce.Do(func() {
+		s.cancel()
+		_ = s.resolver.RemoveListener(s.listener)
+		s.mgr.close()
+		s.grpcServer.GracefulStop()
+		s.wg.Wait()
+	})
 }
 
 func (s *Server) watchMembershipChanges() {
+	ticker := time.NewTicker(s.cfg.ReconcileInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -153,6 +181,8 @@ func (s *Server) watchMembershipChanges() {
 			if !ok {
 				return
 			}
+			s.mgr.reconcile()
+		case <-ticker.C:
 			s.mgr.reconcile()
 		}
 	}

@@ -10,13 +10,10 @@ func TestDeliveryStateMarkDispatchedTracksOutstanding(t *testing.T) {
 	row := &TaskRow{TaskID: 1}
 
 	state.setMaxReadLevel(1)
-	state.markDispatched(row, time.Now(), true)
+	state.markDispatched(row, time.Now(), 1)
 
 	if _, ok := state.outstanding[1]; !ok {
 		t.Fatal("expected task in outstanding")
-	}
-	if state.hasReadable() {
-		t.Fatal("expected no readable task after dispatching the only known task")
 	}
 }
 
@@ -24,25 +21,25 @@ func TestDeliveryStateAckAdvancesLevel(t *testing.T) {
 	state := newDeliveryState(0)
 	now := time.Now()
 
-	state.markDispatched(&TaskRow{TaskID: 1}, now, true)
-	state.markDispatched(&TaskRow{TaskID: 2}, now, true)
-	state.markDispatched(&TaskRow{TaskID: 3}, now, true)
+	state.markDispatched(&TaskRow{TaskID: 1}, now, 1)
+	state.markDispatched(&TaskRow{TaskID: 2}, now, 2)
+	state.markDispatched(&TaskRow{TaskID: 3}, now, 3)
 
-	if err := state.ack(2); err != nil {
+	if err := state.ack(2, 2); err != nil {
 		t.Fatalf("ack task 2: %v", err)
 	}
 	if state.ackLevelValue() != 0 {
 		t.Fatalf("ackLevel should stay at 0, got %d", state.ackLevelValue())
 	}
 
-	if err := state.ack(1); err != nil {
+	if err := state.ack(1, 1); err != nil {
 		t.Fatalf("ack task 1: %v", err)
 	}
 	if state.ackLevelValue() != 2 {
 		t.Fatalf("ackLevel should advance to 2, got %d", state.ackLevelValue())
 	}
 
-	if err := state.ack(3); err != nil {
+	if err := state.ack(3, 3); err != nil {
 		t.Fatalf("ack task 3: %v", err)
 	}
 	if state.ackLevelValue() != 3 {
@@ -54,10 +51,10 @@ func TestDeliveryStateNackMovesTaskToRedelivery(t *testing.T) {
 	state := newDeliveryState(0)
 	now := time.Now()
 
-	state.markDispatched(&TaskRow{TaskID: 1, Data: []byte("a")}, now, true)
-	state.markDispatched(&TaskRow{TaskID: 2, Data: []byte("b")}, now, true)
+	state.markDispatched(&TaskRow{TaskID: 1, Data: []byte("a")}, now, 1)
+	state.markDispatched(&TaskRow{TaskID: 2, Data: []byte("b")}, now, 2)
 
-	ot, err := state.beginNack(1)
+	ot, err := state.beginNack(1, 1)
 	if err != nil {
 		t.Fatalf("beginNack task 1: %v", err)
 	}
@@ -75,33 +72,29 @@ func TestDeliveryStateRedeliveryBlocksAckLevel(t *testing.T) {
 	state := newDeliveryState(0)
 	now := time.Now()
 
-	state.markDispatched(&TaskRow{TaskID: 1}, now, true)
-	state.markDispatched(&TaskRow{TaskID: 2}, now, true)
-	state.markDispatched(&TaskRow{TaskID: 3}, now, true)
+	state.markDispatched(&TaskRow{TaskID: 1}, now, 1)
+	state.markDispatched(&TaskRow{TaskID: 2}, now, 2)
+	state.markDispatched(&TaskRow{TaskID: 3}, now, 3)
 
-	ot, err := state.beginNack(1)
+	ot, err := state.beginNack(1, 1)
 	if err != nil {
 		t.Fatalf("beginNack task 1: %v", err)
 	}
 	state.finishNack(ot)
 
-	if err := state.ack(2); err != nil {
+	if err := state.ack(2, 2); err != nil {
 		t.Fatalf("ack task 2: %v", err)
 	}
-	if err := state.ack(3); err != nil {
+	if err := state.ack(3, 3); err != nil {
 		t.Fatalf("ack task 3: %v", err)
 	}
 	if state.ackLevelValue() != 0 {
 		t.Fatalf("ackLevel should stay blocked at 0, got %d", state.ackLevelValue())
 	}
 
-	row := state.takeRedelivery()
-	if row == nil || row.TaskID != 1 {
-		t.Fatalf("expected redelivery task 1, got %+v", row)
-	}
-	state.markDispatched(row, now, false)
+	state.markDispatched(&TaskRow{TaskID: 1}, now, 4)
 
-	if err := state.ack(1); err != nil {
+	if err := state.ack(1, 4); err != nil {
 		t.Fatalf("ack task 1: %v", err)
 	}
 	if state.ackLevelValue() != 3 {
@@ -113,14 +106,29 @@ func TestDeliveryStateRejectsDuplicateAckAndNack(t *testing.T) {
 	state := newDeliveryState(0)
 	now := time.Now()
 
-	state.markDispatched(&TaskRow{TaskID: 1}, now, true)
-	if err := state.ack(1); err != nil {
+	state.markDispatched(&TaskRow{TaskID: 1}, now, 1)
+	if err := state.ack(1, 1); err != nil {
 		t.Fatalf("first ack failed: %v", err)
 	}
-	if err := state.ack(1); err != ErrTaskNotOutstanding {
+	if err := state.ack(1, 1); err != ErrTaskNotOutstanding {
 		t.Fatalf("expected ErrTaskNotOutstanding from duplicate ack, got %v", err)
 	}
-	if _, err := state.beginNack(1); err != ErrTaskNotOutstanding {
+	if _, err := state.beginNack(1, 1); err != ErrTaskNotOutstanding {
 		t.Fatalf("expected ErrTaskNotOutstanding from duplicate nack, got %v", err)
+	}
+}
+
+func TestDeliveryStateRejectsPreviousDelivery(t *testing.T) {
+	state := newDeliveryState(0)
+	state.markDispatched(&TaskRow{TaskID: 1}, time.Now(), 2)
+
+	if err := state.ack(1, 1); err != ErrStaleToken {
+		t.Fatalf("stale ack error = %v, want ErrStaleToken", err)
+	}
+	if _, err := state.beginNack(1, 1); err != ErrStaleToken {
+		t.Fatalf("stale nack error = %v, want ErrStaleToken", err)
+	}
+	if err := state.ack(1, 2); err != nil {
+		t.Fatalf("current delivery ack: %v", err)
 	}
 }

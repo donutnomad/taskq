@@ -3,17 +3,20 @@ package matching
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"time"
 
 	"github.com/donutnomad/taskq/queue"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // matchingHandler 实现 MatchingServiceServer gRPC 接口
 type matchingHandler struct {
 	UnimplementedMatchingServiceServer
-	mgr *partitionManager
+	mgr        *partitionManager
+	pollCursor atomic.Uint64
 }
 
 func (h *matchingHandler) AddTask(ctx context.Context, req *AddTaskRequest) (*AddTaskResponse, error) {
@@ -21,7 +24,13 @@ func (h *matchingHandler) AddTask(ctx context.Context, req *AddTaskRequest) (*Ad
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
-	if err := pq.AddTask(ctx, req.Data); err != nil {
+	deadline, err := routingDeadline(req.RoutingDeadline)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	if err := pq.AddTaskWithOptions(ctx, req.Data, queue.EnqueueOptions{
+		RoutingKey: req.RoutingKey, RoutingDeadline: deadline,
+	}); err != nil {
 		return nil, toGRPCError(err)
 	}
 	return &AddTaskResponse{}, nil
@@ -33,11 +42,13 @@ func (h *matchingHandler) PollTask(ctx context.Context, req *PollTaskRequest) (*
 		return nil, toGRPCError(err)
 	}
 
+	opts := queue.PollOptions{AcceptedRoutingKeys: req.AcceptedRoutingKeys}
+
 	// 1. 非阻塞尝试
-	if row, token, ok, err := pq.TryPoll(ctx); err != nil {
+	if lease, ok, err := pq.TryPollWithOptions(ctx, opts); err != nil {
 		return nil, toGRPCError(err)
 	} else if ok {
-		return &PollTaskResponse{Data: row.Data, Token: token}, nil
+		return finishPollTask(ctx, pq, lease)
 	}
 
 	// 2. 无超时，立即返回空
@@ -46,29 +57,76 @@ func (h *matchingHandler) PollTask(ctx context.Context, req *PollTaskRequest) (*
 	}
 
 	// 3. 长轮询：注册 waiter，等待任务或超时
-	ch := make(chan queue.PollResult, 1)
-	activePQ, elem, err := pq.RegisterWaiter(ch)
+	waiter, err := pq.RegisterWaiterWithOptions(opts)
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
-	defer activePQ.RemoveWaiter(elem)
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(req.PollTimeoutMs)*time.Millisecond)
 	defer cancel()
 
 	select {
-	case result := <-ch:
+	case <-waiter.Ready():
+		result, claimed := waiter.Claim()
+		if !claimed {
+			return nil, status.Error(codes.Aborted, "poll delivery claim lost")
+		}
 		if result.Err != nil {
 			return nil, toGRPCError(result.Err)
 		}
-		return &PollTaskResponse{Data: result.Row.Data, Token: result.Token}, nil
+		return finishPollTask(ctx, pq, result.Lease())
 	case <-timeoutCtx.Done():
+		if !waiter.Cancel() {
+			result, claimed := waiter.Claim()
+			if !claimed {
+				return nil, status.Error(codes.Aborted, "poll delivery claim lost")
+			}
+			if result.Err != nil {
+				return nil, toGRPCError(result.Err)
+			}
+			return finishPollTask(ctx, pq, result.Lease())
+		}
 		// 区分是调用方取消还是轮询超时
 		if ctx.Err() != nil {
 			return nil, status.Error(codes.Canceled, ctx.Err().Error())
 		}
 		return &PollTaskResponse{Empty: true}, nil
 	}
+}
+
+func finishPollTask(ctx context.Context, target *partitionHandle, lease queue.Lease) (*PollTaskResponse, error) {
+	if err := ctx.Err(); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), pollCleanupTimeout)
+		defer cancel()
+		if cleanupErr := target.Nack(cleanupCtx, lease.Token); cleanupErr != nil {
+			return nil, status.Errorf(codes.Canceled, "%v; return canceled poll lease: %v", err, cleanupErr)
+		}
+		return nil, status.Error(codes.Canceled, err.Error())
+	}
+	return pollTaskResponse(lease), nil
+}
+
+func pollTaskResponse(lease queue.Lease) *PollTaskResponse {
+	response := &PollTaskResponse{
+		Data:            lease.Data,
+		Token:           lease.Token,
+		RoutingKey:      lease.RoutingKey,
+		RoutingFallback: lease.RoutingFallback,
+	}
+	if !lease.RoutingDeadline.IsZero() {
+		response.RoutingDeadline = timestamppb.New(lease.RoutingDeadline)
+	}
+	return response
+}
+
+func routingDeadline(value *timestamppb.Timestamp) (time.Time, error) {
+	if value == nil {
+		return time.Time{}, nil
+	}
+	if err := value.CheckValid(); err != nil {
+		return time.Time{}, err
+	}
+	return value.AsTime(), nil
 }
 
 func (h *matchingHandler) AckTask(ctx context.Context, req *AckTaskRequest) (*AckTaskResponse, error) {
@@ -141,6 +199,12 @@ func toGRPCError(err error) error {
 		return status.Error(codes.Aborted, err.Error())
 	}
 	if errors.Is(err, queue.ErrStaleToken) {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	if errors.Is(err, queue.ErrInvalidRoutingKey) {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	if errors.Is(err, queue.ErrInvalidRoutingDeadline) {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	if errors.Is(err, queue.ErrQueueClosed) {

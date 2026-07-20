@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -66,6 +68,14 @@ func (m *stubMonitor) GetResolver(string) (membership.ServiceResolver, error) {
 }
 func (m *stubMonitor) WaitUntilInitialized(context.Context) error { return nil }
 func (m *stubMonitor) SetDraining(bool) error                     { return nil }
+
+type stubResolverProvider struct {
+	resolver membership.ServiceResolver
+}
+
+func (p *stubResolverProvider) GetResolver(string) (membership.ServiceResolver, error) {
+	return p.resolver, nil
+}
 
 type refreshAwareResolver struct {
 	mu        sync.Mutex
@@ -133,9 +143,9 @@ func (m *refreshAwareMonitor) GetResolver(string) (membership.ServiceResolver, e
 func (m *refreshAwareMonitor) WaitUntilInitialized(context.Context) error { return nil }
 func (m *refreshAwareMonitor) SetDraining(bool) error                     { return nil }
 
-func newTestSQLiteStore(t *testing.T) queue.Store {
+func newTestSQLiteStore(t *testing.T) matching.Store {
 	t.Helper()
-	store, err := gormstore.NewSQLite(":memory:", gormstore.Config{AutoMigrate: true})
+	store, err := gormstore.NewSQLite(filepath.Join(t.TempDir(), "taskq.db"), gormstore.Config{AutoMigrate: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,13 +154,13 @@ func newTestSQLiteStore(t *testing.T) queue.Store {
 }
 
 // startMatchingServer 启动测试用 matching 服务，返回监听地址
-func startMatchingServer(t *testing.T, store queue.Store, resolver *stubResolver, queueConfigs map[string]int) string {
+func startMatchingServer(t *testing.T, store matching.Store, resolver *stubResolver, queueConfigs map[string]int) string {
 	t.Helper()
 	_, addr := startMatchingServerWithHandle(t, store, resolver, queueConfigs)
 	return addr
 }
 
-func startMatchingServerWithHandle(t *testing.T, store queue.Store, resolver *stubResolver, queueConfigs map[string]int) (*matching.Server, string) {
+func startMatchingServerWithHandle(t *testing.T, store matching.Store, resolver *stubResolver, queueConfigs map[string]int) (*matching.Server, string) {
 	t.Helper()
 
 	monitor := &stubMonitor{resolver: resolver}
@@ -192,12 +202,11 @@ func TestFrontend_EndToEnd(t *testing.T) {
 	resolver := newStubResolver()
 	addr := startMatchingServer(t, store, resolver, map[string]int{"test-q": 4})
 
-	monitor := &stubMonitor{resolver: resolver}
 	_ = addr
 
 	fe, err := New(Config{
-		Monitor:   monitor,
-		QueueName: "test-q",
+		ResolverProvider: &stubResolverProvider{resolver: resolver},
+		QueueName:        "test-q",
 
 		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
 		PollTimeout: 2 * time.Second,
@@ -229,6 +238,88 @@ func TestFrontend_EndToEnd(t *testing.T) {
 	// Ack
 	if err := fe.Ack(ctx, token); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFrontend_RoutedLeaseEndToEnd(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver()
+	startMatchingServer(t, store, resolver, map[string]int{"test-q": 1})
+
+	fe, err := New(Config{
+		Monitor: &stubMonitor{resolver: resolver}, QueueName: "test-q",
+		DialOpts: []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe.Close()
+
+	ctx := context.Background()
+	if err := fe.EnqueueWithOptions(ctx, []byte("worker-a-task"), EnqueueOptions{RoutingKey: "worker-a"}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := fe.DequeueWithOptions(ctx, PollOptions{AcceptedRoutingKeys: []string{"worker-a"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(lease.Data) != "worker-a-task" || lease.RoutingKey != "worker-a" || lease.Token == "" {
+		t.Fatalf("unexpected lease: %+v", lease)
+	}
+}
+
+func TestFrontend_RoutingDeadlineFallbackEndToEnd(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver()
+	startMatchingServer(t, store, resolver, map[string]int{"test-q": 1})
+	fe, err := New(Config{
+		Monitor: &stubMonitor{resolver: resolver}, QueueName: "test-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe.Close()
+	deadline := time.Now().Add(-time.Second)
+	if err := fe.EnqueueWithOptions(context.Background(), []byte("fallback"), EnqueueOptions{
+		RoutingKey: "sticky-worker", RoutingDeadline: deadline,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := fe.DequeueWithOptions(context.Background(), PollOptions{AcceptedRoutingKeys: []string{"other-worker"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(lease.Data) != "fallback" || !lease.RoutingFallback || lease.RoutingDeadline.IsZero() {
+		t.Fatalf("fallback lease = %+v", lease)
+	}
+}
+
+func TestFrontend_InvalidRoutingKeyPreservesSentinel(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver()
+	startMatchingServer(t, store, resolver, map[string]int{"test-q": 1})
+	fe, err := New(Config{
+		Monitor: &stubMonitor{resolver: resolver}, QueueName: "test-q",
+		DialOpts: []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe.Close()
+
+	tooLong := strings.Repeat("界", queue.MaxRoutingKeyBytes/len("界")+1)
+	if err := fe.EnqueueWithOptions(context.Background(), []byte("task"), EnqueueOptions{RoutingKey: tooLong}); !errors.Is(err, queue.ErrInvalidRoutingKey) {
+		t.Fatalf("enqueue error = %v", err)
+	}
+	if _, err := fe.DequeueWithOptions(context.Background(), PollOptions{AcceptedRoutingKeys: []string{tooLong}}); !errors.Is(err, queue.ErrInvalidRoutingKey) {
+		t.Fatalf("dequeue error = %v", err)
+	}
+	if err := fe.EnqueueWithOptions(context.Background(), []byte("task"), EnqueueOptions{
+		RoutingDeadline: time.Now().Add(time.Second),
+	}); !errors.Is(err, queue.ErrInvalidRoutingDeadline) {
+		t.Fatalf("deadline error = %v", err)
 	}
 }
 

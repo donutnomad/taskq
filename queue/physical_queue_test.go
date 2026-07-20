@@ -26,6 +26,19 @@ type failOnceCreateTasksStore struct {
 	err error
 }
 
+type createTasksBarrierStore struct {
+	Store
+	entered chan struct{}
+	release chan struct{}
+	err     error
+}
+
+func (s *createTasksBarrierStore) CreateTasksAndAdvanceRange(context.Context, string, int, []*TaskRow, int64, int64) (int64, error) {
+	close(s.entered)
+	<-s.release
+	return 0, s.err
+}
+
 func (s *conditionFailedUpdateStore) AllocateTaskIDRange(ctx context.Context, queueName string, partitionID int, newNextTaskID int64, prevRangeID int64) (int64, error) {
 	if s.failUpdate {
 		return 0, ErrConditionFailed
@@ -40,6 +53,13 @@ func (s *conditionFailedUpdateStore) AdvanceAckLevelAndDeleteTasks(ctx context.C
 	return s.Store.AdvanceAckLevelAndDeleteTasks(ctx, queueName, partitionID, newAckLevel, prevRangeID)
 }
 
+func (s *conditionFailedUpdateStore) CreateTasksAndAdvanceRange(ctx context.Context, queueName string, partitionID int, tasks []*TaskRow, newNextTaskID int64, prevRangeID int64) (int64, error) {
+	if s.failUpdate {
+		return 0, ErrConditionFailed
+	}
+	return s.Store.CreateTasksAndAdvanceRange(ctx, queueName, partitionID, tasks, newNextTaskID, prevRangeID)
+}
+
 func (s *failOnceCreateTasksStore) CreateTasks(ctx context.Context, tasks []*TaskRow) error {
 	s.mu.Lock()
 	err := s.err
@@ -49,6 +69,17 @@ func (s *failOnceCreateTasksStore) CreateTasks(ctx context.Context, tasks []*Tas
 		return err
 	}
 	return s.Store.CreateTasks(ctx, tasks)
+}
+
+func (s *failOnceCreateTasksStore) CreateTasksAndAdvanceRange(ctx context.Context, queueName string, partitionID int, tasks []*TaskRow, newNextTaskID int64, prevRangeID int64) (int64, error) {
+	s.mu.Lock()
+	err := s.err
+	s.err = nil
+	s.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	return s.Store.CreateTasksAndAdvanceRange(ctx, queueName, partitionID, tasks, newNextTaskID, prevRangeID)
 }
 
 func newFlakyDispatchStore(base Store) *flakyDispatchStore {
@@ -193,6 +224,173 @@ func TestCreateTasksRollbackOnFailure(t *testing.T) {
 	}
 	if string(row.Data) != "retry-task" {
 		t.Fatalf("expected retry-task, got %q", row.Data)
+	}
+}
+
+func TestPhysicalQueue_RestartKeepsTaskIDsContiguousForGC(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	first, err := newPhysicalQueue(ctx, store, "restart-q", 0, time.Minute, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, first)
+	if err := first.AddTask(ctx, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	first.Close()
+
+	second, err := newPhysicalQueue(ctx, store, "restart-q", 0, time.Minute, "owner-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, second)
+	t.Cleanup(second.Close)
+	if err := second.AddTask(ctx, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+
+	for wantID := int64(1); wantID <= 2; wantID++ {
+		row, token, ok, err := second.TryPoll(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok || row == nil {
+			t.Fatalf("task %d was unavailable", wantID)
+		}
+		if row.TaskID != wantID {
+			t.Fatalf("task ID = %d, want %d", row.TaskID, wantID)
+		}
+		if err := second.Ack(ctx, token); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := second.RunGCOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	info, err := store.GetQueue(ctx, "restart-q", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.AckLevel != 2 {
+		t.Fatalf("ack level = %d, want 2", info.AckLevel)
+	}
+}
+
+func TestPhysicalQueue_CloseStopsWriterWithIndependentContext(t *testing.T) {
+	store := newTestStore(t)
+	pq, err := newPhysicalQueue(context.Background(), store, "close-q", 0, time.Minute, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- pq.RunWriter(context.Background())
+	}()
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := pq.WaitUntilWriterStarted(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+
+	pq.Close()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("writer remained running after queue close")
+	}
+}
+
+func TestPhysicalQueue_ClosePreservesAcceptedFlushResult(t *testing.T) {
+	store := newTestStore(t)
+	pq, err := newPhysicalQueue(context.Background(), store, "flush-close-q", 0, time.Minute, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq)
+
+	enteredFlush := make(chan struct{})
+	releaseFlush := make(chan struct{})
+	originalOnFlush := pq.writer.onFlush
+	pq.writer.onFlush = func(rows []*TaskRow) {
+		close(enteredFlush)
+		<-releaseFlush
+		originalOnFlush(rows)
+	}
+
+	addDone := make(chan error, 1)
+	go func() {
+		addDone <- pq.AddTask(context.Background(), []byte("task"))
+	}()
+	select {
+	case <-enteredFlush:
+	case <-time.After(time.Second):
+		t.Fatal("flush did not start")
+	}
+
+	pq.Close()
+	select {
+	case err := <-addDone:
+		t.Fatalf("accepted write returned before flush completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFlush)
+
+	select {
+	case err := <-addDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("accepted write did not receive its flush result")
+	}
+}
+
+func TestPhysicalQueue_ClosePreservesAcceptedFlushError(t *testing.T) {
+	writeErr := errors.New("write failed")
+	store := &createTasksBarrierStore{
+		Store:   newTestStore(t),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		err:     writeErr,
+	}
+	pq, err := newPhysicalQueue(context.Background(), store, "flush-error-close-q", 0, time.Minute, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, pq)
+
+	addDone := make(chan error, 1)
+	go func() {
+		addDone <- pq.AddTask(context.Background(), []byte("task"))
+	}()
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("flush did not start")
+	}
+
+	pq.Close()
+	select {
+	case err := <-addDone:
+		t.Fatalf("accepted write returned before flush completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(store.release)
+
+	select {
+	case err := <-addDone:
+		if !errors.Is(err, writeErr) {
+			t.Fatalf("accepted write error = %v, want %v", err, writeErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("accepted write did not receive its flush error")
 	}
 }
 
@@ -486,8 +684,10 @@ func TestPhysicalQueue_SyncMatch(t *testing.T) {
 	ctx := context.Background()
 
 	// 先注册 waiter
-	ch := make(chan PollResult, 1)
-	pq.registerWaiter(ch)
+	waiter, err := pq.registerWaiter(PollOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// 写入任务，应通过 sync match 投递给 waiter
 	if err := pq.addTask(ctx, []byte(`{"type":"activity"}`)); err != nil {
@@ -495,7 +695,11 @@ func TestPhysicalQueue_SyncMatch(t *testing.T) {
 	}
 
 	select {
-	case result := <-ch:
+	case <-waiter.Ready():
+		result, ok := waiter.Claim()
+		if !ok {
+			t.Fatal("expected task delivery claim")
+		}
 		if result.Row == nil {
 			t.Fatal("expected task in sync match result")
 		}
@@ -546,11 +750,14 @@ func TestPhysicalQueue_BlockingPoll(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	ch := make(chan PollResult, 1)
-	pq.registerWaiter(ch)
+	waiter, err := pq.registerWaiter(PollOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer waiter.Cancel()
 
 	select {
-	case <-ch:
+	case <-waiter.Ready():
 		t.Fatal("should not get task")
 	case <-ctx.Done():
 		// 正常超时
@@ -569,12 +776,18 @@ func TestPhysicalQueue_RegisterWaiterImmediatelyGetsReadableTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ch := make(chan PollResult, 1)
-	elem := pq.registerWaiter(ch)
-	defer pq.removeWaiter(elem)
+	waiter, err := pq.registerWaiter(PollOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer waiter.Cancel()
 
 	select {
-	case result := <-ch:
+	case <-waiter.Ready():
+		result, ok := waiter.Claim()
+		if !ok {
+			t.Fatal("expected readable task delivery claim")
+		}
 		if result.Err != nil {
 			t.Fatalf("expected readable task, got error: %v", result.Err)
 		}
@@ -691,6 +904,9 @@ func TestPhysicalQueue_TokenIncludesQueueAndOwnershipEpoch(t *testing.T) {
 	}
 	if parsed.OwnershipEpoch == 0 {
 		t.Fatal("expected ownership epoch")
+	}
+	if parsed.DeliveryID == 0 {
+		t.Fatal("expected delivery ID")
 	}
 }
 

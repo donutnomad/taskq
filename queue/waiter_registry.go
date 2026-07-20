@@ -3,7 +3,46 @@ package queue
 import (
 	"container/list"
 	"sync"
+	"time"
 )
+
+type pollWaiterState uint8
+
+const (
+	pollWaiterWaiting pollWaiterState = iota
+	pollWaiterDelivered
+	pollWaiterClaimed
+	pollWaiterCanceled
+)
+
+// PollWaiter arbitrates delivery and cancellation under the registry lock.
+// A timeout that loses to delivery can still claim the dispatched task.
+type PollWaiter struct {
+	registry *waiterRegistry
+	ready    chan struct{}
+	elem     *list.Element
+	state    pollWaiterState
+	result   PollResult
+	accepted routingKeySet
+}
+
+func (w *PollWaiter) Ready() <-chan struct{} {
+	return w.ready
+}
+
+func (w *PollWaiter) Cancel() bool {
+	if w == nil || w.registry == nil {
+		return false
+	}
+	return w.registry.cancel(w)
+}
+
+func (w *PollWaiter) Claim() (PollResult, bool) {
+	if w == nil || w.registry == nil {
+		return PollResult{}, false
+	}
+	return w.registry.claim(w)
+}
 
 type waiterRegistry struct {
 	mu      sync.Mutex
@@ -15,46 +54,88 @@ func newWaiterRegistry() *waiterRegistry {
 	return &waiterRegistry{waiters: list.New()}
 }
 
-func (wr *waiterRegistry) add(ch chan PollResult) *list.Element {
+func (wr *waiterRegistry) add(opts PollOptions) *PollWaiter {
 	wr.mu.Lock()
 	defer wr.mu.Unlock()
 
+	waiter := &PollWaiter{
+		registry: wr,
+		ready:    make(chan struct{}),
+		state:    pollWaiterWaiting,
+		accepted: newRoutingKeySet(opts.AcceptedRoutingKeys),
+	}
 	if wr.closed {
-		sendPollResult(ch, PollResult{Err: ErrQueueClosed})
-		return nil
+		wr.deliverLocked(waiter, PollResult{Err: ErrQueueClosed})
+		return waiter
 	}
-
-	return wr.waiters.PushBack(ch)
+	waiter.elem = wr.waiters.PushBack(waiter)
+	return waiter
 }
 
-func (wr *waiterRegistry) remove(elem *list.Element) {
-	if elem == nil {
-		return
-	}
-
-	wr.mu.Lock()
-	defer wr.mu.Unlock()
-	wr.waiters.Remove(elem)
-}
-
-func (wr *waiterRegistry) hasWaiters() bool {
-	wr.mu.Lock()
-	defer wr.mu.Unlock()
-	return !wr.closed && wr.waiters.Len() > 0
-}
-
-func (wr *waiterRegistry) pop() (chan PollResult, bool) {
+func (wr *waiterRegistry) deliver(result PollResult) bool {
 	wr.mu.Lock()
 	defer wr.mu.Unlock()
 
 	if wr.closed || wr.waiters.Len() == 0 {
-		return nil, false
+		return false
 	}
+	for elem := wr.waiters.Front(); elem != nil; elem = elem.Next() {
+		waiter := elem.Value.(*PollWaiter)
+		if result.Row != nil && !waiter.accepted.accepts(result.Row, time.Now()) {
+			continue
+		}
+		wr.waiters.Remove(elem)
+		waiter.elem = nil
+		wr.deliverLocked(waiter, result)
+		return true
+	}
+	return false
+}
 
-	elem := wr.waiters.Front()
-	ch := elem.Value.(chan PollResult)
-	wr.waiters.Remove(elem)
-	return ch, true
+func (wr *waiterRegistry) pollOptions() (PollOptions, bool) {
+	wr.mu.Lock()
+	defer wr.mu.Unlock()
+
+	if wr.closed || wr.waiters.Len() == 0 {
+		return PollOptions{}, false
+	}
+	keys := make(routingKeySet)
+	for elem := wr.waiters.Front(); elem != nil; elem = elem.Next() {
+		for key := range elem.Value.(*PollWaiter).accepted {
+			keys[key] = struct{}{}
+		}
+	}
+	accepted := make([]string, 0, len(keys))
+	for key := range keys {
+		accepted = append(accepted, key)
+	}
+	return PollOptions{AcceptedRoutingKeys: accepted}, true
+}
+
+func (wr *waiterRegistry) cancel(waiter *PollWaiter) bool {
+	wr.mu.Lock()
+	defer wr.mu.Unlock()
+
+	if waiter.state != pollWaiterWaiting {
+		return false
+	}
+	if waiter.elem != nil {
+		wr.waiters.Remove(waiter.elem)
+		waiter.elem = nil
+	}
+	waiter.state = pollWaiterCanceled
+	return true
+}
+
+func (wr *waiterRegistry) claim(waiter *PollWaiter) (PollResult, bool) {
+	wr.mu.Lock()
+	defer wr.mu.Unlock()
+
+	if waiter.state != pollWaiterDelivered {
+		return PollResult{}, false
+	}
+	waiter.state = pollWaiterClaimed
+	return waiter.result, true
 }
 
 func (wr *waiterRegistry) close() {
@@ -65,19 +146,18 @@ func (wr *waiterRegistry) close() {
 		return
 	}
 	wr.closed = true
-
-	for elem := wr.waiters.Front(); elem != nil; elem = elem.Next() {
-		ch := elem.Value.(chan PollResult)
-		sendPollResult(ch, PollResult{Err: ErrQueueClosed})
+	for elem := wr.waiters.Front(); elem != nil; {
+		next := elem.Next()
+		waiter := elem.Value.(*PollWaiter)
+		wr.waiters.Remove(elem)
+		waiter.elem = nil
+		wr.deliverLocked(waiter, PollResult{Err: ErrQueueClosed})
+		elem = next
 	}
-	wr.waiters.Init()
 }
 
-func sendPollResult(ch chan PollResult, result PollResult) bool {
-	select {
-	case ch <- result:
-		return true
-	default:
-		return false
-	}
+func (wr *waiterRegistry) deliverLocked(waiter *PollWaiter, result PollResult) {
+	waiter.result = result
+	waiter.state = pollWaiterDelivered
+	close(waiter.ready)
 }

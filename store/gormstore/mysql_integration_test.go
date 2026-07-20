@@ -5,10 +5,12 @@ package gormstore
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
 	dbleader "github.com/donutnomad/dbleader"
+	"github.com/donutnomad/taskq/membership"
 	"github.com/donutnomad/taskq/queue"
 	tcMysql "github.com/testcontainers/testcontainers-go/modules/mysql"
 )
@@ -71,7 +73,10 @@ func TestMySQLStoreQueueCASAndDelivery(t *testing.T) {
 	if err := s.DispatchTask(ctx, "mysql-q", 0, 1, past); err != nil {
 		t.Fatal(err)
 	}
-	ids, err := s.ResetTimedOutTasks(ctx, "mysql-q", 0, 0, time.Minute)
+	ids, err := s.ResetTimedOutTasks(ctx, "mysql-q", 0, queue.VisibilityResetOptions{
+		AckLevel:          0,
+		VisibilityTimeout: time.Minute,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +90,41 @@ func TestMySQLStoreQueueCASAndDelivery(t *testing.T) {
 	}
 	if rangeID != 3 || deleted != 1 {
 		t.Fatalf("expected range=3 deleted=1, got range=%d deleted=%d", rangeID, deleted)
+	}
+
+	atomicInfo := &queue.QueueInfo{QueueName: "mysql-atomic-q", PartitionID: 0, RangeID: 1, AckLevel: 0, NextTaskID: 1}
+	if err := s.CreateQueue(ctx, atomicInfo); err != nil {
+		t.Fatal(err)
+	}
+	atomicRangeID, err := s.CreateTasksAndAdvanceRange(
+		ctx,
+		"mysql-atomic-q",
+		0,
+		[]*queue.TaskRow{{
+			TaskID: 1, QueueName: "mysql-atomic-q", PartitionID: 0, Data: []byte("atomic"), CreatedAt: time.Now(),
+		}},
+		2,
+		1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atomicRangeID != 2 {
+		t.Fatalf("atomic range ID = %d, want 2", atomicRangeID)
+	}
+	gotAtomicInfo, err := s.GetQueue(ctx, "mysql-atomic-q", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotAtomicInfo.RangeID != 2 || gotAtomicInfo.NextTaskID != 2 {
+		t.Fatalf("atomic queue info = %+v", gotAtomicInfo)
+	}
+	atomicRows, err := s.GetTasks(ctx, "mysql-atomic-q", 0, 0, 2, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(atomicRows) != 1 || string(atomicRows[0].Data) != "atomic" {
+		t.Fatalf("atomic task rows = %+v", atomicRows)
 	}
 }
 
@@ -143,5 +183,46 @@ func TestMySQLStoreLockAndMembers(t *testing.T) {
 	}
 	if removed != 1 {
 		t.Fatalf("expected one stale member purged, got %d", removed)
+	}
+}
+
+func TestMySQLStoreMembershipLifecycle(t *testing.T) {
+	s := newMySQLTestStore(t)
+	memberStore := s.Membership()
+	ctx := context.Background()
+	address := net.ParseIP("10.50.60.70")
+
+	for _, draining := range []bool{false, true} {
+		err := memberStore.UpsertMember(ctx, membership.UpsertMemberRequest{
+			ServiceName:  "matching",
+			RPCAddress:   address,
+			RPCPort:      7235,
+			HostID:       []byte("mysql-host"),
+			SessionStart: time.Now().UTC(),
+			RecordExpiry: 20 * time.Millisecond,
+			Draining:     draining,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	members, err := memberStore.GetActiveMembers(ctx, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 1 || !members[0].Draining || !members[0].RPCAddress.Equal(address) {
+		t.Fatalf("active members = %+v", members)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	members, err = memberStore.GetActiveMembers(ctx, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 0 {
+		t.Fatalf("expired members = %+v, want none", members)
+	}
+	if err := memberStore.PruneExpiredMembers(ctx, 10); err != nil {
+		t.Fatal(err)
 	}
 }

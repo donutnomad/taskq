@@ -1,7 +1,6 @@
 package matching
 
 import (
-	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -277,11 +276,15 @@ func (h *partitionHandle) getActive() (*queue.PhysicalQueue, error) {
 }
 
 func (h *partitionHandle) AddTask(ctx context.Context, data []byte) error {
+	return h.AddTaskWithOptions(ctx, data, queue.EnqueueOptions{})
+}
+
+func (h *partitionHandle) AddTaskWithOptions(ctx context.Context, data []byte, opts queue.EnqueueOptions) error {
 	pq, err := h.getActive()
 	if err != nil {
 		return err
 	}
-	return pq.AddTask(ctx, data)
+	return pq.AddTaskWithOptions(ctx, data, opts)
 }
 
 func (h *partitionHandle) TryPoll(ctx context.Context) (*queue.TaskRow, string, bool, error) {
@@ -292,12 +295,24 @@ func (h *partitionHandle) TryPoll(ctx context.Context) (*queue.TaskRow, string, 
 	return pq.TryPoll(ctx)
 }
 
-func (h *partitionHandle) RegisterWaiter(ch chan queue.PollResult) (*queue.PhysicalQueue, *list.Element, error) {
+func (h *partitionHandle) TryPollWithOptions(ctx context.Context, opts queue.PollOptions) (queue.Lease, bool, error) {
 	pq, err := h.getActive()
 	if err != nil {
-		return nil, nil, err
+		return queue.Lease{}, false, err
 	}
-	return pq, pq.RegisterWaiter(ch), nil
+	return pq.TryPollWithOptions(ctx, opts)
+}
+
+func (h *partitionHandle) RegisterWaiter() (*queue.PollWaiter, error) {
+	return h.RegisterWaiterWithOptions(queue.PollOptions{})
+}
+
+func (h *partitionHandle) RegisterWaiterWithOptions(opts queue.PollOptions) (*queue.PollWaiter, error) {
+	pq, err := h.getActive()
+	if err != nil {
+		return nil, err
+	}
+	return pq.RegisterWaiterWithOptions(opts)
 }
 
 func (h *partitionHandle) Ack(ctx context.Context, token string) error {
@@ -374,6 +389,14 @@ func (pm *partitionManager) getOrLoadPartition(ctx context.Context, queueName st
 	handle, ok := pm.partitions[key]
 	pm.mu.RUnlock()
 	if ok && !handle.isClosed() {
+		isOwner, err := pm.isOwner(queueName, partitionID)
+		if err != nil {
+			return nil, fmt.Errorf("lookup owner for %s: %w", key, err)
+		}
+		if !isOwner {
+			pm.unloadPartition(key, handle)
+			return nil, ErrNotOwner
+		}
 		if err := pm.waitUntilServing(ctx, handle); err != nil {
 			return nil, err
 		}
@@ -391,6 +414,20 @@ func (pm *partitionManager) getOrLoadPartition(ctx context.Context, queueName st
 
 	// 慢路径：写锁加载
 	pm.mu.Lock()
+	isOwner, err = pm.isOwner(queueName, partitionID)
+	if err != nil {
+		pm.mu.Unlock()
+		return nil, fmt.Errorf("lookup owner for %s: %w", key, err)
+	}
+	if !isOwner {
+		stale := pm.partitions[key]
+		delete(pm.partitions, key)
+		pm.mu.Unlock()
+		if stale != nil {
+			stale.close()
+		}
+		return nil, ErrNotOwner
+	}
 
 	// double check
 	if handle, ok := pm.partitions[key]; ok {
@@ -417,6 +454,18 @@ func (pm *partitionManager) getOrLoadPartition(ctx context.Context, queueName st
 		return nil, err
 	}
 	return handle, nil
+}
+
+func (pm *partitionManager) unloadPartition(key string, handle *partitionHandle) {
+	pm.mu.Lock()
+	current, ok := pm.partitions[key]
+	if ok && current == handle {
+		delete(pm.partitions, key)
+	}
+	pm.mu.Unlock()
+	if ok && current == handle {
+		handle.close()
+	}
 }
 
 func (pm *partitionManager) waitUntilServing(ctx context.Context, handle *partitionHandle) error {

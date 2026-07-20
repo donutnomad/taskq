@@ -9,6 +9,7 @@ package matching
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -22,12 +23,14 @@ const (
 )
 
 type AddTaskRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	QueueName     string                 `protobuf:"bytes,1,opt,name=queue_name,json=queueName,proto3" json:"queue_name,omitempty"`
-	PartitionId   int32                  `protobuf:"varint,2,opt,name=partition_id,json=partitionId,proto3" json:"partition_id,omitempty"`
-	Data          []byte                 `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	QueueName       string                 `protobuf:"bytes,1,opt,name=queue_name,json=queueName,proto3" json:"queue_name,omitempty"`
+	PartitionId     int32                  `protobuf:"varint,2,opt,name=partition_id,json=partitionId,proto3" json:"partition_id,omitempty"`
+	Data            []byte                 `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"`
+	RoutingKey      string                 `protobuf:"bytes,4,opt,name=routing_key,json=routingKey,proto3" json:"routing_key,omitempty"`
+	RoutingDeadline *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=routing_deadline,json=routingDeadline,proto3" json:"routing_deadline,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *AddTaskRequest) Reset() {
@@ -81,6 +84,20 @@ func (x *AddTaskRequest) GetData() []byte {
 	return nil
 }
 
+func (x *AddTaskRequest) GetRoutingKey() string {
+	if x != nil {
+		return x.RoutingKey
+	}
+	return ""
+}
+
+func (x *AddTaskRequest) GetRoutingDeadline() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RoutingDeadline
+	}
+	return nil
+}
+
 type AddTaskResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -118,12 +135,13 @@ func (*AddTaskResponse) Descriptor() ([]byte, []int) {
 }
 
 type PollTaskRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	QueueName     string                 `protobuf:"bytes,1,opt,name=queue_name,json=queueName,proto3" json:"queue_name,omitempty"`
-	PartitionId   int32                  `protobuf:"varint,2,opt,name=partition_id,json=partitionId,proto3" json:"partition_id,omitempty"`
-	PollTimeoutMs int64                  `protobuf:"varint,3,opt,name=poll_timeout_ms,json=pollTimeoutMs,proto3" json:"poll_timeout_ms,omitempty"` // 0=非阻塞，>0=长轮询毫秒数
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	QueueName           string                 `protobuf:"bytes,1,opt,name=queue_name,json=queueName,proto3" json:"queue_name,omitempty"`
+	PartitionId         int32                  `protobuf:"varint,2,opt,name=partition_id,json=partitionId,proto3" json:"partition_id,omitempty"`
+	PollTimeoutMs       int64                  `protobuf:"varint,3,opt,name=poll_timeout_ms,json=pollTimeoutMs,proto3" json:"poll_timeout_ms,omitempty"` // 0=非阻塞，>0=长轮询毫秒数
+	AcceptedRoutingKeys []string               `protobuf:"bytes,4,rep,name=accepted_routing_keys,json=acceptedRoutingKeys,proto3" json:"accepted_routing_keys,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *PollTaskRequest) Reset() {
@@ -177,13 +195,23 @@ func (x *PollTaskRequest) GetPollTimeoutMs() int64 {
 	return 0
 }
 
+func (x *PollTaskRequest) GetAcceptedRoutingKeys() []string {
+	if x != nil {
+		return x.AcceptedRoutingKeys
+	}
+	return nil
+}
+
 type PollTaskResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Empty         bool                   `protobuf:"varint,1,opt,name=empty,proto3" json:"empty,omitempty"` // true=无任务
-	Data          []byte                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
-	Token         string                 `protobuf:"bytes,3,opt,name=token,proto3" json:"token,omitempty"` // ack/nack 用的 token
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Empty           bool                   `protobuf:"varint,1,opt,name=empty,proto3" json:"empty,omitempty"` // true=无任务
+	Data            []byte                 `protobuf:"bytes,2,opt,name=data,proto3" json:"data,omitempty"`
+	Token           string                 `protobuf:"bytes,3,opt,name=token,proto3" json:"token,omitempty"` // ack/nack 用的 token
+	RoutingKey      string                 `protobuf:"bytes,4,opt,name=routing_key,json=routingKey,proto3" json:"routing_key,omitempty"`
+	RoutingDeadline *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=routing_deadline,json=routingDeadline,proto3" json:"routing_deadline,omitempty"`
+	RoutingFallback bool                   `protobuf:"varint,6,opt,name=routing_fallback,json=routingFallback,proto3" json:"routing_fallback,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *PollTaskResponse) Reset() {
@@ -237,6 +265,187 @@ func (x *PollTaskResponse) GetToken() string {
 	return ""
 }
 
+func (x *PollTaskResponse) GetRoutingKey() string {
+	if x != nil {
+		return x.RoutingKey
+	}
+	return ""
+}
+
+func (x *PollTaskResponse) GetRoutingDeadline() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RoutingDeadline
+	}
+	return nil
+}
+
+func (x *PollTaskResponse) GetRoutingFallback() bool {
+	if x != nil {
+		return x.RoutingFallback
+	}
+	return false
+}
+
+type PollQueueRequest struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	QueueName           string                 `protobuf:"bytes,1,opt,name=queue_name,json=queueName,proto3" json:"queue_name,omitempty"`
+	PartitionIds        []int32                `protobuf:"varint,2,rep,packed,name=partition_ids,json=partitionIds,proto3" json:"partition_ids,omitempty"`
+	PollTimeoutMs       int64                  `protobuf:"varint,3,opt,name=poll_timeout_ms,json=pollTimeoutMs,proto3" json:"poll_timeout_ms,omitempty"`
+	AcceptedRoutingKeys []string               `protobuf:"bytes,4,rep,name=accepted_routing_keys,json=acceptedRoutingKeys,proto3" json:"accepted_routing_keys,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *PollQueueRequest) Reset() {
+	*x = PollQueueRequest{}
+	mi := &file_matching_matching_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PollQueueRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PollQueueRequest) ProtoMessage() {}
+
+func (x *PollQueueRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_matching_matching_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PollQueueRequest.ProtoReflect.Descriptor instead.
+func (*PollQueueRequest) Descriptor() ([]byte, []int) {
+	return file_matching_matching_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *PollQueueRequest) GetQueueName() string {
+	if x != nil {
+		return x.QueueName
+	}
+	return ""
+}
+
+func (x *PollQueueRequest) GetPartitionIds() []int32 {
+	if x != nil {
+		return x.PartitionIds
+	}
+	return nil
+}
+
+func (x *PollQueueRequest) GetPollTimeoutMs() int64 {
+	if x != nil {
+		return x.PollTimeoutMs
+	}
+	return 0
+}
+
+func (x *PollQueueRequest) GetAcceptedRoutingKeys() []string {
+	if x != nil {
+		return x.AcceptedRoutingKeys
+	}
+	return nil
+}
+
+type PollQueueResponse struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Empty           bool                   `protobuf:"varint,1,opt,name=empty,proto3" json:"empty,omitempty"`
+	PartitionId     int32                  `protobuf:"varint,2,opt,name=partition_id,json=partitionId,proto3" json:"partition_id,omitempty"`
+	Data            []byte                 `protobuf:"bytes,3,opt,name=data,proto3" json:"data,omitempty"`
+	Token           string                 `protobuf:"bytes,4,opt,name=token,proto3" json:"token,omitempty"`
+	RoutingKey      string                 `protobuf:"bytes,5,opt,name=routing_key,json=routingKey,proto3" json:"routing_key,omitempty"`
+	RoutingDeadline *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=routing_deadline,json=routingDeadline,proto3" json:"routing_deadline,omitempty"`
+	RoutingFallback bool                   `protobuf:"varint,7,opt,name=routing_fallback,json=routingFallback,proto3" json:"routing_fallback,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *PollQueueResponse) Reset() {
+	*x = PollQueueResponse{}
+	mi := &file_matching_matching_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PollQueueResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PollQueueResponse) ProtoMessage() {}
+
+func (x *PollQueueResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_matching_matching_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PollQueueResponse.ProtoReflect.Descriptor instead.
+func (*PollQueueResponse) Descriptor() ([]byte, []int) {
+	return file_matching_matching_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *PollQueueResponse) GetEmpty() bool {
+	if x != nil {
+		return x.Empty
+	}
+	return false
+}
+
+func (x *PollQueueResponse) GetPartitionId() int32 {
+	if x != nil {
+		return x.PartitionId
+	}
+	return 0
+}
+
+func (x *PollQueueResponse) GetData() []byte {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *PollQueueResponse) GetToken() string {
+	if x != nil {
+		return x.Token
+	}
+	return ""
+}
+
+func (x *PollQueueResponse) GetRoutingKey() string {
+	if x != nil {
+		return x.RoutingKey
+	}
+	return ""
+}
+
+func (x *PollQueueResponse) GetRoutingDeadline() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RoutingDeadline
+	}
+	return nil
+}
+
+func (x *PollQueueResponse) GetRoutingFallback() bool {
+	if x != nil {
+		return x.RoutingFallback
+	}
+	return false
+}
+
 type AckTaskRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	QueueName     string                 `protobuf:"bytes,1,opt,name=queue_name,json=queueName,proto3" json:"queue_name,omitempty"`
@@ -248,7 +457,7 @@ type AckTaskRequest struct {
 
 func (x *AckTaskRequest) Reset() {
 	*x = AckTaskRequest{}
-	mi := &file_matching_matching_proto_msgTypes[4]
+	mi := &file_matching_matching_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -260,7 +469,7 @@ func (x *AckTaskRequest) String() string {
 func (*AckTaskRequest) ProtoMessage() {}
 
 func (x *AckTaskRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_matching_matching_proto_msgTypes[4]
+	mi := &file_matching_matching_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -273,7 +482,7 @@ func (x *AckTaskRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AckTaskRequest.ProtoReflect.Descriptor instead.
 func (*AckTaskRequest) Descriptor() ([]byte, []int) {
-	return file_matching_matching_proto_rawDescGZIP(), []int{4}
+	return file_matching_matching_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *AckTaskRequest) GetQueueName() string {
@@ -305,7 +514,7 @@ type AckTaskResponse struct {
 
 func (x *AckTaskResponse) Reset() {
 	*x = AckTaskResponse{}
-	mi := &file_matching_matching_proto_msgTypes[5]
+	mi := &file_matching_matching_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -317,7 +526,7 @@ func (x *AckTaskResponse) String() string {
 func (*AckTaskResponse) ProtoMessage() {}
 
 func (x *AckTaskResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_matching_matching_proto_msgTypes[5]
+	mi := &file_matching_matching_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -330,7 +539,7 @@ func (x *AckTaskResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AckTaskResponse.ProtoReflect.Descriptor instead.
 func (*AckTaskResponse) Descriptor() ([]byte, []int) {
-	return file_matching_matching_proto_rawDescGZIP(), []int{5}
+	return file_matching_matching_proto_rawDescGZIP(), []int{7}
 }
 
 type NackTaskRequest struct {
@@ -344,7 +553,7 @@ type NackTaskRequest struct {
 
 func (x *NackTaskRequest) Reset() {
 	*x = NackTaskRequest{}
-	mi := &file_matching_matching_proto_msgTypes[6]
+	mi := &file_matching_matching_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -356,7 +565,7 @@ func (x *NackTaskRequest) String() string {
 func (*NackTaskRequest) ProtoMessage() {}
 
 func (x *NackTaskRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_matching_matching_proto_msgTypes[6]
+	mi := &file_matching_matching_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -369,7 +578,7 @@ func (x *NackTaskRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NackTaskRequest.ProtoReflect.Descriptor instead.
 func (*NackTaskRequest) Descriptor() ([]byte, []int) {
-	return file_matching_matching_proto_rawDescGZIP(), []int{6}
+	return file_matching_matching_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *NackTaskRequest) GetQueueName() string {
@@ -401,7 +610,7 @@ type NackTaskResponse struct {
 
 func (x *NackTaskResponse) Reset() {
 	*x = NackTaskResponse{}
-	mi := &file_matching_matching_proto_msgTypes[7]
+	mi := &file_matching_matching_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -413,7 +622,7 @@ func (x *NackTaskResponse) String() string {
 func (*NackTaskResponse) ProtoMessage() {}
 
 func (x *NackTaskResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_matching_matching_proto_msgTypes[7]
+	mi := &file_matching_matching_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -426,7 +635,7 @@ func (x *NackTaskResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NackTaskResponse.ProtoReflect.Descriptor instead.
 func (*NackTaskResponse) Descriptor() ([]byte, []int) {
-	return file_matching_matching_proto_rawDescGZIP(), []int{7}
+	return file_matching_matching_proto_rawDescGZIP(), []int{9}
 }
 
 type GetQueueInfoRequest struct {
@@ -438,7 +647,7 @@ type GetQueueInfoRequest struct {
 
 func (x *GetQueueInfoRequest) Reset() {
 	*x = GetQueueInfoRequest{}
-	mi := &file_matching_matching_proto_msgTypes[8]
+	mi := &file_matching_matching_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -450,7 +659,7 @@ func (x *GetQueueInfoRequest) String() string {
 func (*GetQueueInfoRequest) ProtoMessage() {}
 
 func (x *GetQueueInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_matching_matching_proto_msgTypes[8]
+	mi := &file_matching_matching_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -463,7 +672,7 @@ func (x *GetQueueInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetQueueInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetQueueInfoRequest) Descriptor() ([]byte, []int) {
-	return file_matching_matching_proto_rawDescGZIP(), []int{8}
+	return file_matching_matching_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *GetQueueInfoRequest) GetQueueName() string {
@@ -482,7 +691,7 @@ type GetQueueInfoResponse struct {
 
 func (x *GetQueueInfoResponse) Reset() {
 	*x = GetQueueInfoResponse{}
-	mi := &file_matching_matching_proto_msgTypes[9]
+	mi := &file_matching_matching_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -494,7 +703,7 @@ func (x *GetQueueInfoResponse) String() string {
 func (*GetQueueInfoResponse) ProtoMessage() {}
 
 func (x *GetQueueInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_matching_matching_proto_msgTypes[9]
+	mi := &file_matching_matching_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -507,7 +716,7 @@ func (x *GetQueueInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetQueueInfoResponse.ProtoReflect.Descriptor instead.
 func (*GetQueueInfoResponse) Descriptor() ([]byte, []int) {
-	return file_matching_matching_proto_rawDescGZIP(), []int{9}
+	return file_matching_matching_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *GetQueueInfoResponse) GetNumPartitions() int32 {
@@ -521,22 +730,45 @@ var File_matching_matching_proto protoreflect.FileDescriptor
 
 const file_matching_matching_proto_rawDesc = "" +
 	"\n" +
-	"\x17matching/matching.proto\x12\bmatching\"f\n" +
+	"\x17matching/matching.proto\x12\bmatching\x1a\x1fgoogle/protobuf/timestamp.proto\"\xce\x01\n" +
 	"\x0eAddTaskRequest\x12\x1d\n" +
 	"\n" +
 	"queue_name\x18\x01 \x01(\tR\tqueueName\x12!\n" +
 	"\fpartition_id\x18\x02 \x01(\x05R\vpartitionId\x12\x12\n" +
-	"\x04data\x18\x03 \x01(\fR\x04data\"\x11\n" +
-	"\x0fAddTaskResponse\"{\n" +
+	"\x04data\x18\x03 \x01(\fR\x04data\x12\x1f\n" +
+	"\vrouting_key\x18\x04 \x01(\tR\n" +
+	"routingKey\x12E\n" +
+	"\x10routing_deadline\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\x0froutingDeadline\"\x11\n" +
+	"\x0fAddTaskResponse\"\xaf\x01\n" +
 	"\x0fPollTaskRequest\x12\x1d\n" +
 	"\n" +
 	"queue_name\x18\x01 \x01(\tR\tqueueName\x12!\n" +
 	"\fpartition_id\x18\x02 \x01(\x05R\vpartitionId\x12&\n" +
-	"\x0fpoll_timeout_ms\x18\x03 \x01(\x03R\rpollTimeoutMs\"R\n" +
+	"\x0fpoll_timeout_ms\x18\x03 \x01(\x03R\rpollTimeoutMs\x122\n" +
+	"\x15accepted_routing_keys\x18\x04 \x03(\tR\x13acceptedRoutingKeys\"\xe5\x01\n" +
 	"\x10PollTaskResponse\x12\x14\n" +
 	"\x05empty\x18\x01 \x01(\bR\x05empty\x12\x12\n" +
 	"\x04data\x18\x02 \x01(\fR\x04data\x12\x14\n" +
-	"\x05token\x18\x03 \x01(\tR\x05token\"h\n" +
+	"\x05token\x18\x03 \x01(\tR\x05token\x12\x1f\n" +
+	"\vrouting_key\x18\x04 \x01(\tR\n" +
+	"routingKey\x12E\n" +
+	"\x10routing_deadline\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\x0froutingDeadline\x12)\n" +
+	"\x10routing_fallback\x18\x06 \x01(\bR\x0froutingFallback\"\xb2\x01\n" +
+	"\x10PollQueueRequest\x12\x1d\n" +
+	"\n" +
+	"queue_name\x18\x01 \x01(\tR\tqueueName\x12#\n" +
+	"\rpartition_ids\x18\x02 \x03(\x05R\fpartitionIds\x12&\n" +
+	"\x0fpoll_timeout_ms\x18\x03 \x01(\x03R\rpollTimeoutMs\x122\n" +
+	"\x15accepted_routing_keys\x18\x04 \x03(\tR\x13acceptedRoutingKeys\"\x89\x02\n" +
+	"\x11PollQueueResponse\x12\x14\n" +
+	"\x05empty\x18\x01 \x01(\bR\x05empty\x12!\n" +
+	"\fpartition_id\x18\x02 \x01(\x05R\vpartitionId\x12\x12\n" +
+	"\x04data\x18\x03 \x01(\fR\x04data\x12\x14\n" +
+	"\x05token\x18\x04 \x01(\tR\x05token\x12\x1f\n" +
+	"\vrouting_key\x18\x05 \x01(\tR\n" +
+	"routingKey\x12E\n" +
+	"\x10routing_deadline\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\x0froutingDeadline\x12)\n" +
+	"\x10routing_fallback\x18\a \x01(\bR\x0froutingFallback\"h\n" +
 	"\x0eAckTaskRequest\x12\x1d\n" +
 	"\n" +
 	"queue_name\x18\x01 \x01(\tR\tqueueName\x12!\n" +
@@ -553,10 +785,11 @@ const file_matching_matching_proto_rawDesc = "" +
 	"\n" +
 	"queue_name\x18\x01 \x01(\tR\tqueueName\"=\n" +
 	"\x14GetQueueInfoResponse\x12%\n" +
-	"\x0enum_partitions\x18\x01 \x01(\x05R\rnumPartitions2\xe6\x02\n" +
+	"\x0enum_partitions\x18\x01 \x01(\x05R\rnumPartitions2\xac\x03\n" +
 	"\x0fMatchingService\x12>\n" +
 	"\aAddTask\x12\x18.matching.AddTaskRequest\x1a\x19.matching.AddTaskResponse\x12A\n" +
-	"\bPollTask\x12\x19.matching.PollTaskRequest\x1a\x1a.matching.PollTaskResponse\x12>\n" +
+	"\bPollTask\x12\x19.matching.PollTaskRequest\x1a\x1a.matching.PollTaskResponse\x12D\n" +
+	"\tPollQueue\x12\x1a.matching.PollQueueRequest\x1a\x1b.matching.PollQueueResponse\x12>\n" +
 	"\aAckTask\x12\x18.matching.AckTaskRequest\x1a\x19.matching.AckTaskResponse\x12A\n" +
 	"\bNackTask\x12\x19.matching.NackTaskRequest\x1a\x1a.matching.NackTaskResponse\x12M\n" +
 	"\fGetQueueInfo\x12\x1d.matching.GetQueueInfoRequest\x1a\x1e.matching.GetQueueInfoResponseB&Z$github.com/donutnomad/taskq/matchingb\x06proto3"
@@ -573,35 +806,43 @@ func file_matching_matching_proto_rawDescGZIP() []byte {
 	return file_matching_matching_proto_rawDescData
 }
 
-var file_matching_matching_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_matching_matching_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_matching_matching_proto_goTypes = []any{
-	(*AddTaskRequest)(nil),       // 0: matching.AddTaskRequest
-	(*AddTaskResponse)(nil),      // 1: matching.AddTaskResponse
-	(*PollTaskRequest)(nil),      // 2: matching.PollTaskRequest
-	(*PollTaskResponse)(nil),     // 3: matching.PollTaskResponse
-	(*AckTaskRequest)(nil),       // 4: matching.AckTaskRequest
-	(*AckTaskResponse)(nil),      // 5: matching.AckTaskResponse
-	(*NackTaskRequest)(nil),      // 6: matching.NackTaskRequest
-	(*NackTaskResponse)(nil),     // 7: matching.NackTaskResponse
-	(*GetQueueInfoRequest)(nil),  // 8: matching.GetQueueInfoRequest
-	(*GetQueueInfoResponse)(nil), // 9: matching.GetQueueInfoResponse
+	(*AddTaskRequest)(nil),        // 0: matching.AddTaskRequest
+	(*AddTaskResponse)(nil),       // 1: matching.AddTaskResponse
+	(*PollTaskRequest)(nil),       // 2: matching.PollTaskRequest
+	(*PollTaskResponse)(nil),      // 3: matching.PollTaskResponse
+	(*PollQueueRequest)(nil),      // 4: matching.PollQueueRequest
+	(*PollQueueResponse)(nil),     // 5: matching.PollQueueResponse
+	(*AckTaskRequest)(nil),        // 6: matching.AckTaskRequest
+	(*AckTaskResponse)(nil),       // 7: matching.AckTaskResponse
+	(*NackTaskRequest)(nil),       // 8: matching.NackTaskRequest
+	(*NackTaskResponse)(nil),      // 9: matching.NackTaskResponse
+	(*GetQueueInfoRequest)(nil),   // 10: matching.GetQueueInfoRequest
+	(*GetQueueInfoResponse)(nil),  // 11: matching.GetQueueInfoResponse
+	(*timestamppb.Timestamp)(nil), // 12: google.protobuf.Timestamp
 }
 var file_matching_matching_proto_depIdxs = []int32{
-	0, // 0: matching.MatchingService.AddTask:input_type -> matching.AddTaskRequest
-	2, // 1: matching.MatchingService.PollTask:input_type -> matching.PollTaskRequest
-	4, // 2: matching.MatchingService.AckTask:input_type -> matching.AckTaskRequest
-	6, // 3: matching.MatchingService.NackTask:input_type -> matching.NackTaskRequest
-	8, // 4: matching.MatchingService.GetQueueInfo:input_type -> matching.GetQueueInfoRequest
-	1, // 5: matching.MatchingService.AddTask:output_type -> matching.AddTaskResponse
-	3, // 6: matching.MatchingService.PollTask:output_type -> matching.PollTaskResponse
-	5, // 7: matching.MatchingService.AckTask:output_type -> matching.AckTaskResponse
-	7, // 8: matching.MatchingService.NackTask:output_type -> matching.NackTaskResponse
-	9, // 9: matching.MatchingService.GetQueueInfo:output_type -> matching.GetQueueInfoResponse
-	5, // [5:10] is the sub-list for method output_type
-	0, // [0:5] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	12, // 0: matching.AddTaskRequest.routing_deadline:type_name -> google.protobuf.Timestamp
+	12, // 1: matching.PollTaskResponse.routing_deadline:type_name -> google.protobuf.Timestamp
+	12, // 2: matching.PollQueueResponse.routing_deadline:type_name -> google.protobuf.Timestamp
+	0,  // 3: matching.MatchingService.AddTask:input_type -> matching.AddTaskRequest
+	2,  // 4: matching.MatchingService.PollTask:input_type -> matching.PollTaskRequest
+	4,  // 5: matching.MatchingService.PollQueue:input_type -> matching.PollQueueRequest
+	6,  // 6: matching.MatchingService.AckTask:input_type -> matching.AckTaskRequest
+	8,  // 7: matching.MatchingService.NackTask:input_type -> matching.NackTaskRequest
+	10, // 8: matching.MatchingService.GetQueueInfo:input_type -> matching.GetQueueInfoRequest
+	1,  // 9: matching.MatchingService.AddTask:output_type -> matching.AddTaskResponse
+	3,  // 10: matching.MatchingService.PollTask:output_type -> matching.PollTaskResponse
+	5,  // 11: matching.MatchingService.PollQueue:output_type -> matching.PollQueueResponse
+	7,  // 12: matching.MatchingService.AckTask:output_type -> matching.AckTaskResponse
+	9,  // 13: matching.MatchingService.NackTask:output_type -> matching.NackTaskResponse
+	11, // 14: matching.MatchingService.GetQueueInfo:output_type -> matching.GetQueueInfoResponse
+	9,  // [9:15] is the sub-list for method output_type
+	3,  // [3:9] is the sub-list for method input_type
+	3,  // [3:3] is the sub-list for extension type_name
+	3,  // [3:3] is the sub-list for extension extendee
+	0,  // [0:3] is the sub-list for field type_name
 }
 
 func init() { file_matching_matching_proto_init() }
@@ -615,7 +856,7 @@ func file_matching_matching_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_matching_matching_proto_rawDesc), len(file_matching_matching_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

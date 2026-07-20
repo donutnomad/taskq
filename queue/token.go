@@ -7,21 +7,26 @@ import (
 	"strings"
 )
 
-const tokenVersionPrefix = "v1."
+const (
+	tokenVersionPrefix       = "v2."
+	legacyTokenVersionPrefix = "v1."
+)
 
 type TaskToken struct {
 	QueueName      string `json:"q"`
 	PartitionID    int    `json:"p"`
 	TaskID         int64  `json:"t"`
 	OwnershipEpoch int64  `json:"e"`
+	DeliveryID     int64  `json:"d"`
 }
 
-func formatToken(queueName string, partitionID int, taskID int64, ownershipEpoch int64) string {
+func formatToken(queueName string, partitionID int, taskID int64, ownershipEpoch, deliveryID int64) string {
 	payload, err := json.Marshal(TaskToken{
 		QueueName:      queueName,
 		PartitionID:    partitionID,
 		TaskID:         taskID,
 		OwnershipEpoch: ownershipEpoch,
+		DeliveryID:     deliveryID,
 	})
 	if err != nil {
 		panic(err)
@@ -31,14 +36,19 @@ func formatToken(queueName string, partitionID int, taskID int64, ownershipEpoch
 
 func ParseTaskToken(token string) (TaskToken, error) {
 	if strings.HasPrefix(token, tokenVersionPrefix) {
-		raw := strings.TrimPrefix(token, tokenVersionPrefix)
-		payload, err := base64.RawURLEncoding.DecodeString(raw)
+		parsed, err := parseStructuredToken(token, tokenVersionPrefix)
 		if err != nil {
+			return TaskToken{}, err
+		}
+		if parsed.QueueName == "" || parsed.PartitionID < 0 || parsed.TaskID <= 0 || parsed.OwnershipEpoch <= 0 || parsed.DeliveryID <= 0 {
 			return TaskToken{}, fmt.Errorf("%w: %q", ErrInvalidToken, token)
 		}
-		var parsed TaskToken
-		if err := json.Unmarshal(payload, &parsed); err != nil {
-			return TaskToken{}, fmt.Errorf("%w: %q", ErrInvalidToken, token)
+		return parsed, nil
+	}
+	if strings.HasPrefix(token, legacyTokenVersionPrefix) {
+		parsed, err := parseStructuredToken(token, legacyTokenVersionPrefix)
+		if err != nil {
+			return TaskToken{}, err
 		}
 		if parsed.QueueName == "" || parsed.PartitionID < 0 || parsed.TaskID <= 0 || parsed.OwnershipEpoch <= 0 {
 			return TaskToken{}, fmt.Errorf("%w: %q", ErrInvalidToken, token)
@@ -53,6 +63,19 @@ func ParseTaskToken(token string) (TaskToken, error) {
 		return TaskToken{}, fmt.Errorf("%w: %q", ErrInvalidToken, token)
 	}
 	return TaskToken{PartitionID: partitionID, TaskID: taskID}, nil
+}
+
+func parseStructuredToken(token, prefix string) (TaskToken, error) {
+	raw := strings.TrimPrefix(token, prefix)
+	payload, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return TaskToken{}, fmt.Errorf("%w: %q", ErrInvalidToken, token)
+	}
+	var parsed TaskToken
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return TaskToken{}, fmt.Errorf("%w: %q", ErrInvalidToken, token)
+	}
+	return parsed, nil
 }
 
 func parseToken(token string) (int, int64, error) {

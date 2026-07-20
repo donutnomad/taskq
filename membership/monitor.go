@@ -42,8 +42,8 @@ type monitor struct {
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
 
-	serviceNames []string
-	store        MemberStore
+	advertisedServices []string
+	store              MemberStore
 
 	pollInterval    time.Duration
 	propagationTime time.Duration
@@ -55,6 +55,7 @@ type monitor struct {
 	hostID        []byte
 	broadcastAddr netip.AddrPort
 	draining      bool
+	stopAt        int64
 
 	initialized chan struct{}
 	shutdownErr error
@@ -62,7 +63,21 @@ type monitor struct {
 
 var _ Monitor = (*monitor)(nil)
 
-// NewMonitor 创建一个 Monitor 实例。
+// MonitorConfig separates the services this process publishes from the
+// services whose routing views it consumes.
+type MonitorConfig struct {
+	AdvertisedServices []string
+	WatchedServices    []string
+	Store              MemberStore
+	BroadcastAddr      netip.AddrPort
+	PollInterval       time.Duration
+	PropagationTime    time.Duration
+	JoinTime           time.Time
+	ReplicaPoints      int
+}
+
+// NewMonitor preserves the legacy behavior where every advertised service is
+// also watched by this process.
 //
 // 参数：
 //   - serviceNames: 本节点承担的服务角色列表（如 []string{"matching"} 或 []string{"matching", "history"}）
@@ -81,26 +96,43 @@ func NewMonitor(
 	joinTime time.Time,
 	replicaPoints int,
 ) Monitor {
+	return NewMonitorWithConfig(MonitorConfig{
+		AdvertisedServices: serviceNames,
+		WatchedServices:    serviceNames,
+		Store:              store,
+		BroadcastAddr:      broadcastAddr,
+		PollInterval:       pollInterval,
+		PropagationTime:    propagationTime,
+		JoinTime:           joinTime,
+		ReplicaPoints:      replicaPoints,
+	})
+}
+
+// NewMonitorWithConfig creates a monitor with independent publication and
+// observation roles. Observer-only processes leave AdvertisedServices empty.
+func NewMonitorWithConfig(cfg MonitorConfig) Monitor {
 	ctx, cancel := context.WithCancel(context.Background())
 	hostID, _ := uuid.New().MarshalBinary()
+	advertisedServices := append([]string(nil), cfg.AdvertisedServices...)
+	watchedServices := append([]string(nil), cfg.WatchedServices...)
 
 	m := &monitor{
-		lifecycleCtx:    ctx,
-		lifecycleCancel: cancel,
-		serviceNames:    serviceNames,
-		store:           store,
-		pollInterval:    pollInterval,
-		propagationTime: propagationTime,
-		joinTime:        joinTime,
-		rings:           make(map[string]*serviceResolver),
-		replicaPoints:   replicaPoints,
-		hostID:          hostID,
-		broadcastAddr:   broadcastAddr,
-		initialized:     make(chan struct{}),
+		lifecycleCtx:       ctx,
+		lifecycleCancel:    cancel,
+		advertisedServices: advertisedServices,
+		store:              cfg.Store,
+		pollInterval:       cfg.PollInterval,
+		propagationTime:    cfg.PropagationTime,
+		joinTime:           cfg.JoinTime,
+		rings:              make(map[string]*serviceResolver),
+		replicaPoints:      cfg.ReplicaPoints,
+		hostID:             hostID,
+		broadcastAddr:      cfg.BroadcastAddr,
+		initialized:        make(chan struct{}),
 	}
 
-	for _, svc := range serviceNames {
-		m.rings[svc] = newServiceResolver(svc, replicaPoints)
+	for _, svc := range watchedServices {
+		m.rings[svc] = newServiceResolver(svc, cfg.ReplicaPoints)
 	}
 	return m
 }
@@ -121,9 +153,11 @@ func (m *monitor) Start() {
 		}
 	}
 
-	if err := m.retryMembershipOp("initialize membership heartbeats", m.writeHeartbeats); err != nil {
-		m.fail(fmt.Errorf("unable to initialize membership heartbeats: %w", err))
-		return
+	if len(m.advertisedServices) > 0 {
+		if err := m.retryMembershipOp("initialize membership heartbeats", m.writeHeartbeats); err != nil {
+			m.fail(fmt.Errorf("unable to initialize membership heartbeats: %w", err))
+			return
+		}
 	}
 
 	if err := m.retryMembershipOp("sync members on startup", m.syncMembers); err != nil {
@@ -135,8 +169,10 @@ func (m *monitor) Start() {
 
 	m.wg.Add(1)
 	go m.pollLoop()
-	m.wg.Add(1)
-	go m.heartbeatLoop()
+	if len(m.advertisedServices) > 0 {
+		m.wg.Add(1)
+		go m.heartbeatLoop()
+	}
 }
 
 func (m *monitor) Stop() {
@@ -189,11 +225,18 @@ func (m *monitor) EvictSelf() error {
 func (m *monitor) EvictSelfAt(asOf time.Time) (time.Duration, error) {
 	until := time.Until(asOf)
 	if until <= 0 {
-		return 0, m.SetDraining(true)
+		if err := m.SetDraining(true); err != nil {
+			return 0, err
+		}
+		return m.propagationTime, nil
 	}
-	leaveAfter := until + m.propagationTime
-	time.AfterFunc(until, func() { _ = m.SetDraining(true) })
-	return leaveAfter, nil
+	m.mu.Lock()
+	m.stopAt = asOf.Unix()
+	m.mu.Unlock()
+	if err := m.writeHeartbeats(); err != nil {
+		return 0, err
+	}
+	return until + m.propagationTime, nil
 }
 
 func (m *monitor) GetResolver(service string) (ServiceResolver, error) {
@@ -224,15 +267,12 @@ func (m *monitor) GetReachableMembers() ([]string, error) {
 func (m *monitor) SetDraining(draining bool) error {
 	m.mu.Lock()
 	m.draining = draining
+	if !draining {
+		m.stopAt = 0
+	}
 	m.mu.Unlock()
 
-	for _, svc := range m.serviceNames {
-		req := m.buildUpsertRequest(svc)
-		if err := m.store.UpsertMember(m.lifecycleCtx, req); err != nil {
-			return err
-		}
-	}
-	return nil
+	return m.writeHeartbeats()
 }
 
 func (m *monitor) ApproximateMaxPropagationTime() time.Duration {
@@ -297,7 +337,7 @@ func (m *monitor) syncMembers() error {
 }
 
 func (m *monitor) writeHeartbeats() error {
-	for _, svc := range m.serviceNames {
+	for _, svc := range m.advertisedServices {
 		req := m.buildUpsertRequest(svc)
 		if err := m.store.UpsertMember(m.lifecycleCtx, req); err != nil {
 			return err
@@ -309,6 +349,7 @@ func (m *monitor) writeHeartbeats() error {
 func (m *monitor) buildUpsertRequest(serviceName string) UpsertMemberRequest {
 	m.mu.Lock()
 	draining := m.draining
+	stopAt := m.stopAt
 	m.mu.Unlock()
 
 	var startAt int64
@@ -325,6 +366,7 @@ func (m *monitor) buildUpsertRequest(serviceName string) UpsertMemberRequest {
 		RecordExpiry: upsertMembershipRecordExpiryDefault,
 		Draining:     draining,
 		StartAt:      startAt,
+		StopAt:       stopAt,
 	}
 }
 

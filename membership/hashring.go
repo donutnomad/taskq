@@ -15,6 +15,7 @@ type hashRing struct {
 	replicaPoints int
 	vnodes        []vnode
 	members       map[string]struct{}
+	hash          func([]byte) uint32
 }
 
 type vnode struct {
@@ -23,9 +24,14 @@ type vnode struct {
 }
 
 func newHashRing(replicaPoints int) *hashRing {
+	return newHashRingWithHash(replicaPoints, farm.Fingerprint32)
+}
+
+func newHashRingWithHash(replicaPoints int, hash func([]byte) uint32) *hashRing {
 	return &hashRing{
 		replicaPoints: replicaPoints,
 		members:       make(map[string]struct{}),
+		hash:          hash,
 	}
 }
 
@@ -36,10 +42,13 @@ func (r *hashRing) AddMember(addr string) {
 	r.members[addr] = struct{}{}
 	for i := range r.replicaPoints {
 		key := fmt.Sprintf("%s-%d", addr, i)
-		h := farm.Fingerprint32([]byte(key))
+		h := r.hash([]byte(key))
 		r.vnodes = append(r.vnodes, vnode{hash: h, addr: addr})
 	}
 	sort.Slice(r.vnodes, func(i, j int) bool {
+		if r.vnodes[i].hash == r.vnodes[j].hash {
+			return r.vnodes[i].addr < r.vnodes[j].addr
+		}
 		return r.vnodes[i].hash < r.vnodes[j].hash
 	})
 }
@@ -59,7 +68,7 @@ func (r *hashRing) Lookup(key string) (string, bool) {
 	if len(r.vnodes) == 0 {
 		return "", false
 	}
-	h := farm.Fingerprint32([]byte(key))
+	h := r.hash([]byte(key))
 	idx := sort.Search(len(r.vnodes), func(i int) bool {
 		return r.vnodes[i].hash >= h
 	})
@@ -77,7 +86,7 @@ func (r *hashRing) LookupN(key string, n int) []string {
 	if n > len(r.members) {
 		n = len(r.members)
 	}
-	h := farm.Fingerprint32([]byte(key))
+	h := r.hash([]byte(key))
 	idx := sort.Search(len(r.vnodes), func(i int) bool {
 		return r.vnodes[i].hash >= h
 	})

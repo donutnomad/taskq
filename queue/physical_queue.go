@@ -1,7 +1,6 @@
 package queue
 
 import (
-	"container/list"
 	"context"
 	"log/slog"
 	"sync"
@@ -13,6 +12,57 @@ type PollResult struct {
 	Row   *TaskRow
 	Token string
 	Err   error
+}
+
+// Lease returns the delivery state captured when the task was dispatched.
+func (r PollResult) Lease() Lease {
+	if r.Row == nil {
+		return Lease{Token: r.Token}
+	}
+	return newLease(r.Row, r.Token, taskDispatchTime(r.Row))
+}
+
+// EnqueueOptions controls task delivery routing.
+type EnqueueOptions struct {
+	RoutingKey      string
+	RoutingDeadline time.Time
+}
+
+// Validate checks whether the options are portable across supported stores.
+func (o EnqueueOptions) Validate() error {
+	if err := validateRoutingKey(o.RoutingKey); err != nil {
+		return err
+	}
+	if o.RoutingKey == "" && !o.RoutingDeadline.IsZero() {
+		return ErrInvalidRoutingDeadline
+	}
+	return nil
+}
+
+// PollOptions declares the routing keys accepted by a poller.
+type PollOptions struct {
+	AcceptedRoutingKeys []string
+}
+
+// Validate checks whether every accepted key is portable across supported stores.
+func (o PollOptions) Validate() error {
+	_, err := o.Normalize()
+	return err
+}
+
+// Normalize validates accepted keys, removes empty entries, and deduplicates
+// them while preserving first-seen order.
+func (o PollOptions) Normalize() (PollOptions, error) {
+	return normalizePollOptions(o)
+}
+
+// Lease is a task delivery that must be completed with Ack or Nack.
+type Lease struct {
+	Data            []byte
+	Token           string
+	RoutingKey      string
+	RoutingDeadline time.Time
+	RoutingFallback bool
 }
 
 // PhysicalQueue 单分区队列核心，负责装配各个子组件。
@@ -73,14 +123,21 @@ func newPhysicalQueue(
 }
 
 func (pq *PhysicalQueue) addTask(ctx context.Context, data []byte) error {
+	return pq.addTaskWithOptions(ctx, data, EnqueueOptions{})
+}
+
+func (pq *PhysicalQueue) addTaskWithOptions(ctx context.Context, data []byte, opts EnqueueOptions) error {
 	if pq.IsClosed() {
 		return ErrQueueClosed
 	}
-
-	_, err := pq.writer.enqueue(data)
-	if err != nil && pq.IsClosed() {
-		return ErrQueueClosed
+	if err := opts.Validate(); err != nil {
+		return err
 	}
+	if !opts.RoutingDeadline.IsZero() {
+		opts.RoutingDeadline = opts.RoutingDeadline.UTC()
+	}
+
+	_, err := pq.writer.enqueue(data, opts)
 	return err
 }
 
@@ -92,11 +149,19 @@ func (pq *PhysicalQueue) onFlush(rows []*TaskRow) {
 }
 
 func (pq *PhysicalQueue) tryPoll(ctx context.Context) (*TaskRow, string, bool, error) {
+	return pq.tryPollWithOptions(ctx, PollOptions{})
+}
+
+func (pq *PhysicalQueue) tryPollWithOptions(ctx context.Context, opts PollOptions) (*TaskRow, string, bool, error) {
 	if pq.IsClosed() {
 		return nil, "", false, ErrQueueClosed
 	}
+	normalized, err := opts.Normalize()
+	if err != nil {
+		return nil, "", false, err
+	}
 
-	row, token, ok, err := pq.runtime.tryGetTask(ctx)
+	row, token, ok, err := pq.runtime.tryGetTask(ctx, normalized)
 	if err != nil {
 		slog.Error("queue tryPoll failed", "queue", pq.queueName, "partition_id", pq.partitionID, "err", err)
 		return nil, "", false, err
@@ -104,30 +169,16 @@ func (pq *PhysicalQueue) tryPoll(ctx context.Context) (*TaskRow, string, bool, e
 	return row, token, ok, nil
 }
 
-func (pq *PhysicalQueue) registerWaiter(ch chan PollResult) *list.Element {
-	if pq.IsClosed() {
-		sendPollResult(ch, PollResult{Err: ErrQueueClosed})
-		return nil
-	}
-
-	row, token, ok, err := pq.runtime.tryGetTask(pq.ctx)
+func (pq *PhysicalQueue) registerWaiter(opts PollOptions) (*PollWaiter, error) {
+	normalized, err := opts.Normalize()
 	if err != nil {
-		slog.Error("queue registerWaiter immediate poll failed", "queue", pq.queueName, "partition_id", pq.partitionID, "err", err)
-	} else if ok {
-		if sendPollResult(ch, PollResult{Row: row, Token: token}) {
-			return nil
-		}
-		if nackErr := pq.runtime.nack(pq.ctx, row.TaskID); nackErr != nil {
-			slog.Error("queue failed to return task after waiter immediate send failure", "queue", pq.queueName, "partition_id", pq.partitionID, "task_id", row.TaskID, "err", nackErr)
-		}
-		return nil
+		return nil, err
 	}
-
-	return pq.waiters.add(ch)
-}
-
-func (pq *PhysicalQueue) removeWaiter(elem *list.Element) {
-	pq.waiters.remove(elem)
+	waiter := pq.waiters.add(normalized)
+	if !pq.IsClosed() {
+		pq.runtime.tryDeliverToWaiters()
+	}
+	return waiter, nil
 }
 
 func (pq *PhysicalQueue) wakeWaiters() {
@@ -148,7 +199,7 @@ func (pq *PhysicalQueue) ack(ctx context.Context, token string) error {
 	}
 
 	_ = ctx
-	return pq.runtime.ack(parsed.TaskID)
+	return pq.runtime.ack(parsed.TaskID, parsed.DeliveryID)
 }
 
 func (pq *PhysicalQueue) nack(ctx context.Context, token string) error {
@@ -164,7 +215,7 @@ func (pq *PhysicalQueue) nack(ctx context.Context, token string) error {
 		return err
 	}
 
-	if err := pq.runtime.nack(ctx, parsed.TaskID); err != nil {
+	if err := pq.runtime.nack(ctx, parsed.TaskID, parsed.DeliveryID); err != nil {
 		return err
 	}
 	pq.wakeWaiters()
@@ -215,19 +266,34 @@ func (pq *PhysicalQueue) AddTask(ctx context.Context, data []byte) error {
 	return pq.addTask(ctx, data)
 }
 
+// AddTaskWithOptions writes a task with delivery routing metadata.
+func (pq *PhysicalQueue) AddTaskWithOptions(ctx context.Context, data []byte, opts EnqueueOptions) error {
+	return pq.addTaskWithOptions(ctx, data, opts)
+}
+
 // TryPoll 非阻塞尝试获取任务
 func (pq *PhysicalQueue) TryPoll(ctx context.Context) (*TaskRow, string, bool, error) {
 	return pq.tryPoll(ctx)
 }
 
-// RegisterWaiter 注册等待 channel，有任务时通过该 channel 投递
-func (pq *PhysicalQueue) RegisterWaiter(ch chan PollResult) *list.Element {
-	return pq.registerWaiter(ch)
+// TryPollWithOptions returns the first task visible to the poller's routing keys.
+func (pq *PhysicalQueue) TryPollWithOptions(ctx context.Context, opts PollOptions) (Lease, bool, error) {
+	row, token, ok, err := pq.tryPollWithOptions(ctx, opts)
+	if err != nil || !ok {
+		return Lease{}, ok, err
+	}
+	return newLease(row, token, taskDispatchTime(row)), true, nil
 }
 
-// RemoveWaiter 取消等待注册
-func (pq *PhysicalQueue) RemoveWaiter(elem *list.Element) {
-	pq.removeWaiter(elem)
+// RegisterWaiter registers an atomic delivery claim for a long poll.
+func (pq *PhysicalQueue) RegisterWaiter() *PollWaiter {
+	waiter, _ := pq.registerWaiter(PollOptions{})
+	return waiter
+}
+
+// RegisterWaiterWithOptions registers a routed long-poll delivery claim.
+func (pq *PhysicalQueue) RegisterWaiterWithOptions(opts PollOptions) (*PollWaiter, error) {
+	return pq.registerWaiter(opts)
 }
 
 // Ack 确认消费完成

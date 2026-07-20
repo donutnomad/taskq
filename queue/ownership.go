@@ -18,12 +18,25 @@ func newOwnershipState(store Store, rangeID int64) *ownershipState {
 	return &ownershipState{store: store, rangeID: rangeID}
 }
 
-func (o *ownershipState) allocateTaskIDRange(ctx context.Context, queueName string, partitionID int, newNextTaskID int64) error {
+func (o *ownershipState) createTasksAndAdvanceRange(
+	ctx context.Context,
+	queueName string,
+	partitionID int,
+	tasks []*TaskRow,
+	newNextTaskID int64,
+) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
 	prev := o.rangeID
-	newRangeID, err := o.store.AllocateTaskIDRange(ctx, queueName, partitionID, newNextTaskID, prev)
+	newRangeID, err := o.store.CreateTasksAndAdvanceRange(
+		ctx,
+		queueName,
+		partitionID,
+		tasks,
+		newNextTaskID,
+		prev,
+	)
 	if err != nil {
 		if errors.Is(err, ErrConditionFailed) {
 			return ErrOwnershipLost

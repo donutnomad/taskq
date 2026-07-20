@@ -57,6 +57,49 @@ type flakyLookupResolver struct {
 	lookupErr error
 }
 
+type ownershipFlipResolver struct {
+	lookups int
+	self    membership.HostInfo
+	other   membership.HostInfo
+}
+
+func (r *ownershipFlipResolver) Lookup(string) (membership.HostInfo, error) {
+	r.lookups++
+	if r.lookups == 1 {
+		return r.self, nil
+	}
+	return r.other, nil
+}
+
+func (*ownershipFlipResolver) AddListener(string, chan<- *membership.ChangedEvent) error { return nil }
+func (*ownershipFlipResolver) RemoveListener(string) error                               { return nil }
+
+func TestBugRepro_SlowPartitionLoadRechecksOwnershipUnderLock(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := &ownershipFlipResolver{
+		self:  membership.NewHostInfoFromAddress("127.0.0.1:9999"),
+		other: membership.NewHostInfoFromAddress("127.0.0.2:9999"),
+	}
+	pm := newPartitionManager(
+		context.Background(),
+		store,
+		store.(dbleader.LockStore),
+		"127.0.0.1:9999",
+		"owner-a",
+		resolver,
+		time.Minute,
+		map[string]int{"known-q": 1},
+	)
+	t.Cleanup(pm.close)
+
+	if _, err := pm.getOrLoadPartition(context.Background(), "known-q", 0); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("expected ownership change to abort partition load, got %v", err)
+	}
+	if len(pm.partitions) != 0 {
+		t.Fatalf("loaded partitions = %d, want 0", len(pm.partitions))
+	}
+}
+
 func (r *flakyLookupResolver) Lookup(key string) (membership.HostInfo, error) {
 	if r.lookupErr != nil {
 		return nil, r.lookupErr
@@ -93,4 +136,82 @@ func TestBugRepro_ReconcileKeepsLoadedPartitionsWhenOwnershipLookupFails(t *test
 	if _, ok := pm.partitions[partitionKey("known-q", 0)]; !ok {
 		t.Fatal("expected loaded partition to remain registered after transient lookup failure")
 	}
+}
+
+func TestBugRepro_LoadedPartitionRechecksOwnership(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+	pm := newPartitionManager(
+		context.Background(),
+		store,
+		store.(dbleader.LockStore),
+		"127.0.0.1:9999",
+		"owner-a",
+		resolver,
+		time.Minute,
+		map[string]int{"known-q": 1},
+	)
+	t.Cleanup(pm.close)
+
+	handle, err := pm.getOrLoadPartition(context.Background(), "known-q", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress("127.0.0.2:9999")}
+
+	if _, err := pm.getOrLoadPartition(context.Background(), "known-q", 0); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("expected loaded partition to reject stale ownership, got %v", err)
+	}
+	if !handle.isClosed() {
+		t.Fatal("expected stale partition handle to close")
+	}
+}
+
+func TestBugRepro_PeriodicReconcileConvergesAfterDroppedEvent(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	pm := newPartitionManager(
+		ctx,
+		store,
+		store.(dbleader.LockStore),
+		"127.0.0.1:9999",
+		"owner-a",
+		resolver,
+		time.Minute,
+		map[string]int{"known-q": 1},
+	)
+	t.Cleanup(pm.close)
+
+	handle, err := pm.getOrLoadPartition(context.Background(), "known-q", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress("127.0.0.2:9999")}
+
+	server := &Server{
+		cfg:      Config{ReconcileInterval: 10 * time.Millisecond},
+		mgr:      pm,
+		changeCh: make(chan *membership.ChangedEvent),
+		ctx:      ctx,
+	}
+	done := make(chan struct{})
+	go func() {
+		server.watchMembershipChanges()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if handle.isClosed() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("periodic reconcile did not unload the stale partition")
 }

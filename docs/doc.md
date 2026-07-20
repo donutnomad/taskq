@@ -11,34 +11,43 @@
 
 ```go
 // 单角色
-monitor := membership.NewMonitor(
-    []string{"matching"},
-    store,
-    netip.MustParseAddrPort("10.0.0.1:7235"), // broadcastAddr，所有角色共用
-    5*time.Second,     // pollInterval
-    3*time.Second,     // propagationTime
-    time.Time{},       // joinTime
-    200,               // replicaPoints
-)
+monitor := membership.NewMonitorWithConfig(membership.MonitorConfig{
+    AdvertisedServices: []string{"matching"},
+    WatchedServices:    []string{"matching"},
+    Store:              store,
+    BroadcastAddr:      netip.MustParseAddrPort("10.0.0.1:7235"),
+    PollInterval:       5*time.Second,
+    PropagationTime:    3*time.Second,
+    ReplicaPoints:      200,
+})
 
 // 多角色（共用端口）
-monitor := membership.NewMonitor(
-    []string{"matching", "history"},
-    store,
-    netip.MustParseAddrPort("10.0.0.1:7235"),
-    5*time.Second,
-    3*time.Second,
-    time.Time{},
-    200,
-)
+monitor := membership.NewMonitorWithConfig(membership.MonitorConfig{
+    AdvertisedServices: []string{"matching", "history"},
+    WatchedServices:    []string{"matching", "history"},
+    Store:              store,
+    BroadcastAddr:      netip.MustParseAddrPort("10.0.0.1:7235"),
+    PollInterval:       5*time.Second,
+    PropagationTime:    3*time.Second,
+    ReplicaPoints:      200,
+})
+
+// 独立 Worker 只维护 Matching 路由视图
+observer := membership.NewMonitorWithConfig(membership.MonitorConfig{
+    WatchedServices: []string{"matching"},
+    Store:           store,
+    PollInterval:    5*time.Second,
+    PropagationTime: 3*time.Second,
+    ReplicaPoints:   200,
+})
 ```
 
 ### 行为
 
-- **心跳**：为每个 serviceName 各写一条心跳记录到 MemberStore，端口统一从 `broadcastRPCAddress` 获取
-- **哈希环**：为 `serviceNames` 中的每个角色维护独立的一致性哈希环
+- **心跳**：为每个 `AdvertisedServices` 角色写一条心跳记录到 MemberStore
+- **哈希环**：为每个 `WatchedServices` 角色维护独立的一致性哈希环
 - **Lookup**：`monitor.GetResolver("matching")` 和 `monitor.GetResolver("history")` 返回各自独立的环
-- **Draining**：`SetDraining(true)` 会更新所有 serviceName 的记录
+- **Draining**：`SetDraining(true)` 会更新所有 advertised service 记录
 
 ### 数据库记录示例
 

@@ -21,6 +21,7 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	MatchingService_AddTask_FullMethodName      = "/matching.MatchingService/AddTask"
 	MatchingService_PollTask_FullMethodName     = "/matching.MatchingService/PollTask"
+	MatchingService_PollQueue_FullMethodName    = "/matching.MatchingService/PollQueue"
 	MatchingService_AckTask_FullMethodName      = "/matching.MatchingService/AckTask"
 	MatchingService_NackTask_FullMethodName     = "/matching.MatchingService/NackTask"
 	MatchingService_GetQueueInfo_FullMethodName = "/matching.MatchingService/GetQueueInfo"
@@ -35,6 +36,7 @@ const (
 type MatchingServiceClient interface {
 	AddTask(ctx context.Context, in *AddTaskRequest, opts ...grpc.CallOption) (*AddTaskResponse, error)
 	PollTask(ctx context.Context, in *PollTaskRequest, opts ...grpc.CallOption) (*PollTaskResponse, error)
+	PollQueue(ctx context.Context, in *PollQueueRequest, opts ...grpc.CallOption) (*PollQueueResponse, error)
 	AckTask(ctx context.Context, in *AckTaskRequest, opts ...grpc.CallOption) (*AckTaskResponse, error)
 	NackTask(ctx context.Context, in *NackTaskRequest, opts ...grpc.CallOption) (*NackTaskResponse, error)
 	GetQueueInfo(ctx context.Context, in *GetQueueInfoRequest, opts ...grpc.CallOption) (*GetQueueInfoResponse, error)
@@ -62,6 +64,16 @@ func (c *matchingServiceClient) PollTask(ctx context.Context, in *PollTaskReques
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PollTaskResponse)
 	err := c.cc.Invoke(ctx, MatchingService_PollTask_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *matchingServiceClient) PollQueue(ctx context.Context, in *PollQueueRequest, opts ...grpc.CallOption) (*PollQueueResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PollQueueResponse)
+	err := c.cc.Invoke(ctx, MatchingService_PollQueue_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +119,7 @@ func (c *matchingServiceClient) GetQueueInfo(ctx context.Context, in *GetQueueIn
 type MatchingServiceServer interface {
 	AddTask(context.Context, *AddTaskRequest) (*AddTaskResponse, error)
 	PollTask(context.Context, *PollTaskRequest) (*PollTaskResponse, error)
+	PollQueue(context.Context, *PollQueueRequest) (*PollQueueResponse, error)
 	AckTask(context.Context, *AckTaskRequest) (*AckTaskResponse, error)
 	NackTask(context.Context, *NackTaskRequest) (*NackTaskResponse, error)
 	GetQueueInfo(context.Context, *GetQueueInfoRequest) (*GetQueueInfoResponse, error)
@@ -125,6 +138,9 @@ func (UnimplementedMatchingServiceServer) AddTask(context.Context, *AddTaskReque
 }
 func (UnimplementedMatchingServiceServer) PollTask(context.Context, *PollTaskRequest) (*PollTaskResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PollTask not implemented")
+}
+func (UnimplementedMatchingServiceServer) PollQueue(context.Context, *PollQueueRequest) (*PollQueueResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PollQueue not implemented")
 }
 func (UnimplementedMatchingServiceServer) AckTask(context.Context, *AckTaskRequest) (*AckTaskResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AckTask not implemented")
@@ -188,6 +204,24 @@ func _MatchingService_PollTask_Handler(srv interface{}, ctx context.Context, dec
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(MatchingServiceServer).PollTask(ctx, req.(*PollTaskRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MatchingService_PollQueue_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PollQueueRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).PollQueue(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_PollQueue_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).PollQueue(ctx, req.(*PollQueueRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -260,6 +294,10 @@ var MatchingService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PollTask",
 			Handler:    _MatchingService_PollTask_Handler,
+		},
+		{
+			MethodName: "PollQueue",
+			Handler:    _MatchingService_PollQueue_Handler,
 		},
 		{
 			MethodName: "AckTask",

@@ -1,5 +1,5 @@
 // Package membership 封装了节点成员发现和一致性哈希路由能力。
-// 对外暴露 Monitor 和 ServiceResolver 两个核心接口。
+// 对外暴露 Monitor、ResolverProvider 和 ServiceResolver 接口。
 package membership
 
 import (
@@ -26,12 +26,18 @@ type hostAddress string
 
 func (a hostAddress) GetAddress() string { return string(a) }
 
+// ResolverProvider supplies service-specific routing views.
+type ResolverProvider interface {
+	GetResolver(service string) (ServiceResolver, error)
+}
+
 // Monitor ---- Monitor 接口 ----
 //
 // Monitor 是整个成员管理的顶层接口。
 // 你的每个服务节点启动时调用 Start()，关闭时调用 Stop()。
 // 通过 GetResolver(serviceName) 拿到对应服务的哈希环，再用 Lookup(key) 找负责该 key 的节点。
 type Monitor interface {
+	ResolverProvider
 	// Start 启动成员管理，在节点准备好接受请求后调用
 	Start()
 	// Stop 停止 Monitor
@@ -39,8 +45,6 @@ type Monitor interface {
 	// EvictSelfAt 在指定时间离开（用于滚动发布，让流量提前切走）
 	// 返回值是建议的等待时长，调用方应等待该时长后再退出进程
 	EvictSelfAt(asOf time.Time) (time.Duration, error)
-	// GetResolver 获取某个服务的哈希环查找器
-	GetResolver(service string) (ServiceResolver, error)
 	// WaitUntilInitialized 阻塞直到初始化完成
 	WaitUntilInitialized(context.Context) error
 	// SetDraining 设置本节点是否处于 draining 状态

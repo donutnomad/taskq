@@ -3,6 +3,8 @@ package matching
 import (
 	"context"
 	"net"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // ---- 测试用 mock ----
@@ -66,9 +69,9 @@ func (m *stubMonitor) GetResolver(service string) (membership.ServiceResolver, e
 func (m *stubMonitor) WaitUntilInitialized(context.Context) error { return nil }
 func (m *stubMonitor) SetDraining(bool) error                     { return nil }
 
-func newTestSQLiteStore(t *testing.T) queue.Store {
+func newTestSQLiteStore(t *testing.T) Store {
 	t.Helper()
-	store, err := gormstore.NewSQLite(":memory:", gormstore.Config{AutoMigrate: true})
+	store, err := gormstore.NewSQLite(filepath.Join(t.TempDir(), "taskq.db"), gormstore.Config{AutoMigrate: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +80,7 @@ func newTestSQLiteStore(t *testing.T) queue.Store {
 }
 
 // startTestServer 启动一个测试用的 matching gRPC server，返回监听地址
-func startTestServer(t *testing.T, store queue.Store, resolver *stubResolver, broadcastAddr string, queueConfigs map[string]int) (*Server, string) {
+func startTestServer(t *testing.T, store Store, resolver *stubResolver, broadcastAddr string, queueConfigs map[string]int) (*Server, string) {
 	t.Helper()
 
 	monitor := &stubMonitor{resolver: resolver}
@@ -129,8 +132,6 @@ func TestMatchingServer_AddAndPoll(t *testing.T) {
 	resolver := newStubResolver("127.0.0.1:9999")
 
 	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 4})
-	// 更新 resolver 使其指向真实地址
-	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
 
 	client := newTestClient(t, addr)
 
@@ -164,12 +165,126 @@ func TestMatchingServer_AddAndPoll(t *testing.T) {
 	}
 }
 
+func TestMatchingServer_RoutesTaskByAcceptedKey(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 1})
+	client := newTestClient(t, addr)
+	ctx := context.Background()
+
+	if _, err := client.AddTask(ctx, &AddTaskRequest{
+		QueueName: "test-q", PartitionId: 0, Data: []byte("worker-a-task"), RoutingKey: "worker-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ineligible, err := client.PollTask(ctx, &PollTaskRequest{
+		QueueName: "test-q", PartitionId: 0, AcceptedRoutingKeys: []string{"worker-b"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ineligible.Empty {
+		t.Fatalf("worker-b received routed task: %+v", ineligible)
+	}
+
+	eligible, err := client.PollTask(ctx, &PollTaskRequest{
+		QueueName: "test-q", PartitionId: 0, AcceptedRoutingKeys: []string{"worker-a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eligible.Empty || string(eligible.Data) != "worker-a-task" || eligible.RoutingKey != "worker-a" {
+		t.Fatalf("worker-a response = %+v", eligible)
+	}
+}
+
+func TestMatchingServer_RoutingDeadlineFallsBackInPlace(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 1})
+	client := newTestClient(t, addr)
+	ctx := context.Background()
+	deadline := time.Now().Add(250 * time.Millisecond)
+	if _, err := client.AddTask(ctx, &AddTaskRequest{
+		QueueName: "test-q", PartitionId: 0, Data: []byte("sticky-task"),
+		RoutingKey: "sticky-worker", RoutingDeadline: timestamppb.New(deadline),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := client.PollTask(ctx, &PollTaskRequest{
+		QueueName: "test-q", PartitionId: 0, AcceptedRoutingKeys: []string{"other-worker"},
+	}); err != nil {
+		t.Fatal(err)
+	} else if !resp.Empty {
+		t.Fatalf("task fell back before deadline: %+v", resp)
+	}
+	time.Sleep(time.Until(deadline) + 10*time.Millisecond)
+	resp, err := client.PollTask(ctx, &PollTaskRequest{
+		QueueName: "test-q", PartitionId: 0, AcceptedRoutingKeys: []string{"other-worker"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Empty || string(resp.Data) != "sticky-task" || !resp.RoutingFallback || resp.RoutingDeadline == nil {
+		t.Fatalf("fallback response = %+v", resp)
+	}
+	if delta := resp.RoutingDeadline.AsTime().Sub(deadline); delta < -time.Millisecond || delta > time.Millisecond {
+		t.Fatalf("routing deadline delta = %v", delta)
+	}
+}
+
+func TestMatchingServer_RejectsInvalidRoutingKeys(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 1})
+	client := newTestClient(t, addr)
+	tooLong := strings.Repeat("界", queue.MaxRoutingKeyBytes/len("界")+1)
+
+	t.Run("add", func(t *testing.T) {
+		_, err := client.AddTask(context.Background(), &AddTaskRequest{
+			QueueName: "test-q", PartitionId: 0, Data: []byte("task"), RoutingKey: tooLong,
+		})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("status = %v, error = %v", status.Code(err), err)
+		}
+	})
+
+	t.Run("poll", func(t *testing.T) {
+		_, err := client.PollTask(context.Background(), &PollTaskRequest{
+			QueueName: "test-q", PartitionId: 0, AcceptedRoutingKeys: []string{tooLong},
+		})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("status = %v, error = %v", status.Code(err), err)
+		}
+	})
+
+	t.Run("deadline without key", func(t *testing.T) {
+		_, err := client.AddTask(context.Background(), &AddTaskRequest{
+			QueueName: "test-q", PartitionId: 0, Data: []byte("task"),
+			RoutingDeadline: timestamppb.New(time.Now().Add(time.Second)),
+		})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("status = %v, error = %v", status.Code(err), err)
+		}
+	})
+
+	t.Run("invalid timestamp", func(t *testing.T) {
+		_, err := client.AddTask(context.Background(), &AddTaskRequest{
+			QueueName: "test-q", PartitionId: 0, Data: []byte("task"), RoutingKey: "worker",
+			RoutingDeadline: &timestamppb.Timestamp{Seconds: 253402300800},
+		})
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("status = %v, error = %v", status.Code(err), err)
+		}
+	})
+}
+
 func TestMatchingServer_PollEmpty(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	resolver := newStubResolver("127.0.0.1:9999")
 
 	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 4})
-	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
 
 	client := newTestClient(t, addr)
 
@@ -190,7 +305,6 @@ func TestMatchingServer_AckTask(t *testing.T) {
 	resolver := newStubResolver("127.0.0.1:9999")
 
 	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 4})
-	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
 
 	client := newTestClient(t, addr)
 	ctx := context.Background()
@@ -213,7 +327,6 @@ func TestMatchingServer_NackRedelivery(t *testing.T) {
 	resolver := newStubResolver("127.0.0.1:9999")
 
 	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 4})
-	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
 
 	client := newTestClient(t, addr)
 	ctx := context.Background()
@@ -249,7 +362,6 @@ func TestMatchingServer_LongPoll(t *testing.T) {
 	resolver := newStubResolver("127.0.0.1:9999")
 
 	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 4})
-	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
 
 	client := newTestClient(t, addr)
 	ctx := context.Background()
@@ -293,7 +405,6 @@ func TestMatchingServer_StopUnblocksInFlightLongPoll(t *testing.T) {
 	resolver := newStubResolver("127.0.0.1:9999")
 
 	srv, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 1})
-	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
 
 	client := newTestClient(t, addr)
 
@@ -338,7 +449,6 @@ func TestMatchingServer_AckTaskRejectsTokenPartitionMismatch(t *testing.T) {
 	resolver := newStubResolver("127.0.0.1:9999")
 
 	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 2})
-	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
 
 	client := newTestClient(t, addr)
 	ctx := context.Background()
@@ -376,7 +486,6 @@ func TestMatchingServer_NackTaskRejectsTokenPartitionMismatch(t *testing.T) {
 	resolver := newStubResolver("127.0.0.1:9999")
 
 	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 2})
-	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress(addr)}
 
 	client := newTestClient(t, addr)
 	ctx := context.Background()

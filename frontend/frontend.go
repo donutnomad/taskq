@@ -19,20 +19,25 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const (
-	defaultPollTimeout  = 30 * time.Second
-	defaultMaxRetries   = 3
-	defaultRetryBackoff = 50 * time.Millisecond
-	defaultServiceName  = "matching"
+	defaultPollTimeout   = 30 * time.Second
+	defaultMaxRetries    = 3
+	defaultRetryBackoff  = 50 * time.Millisecond
+	defaultServiceName   = "matching"
+	pollWinnerDrainGrace = 2 * time.Millisecond
 )
 
 var frontendListenerSeq atomic.Int64
 
 // Config 前端路由配置
 type Config struct {
+	// ResolverProvider supplies the matching service routing view.
+	ResolverProvider membership.ResolverProvider
 	// Monitor membership 监控器
+	// Deprecated: use ResolverProvider. Existing configurations remain supported.
 	Monitor membership.Monitor
 	// ServiceName 服务名称，用于 GetResolver，默认 "matching"
 	ServiceName string
@@ -43,6 +48,10 @@ type Config struct {
 	// PollTimeout Dequeue 长轮询超时，默认 30s
 	PollTimeout time.Duration
 }
+
+type EnqueueOptions = queue.EnqueueOptions
+type PollOptions = queue.PollOptions
+type Lease = queue.Lease
 
 // Frontend 是分布式队列的客户端路由器
 type Frontend struct {
@@ -59,10 +68,23 @@ type Frontend struct {
 	wg            sync.WaitGroup
 }
 
-// New 创建并启动 Frontend 路由器
+// New creates a Frontend with an unbounded initialization context.
 func New(cfg Config) (*Frontend, error) {
-	if cfg.Monitor == nil {
-		return nil, fmt.Errorf("frontend: Monitor is required")
+	return NewWithContext(context.Background(), cfg)
+}
+
+// NewWithContext uses ctx for initial queue discovery. The returned Frontend
+// owns an independent lifecycle that ends when Close is called.
+func NewWithContext(ctx context.Context, cfg Config) (*Frontend, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("frontend: initialization context is nil")
+	}
+	resolverProvider := cfg.ResolverProvider
+	if resolverProvider == nil {
+		resolverProvider = cfg.Monitor
+	}
+	if resolverProvider == nil {
+		return nil, fmt.Errorf("frontend: ResolverProvider or Monitor is required")
 	}
 	if cfg.QueueName == "" {
 		return nil, fmt.Errorf("frontend: QueueName is required")
@@ -74,18 +96,18 @@ func New(cfg Config) (*Frontend, error) {
 		cfg.PollTimeout = defaultPollTimeout
 	}
 
-	resolver, err := cfg.Monitor.GetResolver(cfg.ServiceName)
+	resolver, err := resolverProvider.GetResolver(cfg.ServiceName)
 	if err != nil {
 		return nil, fmt.Errorf("frontend: get resolver: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	lifecycleCtx, cancel := context.WithCancel(context.Background())
 	f := &Frontend{
 		cfg:          cfg,
 		resolver:     resolver,
 		pool:         newConnPool(cfg.DialOpts),
 		listenerName: fmt.Sprintf("frontend-%d", frontendListenerSeq.Add(1)),
-		ctx:          ctx,
+		ctx:          lifecycleCtx,
 		cancel:       cancel,
 	}
 
@@ -94,6 +116,9 @@ func New(cfg Config) (*Frontend, error) {
 	if err != nil {
 		cancel()
 		f.pool.close()
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("frontend: initialize queue %q: %w", cfg.QueueName, ctx.Err())
+		}
 		return nil, err
 	}
 	f.numPartitions = numPartitions
@@ -112,6 +137,14 @@ func New(cfg Config) (*Frontend, error) {
 
 // Enqueue 写入任务，round-robin 选分区后路由到对应 matching 节点
 func (f *Frontend) Enqueue(ctx context.Context, data []byte) error {
+	return f.EnqueueWithOptions(ctx, data, EnqueueOptions{})
+}
+
+// EnqueueWithOptions writes a task with delivery routing metadata.
+func (f *Frontend) EnqueueWithOptions(ctx context.Context, data []byte, opts EnqueueOptions) error {
+	if err := opts.Validate(); err != nil {
+		return err
+	}
 	partID := int(f.enqueueIdx.Add(1)) % f.numPartitions
 
 	for attempt := range defaultMaxRetries {
@@ -126,11 +159,16 @@ func (f *Frontend) Enqueue(ctx context.Context, data []byte) error {
 			return fmt.Errorf("frontend: enqueue: %w", err)
 		}
 
-		_, err = client.AddTask(ctx, &matching.AddTaskRequest{
+		request := &matching.AddTaskRequest{
 			QueueName:   f.cfg.QueueName,
 			PartitionId: int32(partID),
 			Data:        data,
-		})
+			RoutingKey:  opts.RoutingKey,
+		}
+		if !opts.RoutingDeadline.IsZero() {
+			request.RoutingDeadline = timestamppb.New(opts.RoutingDeadline)
+		}
+		_, err = client.AddTask(ctx, request)
 		if err == nil {
 			return nil
 		}
@@ -148,101 +186,350 @@ func (f *Frontend) Enqueue(ctx context.Context, data []byte) error {
 
 // Dequeue 消费任务：快速扫描所有分区 → 长轮询
 func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
+	lease, err := f.DequeueWithOptions(ctx, PollOptions{})
+	if err != nil {
+		return nil, "", err
+	}
+	return lease.Data, lease.Token, nil
+}
+
+// DequeueWithOptions consumes the first task visible to the accepted routing keys.
+func (f *Frontend) DequeueWithOptions(ctx context.Context, opts PollOptions) (Lease, error) {
+	normalized, err := opts.Normalize()
+	if err != nil {
+		return Lease{}, err
+	}
+	opts = normalized
 	startIdx := int(f.pollIdx.Add(1)) % f.numPartitions
-	var firstErr error
-	healthyResponses := 0
+	groups, resolutionErrors := f.resolvePollGroups(startIdx)
+	if len(groups) == 0 {
+		if len(resolutionErrors) > 0 {
+			return Lease{}, errors.Join(resolutionErrors...)
+		}
+		return Lease{}, ErrNoTask
+	}
+	ownerErrors := make([]error, len(groups))
 
-	// 阶段 1：快速扫描，非阻塞尝试所有分区
-	for i := range f.numPartitions {
-		pid := (startIdx + i) % f.numPartitions
-
-		client, err := f.getPartitionClient(f.cfg.QueueName, pid)
+	for i, group := range groups {
+		lease, ok, err := f.pollOwner(ctx, group, 0, opts)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("frontend: dequeue partition %d: %w", pid, err)
-			}
+			ownerErrors[i] = err
 			continue
 		}
-
-		resp, err := client.PollTask(ctx, &matching.PollTaskRequest{
-			QueueName:     f.cfg.QueueName,
-			PartitionId:   int32(pid),
-			PollTimeoutMs: 0, // 非阻塞
-		})
-		if err != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("frontend: dequeue partition %d: %w", pid, err)
-			}
-			continue
-		}
-		healthyResponses++
-		if !resp.Empty {
-			return resp.Data, resp.Token, nil
+		ownerErrors[i] = nil
+		if ok {
+			return lease, nil
 		}
 	}
-	if healthyResponses == 0 && firstErr != nil {
-		return nil, "", firstErr
-	}
 
-	// 阶段 2：并发长轮询所有分区，任一分区返回任务即取消其余
-	type pollResult struct {
-		data  []byte
-		token string
-		err   error
-	}
 	pollCtx, pollCancel := context.WithTimeout(ctx, f.cfg.PollTimeout+5*time.Second)
 	defer pollCancel()
 
-	resultCh := make(chan pollResult, f.numPartitions)
-	for i := range f.numPartitions {
-		pid := (startIdx + i) % f.numPartitions
+	resultCh := make(chan ownerPollResult, len(groups))
+	for i, group := range groups {
 		go func() {
-			client, err := f.getPartitionClient(f.cfg.QueueName, pid)
-			if err != nil {
-				resultCh <- pollResult{err: fmt.Errorf("frontend: dequeue partition %d: %w", pid, err)}
-				return
-			}
-			resp, err := client.PollTask(pollCtx, &matching.PollTaskRequest{
-				QueueName:     f.cfg.QueueName,
-				PartitionId:   int32(pid),
-				PollTimeoutMs: f.cfg.PollTimeout.Milliseconds(),
-			})
-			if err != nil {
-				resultCh <- pollResult{err: fmt.Errorf("frontend: dequeue partition %d: %w", pid, err)}
-				return
-			}
-			if resp.Empty {
-				resultCh <- pollResult{err: ErrNoTask}
-				return
-			}
-			resultCh <- pollResult{data: resp.Data, token: resp.Token}
+			lease, ok, err := f.pollOwner(pollCtx, group, f.cfg.PollTimeout, opts)
+			resultCh <- ownerPollResult{index: i, group: group, lease: lease, found: ok, err: err}
 		}()
 	}
 
-	firstErr = nil
-	sawEmpty := false
-	for range f.numPartitions {
+	for i := range groups {
 		r := <-resultCh
-		if r.err == nil {
-			pollCancel()
-			return r.data, r.token, nil
+		ownerErrors[r.index] = r.err
+		if r.err == nil && r.found {
+			losers := make([]ownerPollResult, 0, len(groups)-1)
+			for _, other := range drainPollResults(resultCh, len(groups)-i-1, pollCancel) {
+				if other.err == nil && other.found {
+					losers = append(losers, other)
+				}
+			}
+			if cleanupErr := f.nackOwnerPollResults(losers); cleanupErr != nil {
+				if winnerErr := f.nackOwnerPollResults([]ownerPollResult{r}); winnerErr != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("return winner: %w", winnerErr))
+				}
+				return Lease{}, cleanupErr
+			}
+			return r.lease, nil
 		}
-		if errors.Is(r.err, ErrNoTask) {
-			sawEmpty = true
+	}
+	if ctx.Err() != nil {
+		return Lease{}, fmt.Errorf("frontend: dequeue: %w", ctx.Err())
+	}
+	allErrors := append(append([]error(nil), resolutionErrors...), ownerErrors...)
+	if err := errors.Join(allErrors...); err != nil {
+		return Lease{}, err
+	}
+	return Lease{}, ErrNoTask
+}
+
+type ownerPollGroup struct {
+	address      string
+	partitionIDs []int32
+}
+
+type ownerPollResult struct {
+	index int
+	group ownerPollGroup
+	lease Lease
+	found bool
+	err   error
+}
+
+func (f *Frontend) resolvePollGroups(startIdx int) ([]ownerPollGroup, []error) {
+	groupIndexes := make(map[string]int)
+	groups := make([]ownerPollGroup, 0)
+	var errs []error
+	for i := range f.numPartitions {
+		partitionID := (startIdx + i) % f.numPartitions
+		host, err := f.resolver.Lookup(fmt.Sprintf("%s/%d", f.cfg.QueueName, partitionID))
+		if err != nil {
+			errs = append(errs, fmt.Errorf("frontend: dequeue partition %d: %w", partitionID, err))
 			continue
 		}
-		if firstErr == nil {
-			firstErr = r.err
+		address := host.GetAddress()
+		index, ok := groupIndexes[address]
+		if !ok {
+			index = len(groups)
+			groupIndexes[address] = index
+			groups = append(groups, ownerPollGroup{address: address})
+		}
+		groups[index].partitionIDs = append(groups[index].partitionIDs, int32(partitionID))
+	}
+	return groups, errs
+}
+
+func (f *Frontend) pollOwner(ctx context.Context, group ownerPollGroup, timeout time.Duration, opts PollOptions) (Lease, bool, error) {
+	client, err := f.pool.getClient(group.address)
+	if err != nil {
+		return Lease{}, false, fmt.Errorf("frontend: dequeue owner %q partitions %v: %w", group.address, group.partitionIDs, err)
+	}
+	response, err := client.PollQueue(ctx, &matching.PollQueueRequest{
+		QueueName:           f.cfg.QueueName,
+		PartitionIds:        group.partitionIDs,
+		PollTimeoutMs:       timeout.Milliseconds(),
+		AcceptedRoutingKeys: opts.AcceptedRoutingKeys,
+	})
+	if status.Code(err) == codes.Unimplemented {
+		return f.pollPartitions(ctx, client, group.partitionIDs, timeout, opts)
+	}
+	if err != nil {
+		return Lease{}, false, fmt.Errorf("frontend: dequeue owner %q partitions %v: %w", group.address, group.partitionIDs, err)
+	}
+	if response.Empty {
+		return Lease{}, false, nil
+	}
+	if !containsPartition(group.partitionIDs, response.PartitionId) {
+		return Lease{}, false, fmt.Errorf("frontend: owner %q returned unrequested partition %d", group.address, response.PartitionId)
+	}
+	lease, err := leaseFromPollQueueResponse(response)
+	return lease, err == nil, err
+}
+
+func (f *Frontend) pollPartitions(
+	ctx context.Context,
+	client matching.MatchingServiceClient,
+	partitionIDs []int32,
+	timeout time.Duration,
+	opts PollOptions,
+) (Lease, bool, error) {
+	if timeout <= 0 {
+		var errs []error
+		for _, partitionID := range partitionIDs {
+			lease, found, err := pollPartition(ctx, client, f.cfg.QueueName, partitionID, 0, opts)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if found {
+				return lease, true, nil
+			}
+		}
+		if len(errs) > 0 {
+			return Lease{}, false, errors.Join(errs...)
+		}
+		return Lease{}, false, nil
+	}
+
+	pollCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan ownerPollResult, len(partitionIDs))
+	for _, partitionID := range partitionIDs {
+		go func() {
+			lease, found, err := pollPartition(pollCtx, client, f.cfg.QueueName, partitionID, timeout, opts)
+			results <- ownerPollResult{lease: lease, found: found, err: err}
+		}()
+	}
+	var errs []error
+	for i := range partitionIDs {
+		result := <-results
+		if result.err == nil && result.found {
+			losers := make([]Lease, 0, len(partitionIDs)-1)
+			for _, other := range drainPollResults(results, len(partitionIDs)-i-1, cancel) {
+				if other.err == nil && other.found {
+					losers = append(losers, other.lease)
+				}
+			}
+			if cleanupErr := f.nackPollLeases(client, losers); cleanupErr != nil {
+				if winnerErr := f.nackPollLeases(client, []Lease{result.lease}); winnerErr != nil {
+					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("return winner: %w", winnerErr))
+				}
+				return Lease{}, false, cleanupErr
+			}
+			return result.lease, true, nil
+		}
+		if result.err != nil {
+			errs = append(errs, result.err)
 		}
 	}
-	// 如果调用方 context 已取消，传播取消错误
 	if ctx.Err() != nil {
-		return nil, "", fmt.Errorf("frontend: dequeue: %w", ctx.Err())
+		return Lease{}, false, ctx.Err()
 	}
-	if !sawEmpty && firstErr != nil {
-		return nil, "", firstErr
+	if len(errs) > 0 {
+		return Lease{}, false, errors.Join(errs...)
 	}
-	return nil, "", ErrNoTask
+	return Lease{}, false, nil
+}
+
+func drainPollResults(results <-chan ownerPollResult, remaining int, cancel context.CancelFunc) []ownerPollResult {
+	drained := make([]ownerPollResult, 0, remaining)
+	grace := time.NewTimer(pollWinnerDrainGrace)
+drainReady:
+	for remaining > 0 {
+		select {
+		case result := <-results:
+			drained = append(drained, result)
+			remaining--
+		case <-grace.C:
+			break drainReady
+		}
+	}
+	if !grace.Stop() {
+		select {
+		case <-grace.C:
+		default:
+		}
+	}
+	cancel()
+	for range remaining {
+		drained = append(drained, <-results)
+	}
+	return drained
+}
+
+func (f *Frontend) nackOwnerPollResults(results []ownerPollResult) error {
+	if len(results) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var errs []error
+	for _, result := range results {
+		client, err := f.pool.getClient(result.group.address)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("frontend: connect cleanup owner %q: %w", result.group.address, err))
+			continue
+		}
+		if err := nackPollLease(ctx, client, f.cfg.QueueName, result.lease); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (f *Frontend) nackPollLeases(client matching.MatchingServiceClient, leases []Lease) error {
+	if len(leases) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var errs []error
+	for _, lease := range leases {
+		if err := nackPollLease(ctx, client, f.cfg.QueueName, lease); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func nackPollLease(ctx context.Context, client matching.MatchingServiceClient, queueName string, lease Lease) error {
+	partitionID, _, err := queue.ParseToken(lease.Token)
+	if err != nil {
+		return fmt.Errorf("frontend: parse cleanup token: %w", err)
+	}
+	_, err = client.NackTask(ctx, &matching.NackTaskRequest{
+		QueueName: queueName, PartitionId: int32(partitionID), Token: lease.Token,
+	})
+	if err != nil {
+		return fmt.Errorf("frontend: return poll loser partition %d: %w", partitionID, err)
+	}
+	return nil
+}
+
+func pollPartition(
+	ctx context.Context,
+	client matching.MatchingServiceClient,
+	queueName string,
+	partitionID int32,
+	timeout time.Duration,
+	opts PollOptions,
+) (Lease, bool, error) {
+	response, err := client.PollTask(ctx, &matching.PollTaskRequest{
+		QueueName:           queueName,
+		PartitionId:         partitionID,
+		PollTimeoutMs:       timeout.Milliseconds(),
+		AcceptedRoutingKeys: opts.AcceptedRoutingKeys,
+	})
+	if err != nil {
+		return Lease{}, false, fmt.Errorf("frontend: dequeue partition %d: %w", partitionID, err)
+	}
+	if response.Empty {
+		return Lease{}, false, nil
+	}
+	lease, err := leaseFromPollResponse(response)
+	return lease, err == nil, err
+}
+
+func containsPartition(partitionIDs []int32, partitionID int32) bool {
+	for _, candidate := range partitionIDs {
+		if candidate == partitionID {
+			return true
+		}
+	}
+	return false
+}
+
+func leaseFromPollResponse(response *matching.PollTaskResponse) (Lease, error) {
+	lease := Lease{
+		Data:            response.Data,
+		Token:           response.Token,
+		RoutingKey:      response.RoutingKey,
+		RoutingFallback: response.RoutingFallback,
+	}
+	if response.RoutingDeadline == nil {
+		return lease, nil
+	}
+	if err := response.RoutingDeadline.CheckValid(); err != nil {
+		return Lease{}, fmt.Errorf("frontend: invalid routing deadline: %w", err)
+	}
+	lease.RoutingDeadline = response.RoutingDeadline.AsTime()
+	return lease, nil
+}
+
+func leaseFromPollQueueResponse(response *matching.PollQueueResponse) (Lease, error) {
+	lease := Lease{
+		Data:            response.Data,
+		Token:           response.Token,
+		RoutingKey:      response.RoutingKey,
+		RoutingFallback: response.RoutingFallback,
+	}
+	if response.RoutingDeadline == nil {
+		return lease, nil
+	}
+	if err := response.RoutingDeadline.CheckValid(); err != nil {
+		return Lease{}, fmt.Errorf("frontend: invalid routing deadline: %w", err)
+	}
+	lease.RoutingDeadline = response.RoutingDeadline.AsTime()
+	return lease, nil
 }
 
 // Ack 确认消费完成

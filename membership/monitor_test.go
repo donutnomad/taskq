@@ -2,6 +2,7 @@ package membership
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -15,6 +16,15 @@ type stubStore struct {
 	mu      sync.Mutex
 	members []MemberRecord
 	upserts []UpsertMemberRequest
+}
+
+type upsertErrorStore struct {
+	stubStore
+	err error
+}
+
+func (s *upsertErrorStore) UpsertMember(context.Context, UpsertMemberRequest) error {
+	return s.err
 }
 
 func (s *stubStore) UpsertMember(_ context.Context, req UpsertMemberRequest) error {
@@ -89,6 +99,31 @@ func TestMonitorStartStop(t *testing.T) {
 		t.Fatal("expected at least 1 member")
 	}
 
+	m.Stop()
+}
+
+func TestMonitorConcurrentStopIsIdempotent(t *testing.T) {
+	store := &stubStore{}
+	m := NewMonitor(
+		[]string{"matching"},
+		store,
+		netip.MustParseAddrPort("127.0.0.1:7233"),
+		50*time.Millisecond,
+		time.Second,
+		time.Time{},
+		200,
+	)
+	m.Start()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.WaitUntilInitialized(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(m.Stop)
+	wg.Go(m.Stop)
+	wg.Wait()
 	m.Stop()
 }
 
@@ -206,6 +241,76 @@ func TestEvictSelfAtReturnValue(t *testing.T) {
 	if waitDuration > maxExpected {
 		t.Fatalf("EvictSelfAt returned %v, expected at most ~%v (double-counting propagationTime)", waitDuration, maxExpected)
 	}
+	store.mu.Lock()
+	last := store.upserts[len(store.upserts)-1]
+	store.mu.Unlock()
+	if last.StopAt != evictAt.Unix() {
+		t.Fatalf("stop time = %d, want %d", last.StopAt, evictAt.Unix())
+	}
+	if last.Draining {
+		t.Fatal("future eviction marked the member draining immediately")
+	}
+	if err := m.SetDraining(false); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	last = store.upserts[len(store.upserts)-1]
+	store.mu.Unlock()
+	if last.StopAt != 0 {
+		t.Fatalf("stop time after resume = %d, want 0", last.StopAt)
+	}
+}
+
+func TestEvictSelfAtPastDeadlineDrainsImmediately(t *testing.T) {
+	store := &stubStore{}
+	m := NewMonitor(
+		[]string{"matching"},
+		store,
+		netip.MustParseAddrPort("10.0.0.1:7235"),
+		100*time.Millisecond,
+		time.Second,
+		time.Time{},
+		200,
+	)
+	m.Start()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.WaitUntilInitialized(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	waitDuration, err := m.EvictSelfAt(time.Now().Add(-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if waitDuration != time.Second {
+		t.Fatalf("wait duration = %v, want %v", waitDuration, time.Second)
+	}
+	store.mu.Lock()
+	last := store.upserts[len(store.upserts)-1]
+	store.mu.Unlock()
+	if !last.Draining {
+		t.Fatal("past eviction deadline did not persist draining state")
+	}
+}
+
+func TestEvictSelfAtReturnsScheduledHeartbeatFailure(t *testing.T) {
+	upsertErr := errors.New("upsert failed")
+	store := &upsertErrorStore{err: upsertErr}
+	m := NewMonitor(
+		[]string{"matching"},
+		store,
+		netip.MustParseAddrPort("10.0.0.1:7235"),
+		100*time.Millisecond,
+		time.Second,
+		time.Time{},
+		200,
+	)
+
+	if _, err := m.EvictSelfAt(time.Now().Add(time.Hour)); !errors.Is(err, upsertErr) {
+		t.Fatalf("eviction error = %v, want %v", err, upsertErr)
+	}
 }
 
 func TestMonitorHeartbeat(t *testing.T) {
@@ -300,6 +405,84 @@ func TestMonitorMultiServiceNames(t *testing.T) {
 	m.Stop()
 }
 
+func TestMonitorObserverWatchesServiceWithoutAdvertisingIt(t *testing.T) {
+	store := &stubStore{members: []MemberRecord{
+		{RPCAddress: net.ParseIP("10.0.0.1"), RPCPort: 7235, ServiceName: "matching"},
+	}}
+	monitor := NewMonitorWithConfig(MonitorConfig{
+		WatchedServices: []string{"matching"},
+		Store:           store,
+		PollInterval:    50 * time.Millisecond,
+		PropagationTime: time.Second,
+		ReplicaPoints:   200,
+	})
+	monitor.Start()
+	defer monitor.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := monitor.WaitUntilInitialized(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := monitor.GetResolver("matching")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := resolver.Lookup("workflow-tasks/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.GetAddress() != "10.0.0.1:7235" {
+		t.Fatalf("matching host = %q", host.GetAddress())
+	}
+
+	store.mu.Lock()
+	upsertCount := len(store.upserts)
+	store.mu.Unlock()
+	if upsertCount != 0 {
+		t.Fatalf("observer heartbeat upserts = %d, want 0", upsertCount)
+	}
+}
+
+func TestMonitorCanAdvertiseAndWatchSameService(t *testing.T) {
+	store := &stubStore{}
+	monitor := NewMonitorWithConfig(MonitorConfig{
+		AdvertisedServices: []string{"matching"},
+		WatchedServices:    []string{"matching"},
+		Store:              store,
+		BroadcastAddr:      netip.MustParseAddrPort("10.0.0.1:7235"),
+		PollInterval:       50 * time.Millisecond,
+		PropagationTime:    time.Second,
+		ReplicaPoints:      200,
+	})
+	monitor.Start()
+	defer monitor.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := monitor.WaitUntilInitialized(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := monitor.GetResolver("matching")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := resolver.Lookup("workflow-tasks/0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.GetAddress() != "10.0.0.1:7235" {
+		t.Fatalf("matching host = %q", host.GetAddress())
+	}
+
+	store.mu.Lock()
+	upserts := append([]UpsertMemberRequest(nil), store.upserts...)
+	store.mu.Unlock()
+	if len(upserts) != 1 || upserts[0].ServiceName != "matching" {
+		t.Fatalf("heartbeat upserts = %+v", upserts)
+	}
+}
+
 func TestMonitorBuildUpsertRequestPreservesFutureJoinTime(t *testing.T) {
 	store := &stubStore{}
 	joinAt := time.Now().Add(20 * time.Second).Truncate(time.Second)
@@ -317,5 +500,39 @@ func TestMonitorBuildUpsertRequestPreservesFutureJoinTime(t *testing.T) {
 	req := m.buildUpsertRequest("matching")
 	if req.StartAt != joinAt.Unix() {
 		t.Fatalf("expected future join time %d to be preserved, got %d", joinAt.Unix(), req.StartAt)
+	}
+}
+
+func TestMonitorFiltersMembersOutsideSchedulingWindow(t *testing.T) {
+	now := time.Now()
+	store := &stubStore{members: []MemberRecord{
+		{RPCAddress: net.ParseIP("10.0.0.1"), RPCPort: 7235, ServiceName: "matching"},
+		{RPCAddress: net.ParseIP("10.0.0.2"), RPCPort: 7235, ServiceName: "matching", StartAt: now.Add(time.Hour).Unix()},
+		{RPCAddress: net.ParseIP("10.0.0.3"), RPCPort: 7235, ServiceName: "matching", StopAt: now.Add(-time.Hour).Unix()},
+	}}
+	m := NewMonitor(
+		[]string{"matching"},
+		store,
+		netip.MustParseAddrPort("10.0.0.1:7235"),
+		100*time.Millisecond,
+		time.Second,
+		time.Time{},
+		200,
+	)
+	m.Start()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.WaitUntilInitialized(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop()
+
+	resolver, err := m.GetResolver("matching")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observable := resolver.(interface{ MemberCount() int })
+	if observable.MemberCount() != 1 {
+		t.Fatalf("member count = %d, want 1 active member", observable.MemberCount())
 	}
 }

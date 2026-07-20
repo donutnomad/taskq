@@ -15,23 +15,27 @@ import (
 )
 
 const (
-	defaultLockTable   = "taskq_partition_lock"
-	defaultMemberTable = "taskq_partition_lock_members"
+	defaultLockTable       = "taskq_partition_lock"
+	defaultMemberTable     = "taskq_partition_lock_members"
+	defaultMembershipTable = "taskq_membership_members"
+	visibilityResetBatch   = 500
 )
 
 // Config controls Store initialization. AutoMigrate is explicit so production
 // callers can own schema rollout while tests and examples can opt in.
 type Config struct {
-	AutoMigrate bool
-	LockTable   string
-	MemberTable string
+	AutoMigrate     bool
+	LockTable       string
+	MemberTable     string
+	MembershipTable string
 }
 
 // Store is a GORM-backed implementation of queue.Store and dbleader.LockStore.
 type Store struct {
-	db          *gorm.DB
-	lockTable   string
-	memberTable string
+	db              *gorm.DB
+	lockTable       string
+	memberTable     string
+	membershipTable string
 }
 
 var _ queue.Store = (*Store)(nil)
@@ -42,15 +46,19 @@ func New(db *gorm.DB, cfg Config) (*Store, error) {
 		return nil, fmt.Errorf("gormstore: db is required")
 	}
 	s := &Store{
-		db:          db,
-		lockTable:   cfg.LockTable,
-		memberTable: cfg.MemberTable,
+		db:              db,
+		lockTable:       cfg.LockTable,
+		memberTable:     cfg.MemberTable,
+		membershipTable: cfg.MembershipTable,
 	}
 	if s.lockTable == "" {
 		s.lockTable = defaultLockTable
 	}
 	if s.memberTable == "" {
 		s.memberTable = defaultMemberTable
+	}
+	if s.membershipTable == "" {
+		s.membershipTable = defaultMembershipTable
 	}
 	if cfg.AutoMigrate {
 		if err := s.AutoMigrate(context.Background()); err != nil {
@@ -121,7 +129,10 @@ func (s *Store) AutoMigrate(ctx context.Context) error {
 	if err := db.Table(s.lockTable).AutoMigrate(&lockRow{}); err != nil {
 		return err
 	}
-	return db.Table(s.memberTable).AutoMigrate(&memberRow{})
+	if err := db.Table(s.memberTable).AutoMigrate(&memberRow{}); err != nil {
+		return err
+	}
+	return db.Table(s.membershipTable).AutoMigrate(&membershipMemberRow{})
 }
 
 type queueInfoRow struct {
@@ -135,12 +146,14 @@ type queueInfoRow struct {
 func (queueInfoRow) TableName() string { return "queue_info" }
 
 type taskRow struct {
-	QueueName    string     `gorm:"column:queue_name;primaryKey;size:191"`
-	PartitionID  int        `gorm:"column:partition_id;primaryKey"`
-	TaskID       int64      `gorm:"column:task_id;primaryKey"`
-	Data         []byte     `gorm:"column:data;not null"`
-	CreatedAt    time.Time  `gorm:"column:created_at;not null"`
-	DispatchedAt *time.Time `gorm:"column:dispatched_at;index:idx_tasks_dispatch"`
+	QueueName       string     `gorm:"column:queue_name;primaryKey;size:191;index:idx_tasks_visibility,priority:1;index:idx_tasks_routing_deadline,priority:1"`
+	PartitionID     int        `gorm:"column:partition_id;primaryKey;index:idx_tasks_visibility,priority:2;index:idx_tasks_routing_deadline,priority:2"`
+	TaskID          int64      `gorm:"column:task_id;primaryKey;index:idx_tasks_visibility,priority:5;index:idx_tasks_routing_deadline,priority:5"`
+	RoutingKey      string     `gorm:"column:routing_key;not null;default:'';size:191;index:idx_tasks_visibility,priority:4"`
+	RoutingDeadline *time.Time `gorm:"column:routing_deadline;index:idx_tasks_routing_deadline,priority:4"`
+	Data            []byte     `gorm:"column:data;not null"`
+	CreatedAt       time.Time  `gorm:"column:created_at;not null"`
+	DispatchedAt    *time.Time `gorm:"column:dispatched_at;index:idx_tasks_visibility,priority:3;index:idx_tasks_routing_deadline,priority:3"`
 }
 
 func (taskRow) TableName() string { return "tasks" }
@@ -179,24 +192,43 @@ func toQueueInfo(row queueInfoRow) *queue.QueueInfo {
 
 func fromTask(row *queue.TaskRow) taskRow {
 	return taskRow{
-		QueueName:    row.QueueName,
-		PartitionID:  row.PartitionID,
-		TaskID:       row.TaskID,
-		Data:         row.Data,
-		CreatedAt:    row.CreatedAt,
-		DispatchedAt: row.DispatchedAt,
+		QueueName:       row.QueueName,
+		PartitionID:     row.PartitionID,
+		TaskID:          row.TaskID,
+		RoutingKey:      row.RoutingKey,
+		RoutingDeadline: nullableTime(row.RoutingDeadline),
+		Data:            row.Data,
+		CreatedAt:       row.CreatedAt,
+		DispatchedAt:    row.DispatchedAt,
 	}
 }
 
 func toTask(row taskRow) *queue.TaskRow {
 	return &queue.TaskRow{
-		TaskID:       row.TaskID,
-		QueueName:    row.QueueName,
-		PartitionID:  row.PartitionID,
-		Data:         row.Data,
-		CreatedAt:    row.CreatedAt,
-		DispatchedAt: row.DispatchedAt,
+		TaskID:          row.TaskID,
+		QueueName:       row.QueueName,
+		PartitionID:     row.PartitionID,
+		RoutingKey:      row.RoutingKey,
+		RoutingDeadline: valueTime(row.RoutingDeadline),
+		Data:            row.Data,
+		CreatedAt:       row.CreatedAt,
+		DispatchedAt:    row.DispatchedAt,
 	}
+}
+
+func nullableTime(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	utc := value.UTC()
+	return &utc
+}
+
+func valueTime(value *time.Time) time.Time {
+	if value == nil {
+		return time.Time{}
+	}
+	return *value
 }
 
 func (s *Store) CreateQueue(ctx context.Context, info *queue.QueueInfo) error {
@@ -292,10 +324,72 @@ func (s *Store) CreateTasks(ctx context.Context, tasks []*queue.TaskRow) error {
 	return s.db.WithContext(ctx).Create(&rows).Error
 }
 
+func (s *Store) CreateTasksAndAdvanceRange(
+	ctx context.Context,
+	queueName string,
+	partitionID int,
+	tasks []*queue.TaskRow,
+	newNextTaskID int64,
+	prevRangeID int64,
+) (int64, error) {
+	if len(tasks) == 0 {
+		return prevRangeID, nil
+	}
+	rows := make([]taskRow, len(tasks))
+	for i, task := range tasks {
+		rows[i] = fromTask(task)
+	}
+
+	newRangeID := prevRangeID + 1
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&queueInfoRow{}).
+			Where("queue_name = ? AND partition_id = ? AND range_id = ?", queueName, partitionID, prevRangeID).
+			Updates(map[string]any{"range_id": newRangeID, "next_task_id": newNextTaskID})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return queue.ErrConditionFailed
+		}
+		return tx.Create(&rows).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+	return newRangeID, nil
+}
+
 func (s *Store) GetTasks(ctx context.Context, queueName string, partitionID int, minTaskID, maxTaskID int64, limit int) ([]*queue.TaskRow, error) {
+	return s.getTasks(ctx, queueName, partitionID, minTaskID, maxTaskID, limit, nil)
+}
+
+func (s *Store) GetTasksWithOptions(ctx context.Context, queueName string, partitionID int, minTaskID, maxTaskID int64, limit int, opts queue.TaskQueryOptions) ([]*queue.TaskRow, error) {
+	return s.getTasks(ctx, queueName, partitionID, minTaskID, maxTaskID, limit, &opts)
+}
+
+func (s *Store) getTasks(ctx context.Context, queueName string, partitionID int, minTaskID, maxTaskID int64, limit int, opts *queue.TaskQueryOptions) ([]*queue.TaskRow, error) {
 	var rows []taskRow
-	err := s.db.WithContext(ctx).
-		Where("queue_name = ? AND partition_id = ? AND task_id > ? AND task_id <= ? AND dispatched_at IS NULL", queueName, partitionID, minTaskID, maxTaskID).
+	query := s.db.WithContext(ctx).
+		Where("queue_name = ? AND partition_id = ? AND task_id > ? AND task_id <= ? AND dispatched_at IS NULL", queueName, partitionID, minTaskID, maxTaskID)
+	if opts != nil {
+		fallbackAt := opts.RoutingFallbackAt
+		if !fallbackAt.IsZero() {
+			fallbackAt = fallbackAt.UTC()
+		}
+		hasKeys := len(opts.AcceptedRoutingKeys) > 0
+		hasFallback := !fallbackAt.IsZero()
+		switch {
+		case hasKeys && hasFallback:
+			query = query.Where("(routing_key = ? OR routing_key IN ? OR (routing_deadline IS NOT NULL AND routing_deadline <= ?))", "", opts.AcceptedRoutingKeys, fallbackAt)
+		case hasKeys:
+			query = query.Where("(routing_key = ? OR routing_key IN ?)", "", opts.AcceptedRoutingKeys)
+		case hasFallback:
+			query = query.Where("(routing_key = ? OR (routing_deadline IS NOT NULL AND routing_deadline <= ?))", "", fallbackAt)
+		default:
+			query = query.Where("routing_key = ?", "")
+		}
+	}
+	err := query.
 		Order("task_id ASC").
 		Limit(limit).
 		Find(&rows).Error
@@ -335,30 +429,41 @@ func (s *Store) UnDispatchTask(ctx context.Context, queueName string, partitionI
 	return nil
 }
 
-func (s *Store) ResetTimedOutTasks(ctx context.Context, queueName string, partitionID int, ackLevel int64, visTimeout time.Duration) ([]int64, error) {
-	cutoff := time.Now().Add(-visTimeout)
-	var rows []taskRow
+func (s *Store) ResetTimedOutTasks(ctx context.Context, queueName string, partitionID int, opts queue.VisibilityResetOptions) ([]int64, error) {
+	cutoff := time.Now().Add(-opts.VisibilityTimeout)
+	acknowledged := make(map[int64]struct{}, len(opts.AcknowledgedIDs))
+	for _, taskID := range opts.AcknowledgedIDs {
+		acknowledged[taskID] = struct{}{}
+	}
+	var candidateIDs []int64
+	var resetIDs []int64
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("queue_name = ? AND partition_id = ? AND task_id > ? AND dispatched_at IS NOT NULL AND dispatched_at < ?", queueName, partitionID, ackLevel, cutoff).
-			Find(&rows).Error; err != nil {
+		if err := tx.Model(&taskRow{}).
+			Where("queue_name = ? AND partition_id = ? AND task_id > ? AND dispatched_at IS NOT NULL AND dispatched_at < ?", queueName, partitionID, opts.AckLevel, cutoff).
+			Order("task_id ASC").
+			Pluck("task_id", &candidateIDs).Error; err != nil {
 			return err
 		}
-		if len(rows) == 0 {
-			return nil
+		resetIDs = make([]int64, 0, len(candidateIDs))
+		for _, taskID := range candidateIDs {
+			if _, ok := acknowledged[taskID]; !ok {
+				resetIDs = append(resetIDs, taskID)
+			}
 		}
-		result := tx.Model(&taskRow{}).
-			Where("queue_name = ? AND partition_id = ? AND task_id > ? AND dispatched_at IS NOT NULL AND dispatched_at < ?", queueName, partitionID, ackLevel, cutoff).
-			Update("dispatched_at", nil)
-		return result.Error
+		for start := 0; start < len(resetIDs); start += visibilityResetBatch {
+			end := min(start+visibilityResetBatch, len(resetIDs))
+			if err := tx.Model(&taskRow{}).
+				Where("queue_name = ? AND partition_id = ? AND task_id IN ? AND dispatched_at IS NOT NULL AND dispatched_at < ?", queueName, partitionID, resetIDs[start:end], cutoff).
+				Update("dispatched_at", nil).Error; err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("reset timed out tasks: %w", err)
 	}
-	ids := make([]int64, len(rows))
-	for i, row := range rows {
-		ids[i] = row.TaskID
-	}
-	return ids, nil
+	return resetIDs, nil
 }
 
 func (s *Store) nowMS() int64 {
