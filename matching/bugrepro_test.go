@@ -88,6 +88,7 @@ func TestBugRepro_SlowPartitionLoadRechecksOwnershipUnderLock(t *testing.T) {
 		"owner-a",
 		resolver,
 		time.Minute,
+		defaultMaxAttempts,
 		map[string]int{"known-q": 1},
 	)
 	t.Cleanup(pm.close)
@@ -118,6 +119,7 @@ func TestBugRepro_ReconcileKeepsLoadedPartitionsWhenOwnershipLookupFails(t *test
 		"owner-a",
 		resolver,
 		time.Minute,
+		defaultMaxAttempts,
 		map[string]int{"known-q": 1},
 	)
 	t.Cleanup(pm.close)
@@ -149,6 +151,7 @@ func TestBugRepro_LoadedPartitionRechecksOwnership(t *testing.T) {
 		"owner-a",
 		resolver,
 		time.Minute,
+		defaultMaxAttempts,
 		map[string]int{"known-q": 1},
 	)
 	t.Cleanup(pm.close)
@@ -180,6 +183,7 @@ func TestBugRepro_PeriodicReconcileConvergesAfterDroppedEvent(t *testing.T) {
 		"owner-a",
 		resolver,
 		time.Minute,
+		defaultMaxAttempts,
 		map[string]int{"known-q": 1},
 	)
 	t.Cleanup(pm.close)

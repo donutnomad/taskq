@@ -32,6 +32,7 @@ type partitionManager struct {
 	leaseOwner   string // DB lease 标识
 	resolver     membership.ServiceResolver
 	visTimeout   time.Duration
+	maxAttempts  int
 	partitions   map[string]*partitionHandle // key = partitionKey(...)
 	queueConfigs map[string]int              // queueName → numPartitions
 	ctx          context.Context
@@ -54,6 +55,7 @@ type partitionLeaderTask struct {
 	queueName   string
 	partitionID int
 	visTimeout  time.Duration
+	maxAttempts int
 	leaseOwner  string
 }
 
@@ -82,7 +84,7 @@ func tickRun(ctx context.Context, interval time.Duration, f func(context.Context
 }
 
 func (t *partitionLeaderTask) Start(ctx context.Context) error {
-	pq, err := queue.NewPhysicalQueue(ctx, t.store, t.queueName, t.partitionID, t.visTimeout, t.leaseOwner)
+	pq, err := queue.NewPhysicalQueue(ctx, t.store, t.queueName, t.partitionID, t.visTimeout, t.maxAttempts, t.leaseOwner)
 	if err != nil {
 		return err
 	}
@@ -151,6 +153,7 @@ func newPartitionHandle(
 	queueName string,
 	partitionID int,
 	visTimeout time.Duration,
+	maxAttempts int,
 	leaseOwner string,
 ) *partitionHandle {
 	handle := &partitionHandle{
@@ -168,6 +171,7 @@ func newPartitionHandle(
 			queueName:   queueName,
 			partitionID: partitionID,
 			visTimeout:  visTimeout,
+			maxAttempts: maxAttempts,
 			leaseOwner:  leaseOwner,
 		}},
 		dbleader.WithLeaseTTL(3*time.Second),
@@ -331,6 +335,15 @@ func (h *partitionHandle) Nack(ctx context.Context, token string) error {
 	return pq.Nack(ctx, token)
 }
 
+// ReturnLease 归还未交付给消费者的租约，不消耗投递次数，见 queue.PhysicalQueue.ReturnLease。
+func (h *partitionHandle) ReturnLease(ctx context.Context, token string) error {
+	pq, err := h.getActive()
+	if err != nil {
+		return err
+	}
+	return pq.ReturnLease(ctx, token)
+}
+
 func newPartitionManager(
 	ctx context.Context,
 	store queue.Store,
@@ -339,6 +352,7 @@ func newPartitionManager(
 	leaseOwner string,
 	resolver membership.ServiceResolver,
 	visTimeout time.Duration,
+	maxAttempts int,
 	queueConfigs map[string]int,
 ) *partitionManager {
 	ctx, cancel := context.WithCancel(ctx)
@@ -349,6 +363,7 @@ func newPartitionManager(
 		leaseOwner:   leaseOwner,
 		resolver:     resolver,
 		visTimeout:   visTimeout,
+		maxAttempts:  maxAttempts,
 		partitions:   make(map[string]*partitionHandle),
 		queueConfigs: queueConfigs,
 		ctx:          ctx,
@@ -442,7 +457,7 @@ func (pm *partitionManager) getOrLoadPartition(ctx context.Context, queueName st
 		}
 	}
 
-	handle = newPartitionHandle(pm.store, pm.lockStore, queueName, partitionID, pm.visTimeout, pm.leaseOwner)
+	handle = newPartitionHandle(pm.store, pm.lockStore, queueName, partitionID, pm.visTimeout, pm.maxAttempts, pm.leaseOwner)
 	handle.start()
 	pm.partitions[key] = handle
 	pm.mu.Unlock()
@@ -520,7 +535,7 @@ func (pm *partitionManager) reconcile() {
 		if _, ok := pm.partitions[key]; ok {
 			continue
 		}
-		handle := newPartitionHandle(pm.store, pm.lockStore, pid.queueName, pid.partitionID, pm.visTimeout, pm.leaseOwner)
+		handle := newPartitionHandle(pm.store, pm.lockStore, pid.queueName, pid.partitionID, pm.visTimeout, pm.maxAttempts, pm.leaseOwner)
 		handle.start()
 		slog.Info("matching loaded partition", "partition", key)
 		pm.partitions[key] = handle

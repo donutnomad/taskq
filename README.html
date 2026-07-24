@@ -1,0 +1,2064 @@
+<!DOCTYPE html>
+<html lang="zh" data-theme="light" style="--rec-label: '★ 推荐'">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>TaskQ — 分布式任务队列</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    /* ============================================================
+       TOKENS
+       ============================================================ */
+    :root {
+      --bg: #FAFAF7;
+      --surface: #FFFFFF;
+      --surface-2: #F5F5F0;
+      --surface-3: #EFEEE8;
+      --text: #1A1A1A;
+      --text-muted: #4A4A45;
+      --text-subtle: #6B6B66;
+      --accent: #D97757;
+      --accent-hover: #C56843;
+      --accent-soft: #FBEEE6;
+      --accent-border: #F0D5C4;
+      --accent-strong: #A85533;
+      --border: #E5E4DC;
+      --border-strong: #CDCDC4;
+      --code-bg: #F5F2EC;
+      --code-text: #2A2A2A;
+      --info: #2563EB;
+      --info-soft: #EFF6FF;
+      --info-border: #BFDBFE;
+      --warn: #B45309;
+      --warn-soft: #FFFBEB;
+      --warn-border: #FDE68A;
+      --danger: #B91C1C;
+      --danger-soft: #FEF2F2;
+      --danger-border: #FECACA;
+      --success: #047857;
+      --success-soft: #ECFDF5;
+      --success-border: #A7F3D0;
+      --decision: #6D28D9;
+      --decision-soft: #F5F3FF;
+      --decision-border: #DDD6FE;
+      --shadow-sm: 0 1px 2px rgba(20, 14, 8, 0.04);
+      --shadow: 0 1px 2px rgba(20, 14, 8, 0.04), 0 4px 12px rgba(20, 14, 8, 0.06);
+      --shadow-lg: 0 8px 24px rgba(20, 14, 8, 0.10);
+      --radius: 12px;
+      --radius-sm: 8px;
+      --radius-lg: 16px;
+      --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Noto Sans CJK JP', 'Noto Sans CJK KR', sans-serif;
+      --font-mono: 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+      --z-progress: 200;
+      --z-topbar: 100;
+      --z-drawer: 300;
+      --z-backdrop: 250;
+    }
+
+    [data-theme="dark"] {
+      --bg: #1A1714;
+      --surface: #221E1A;
+      --surface-2: #2A2520;
+      --surface-3: #322C26;
+      --text: #F5F0E8;
+      --text-muted: #C8C0B6;
+      --text-subtle: #9A938A;
+      --accent: #E89572;
+      --accent-hover: #F2A87F;
+      --accent-soft: #3A2A22;
+      --accent-border: #5A3D2E;
+      --accent-strong: #F5B493;
+      --border: #2E2924;
+      --border-strong: #463F38;
+      --code-bg: #1E1B17;
+      --code-text: #E8E2D8;
+      --info: #93C5FD;
+      --info-soft: #1E2A3D;
+      --info-border: #2A4365;
+      --warn: #FBBF24;
+      --warn-soft: #332817;
+      --warn-border: #5C4520;
+      --danger: #FCA5A5;
+      --danger-soft: #3A1F1F;
+      --danger-border: #5C2A2A;
+      --success: #6EE7B7;
+      --success-soft: #1A3329;
+      --success-border: #1F5C45;
+      --decision: #C4B5FD;
+      --decision-soft: #2A1F40;
+      --decision-border: #4A3870;
+      --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 4px 12px rgba(0, 0, 0, 0.35);
+      --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.45);
+    }
+
+    /* ============================================================
+       BASE
+       ============================================================ */
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 80px; }
+    body {
+      margin: 0;
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+      font-size: 16px;
+      -webkit-font-smoothing: antialiased;
+      transition: background-color 0.2s, color 0.2s;
+    }
+    ::selection { background: var(--accent-soft); color: var(--accent-strong); }
+
+    /* Skip link */
+    .skip-link {
+      position: absolute;
+      top: -100px; left: 8px;
+      padding: 10px 16px;
+      background: var(--accent);
+      color: #fff;
+      text-decoration: none;
+      border-radius: var(--radius-sm);
+      font-weight: 500;
+      z-index: 1000;
+      transition: top 0.15s;
+    }
+    .skip-link:focus { top: 8px; }
+
+    /* SVG sprite container (hidden) */
+    .icon-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+    .icon { display: inline-block; flex-shrink: 0; vertical-align: middle; stroke: currentColor; fill: none; }
+
+    /* Scroll progress bar */
+    .scroll-progress {
+      position: fixed;
+      top: 0; left: 0;
+      height: 2px;
+      width: 0;
+      background: var(--accent);
+      z-index: var(--z-progress);
+      transition: width 0.05s linear;
+    }
+
+    /* ============================================================
+       TOPBAR
+       ============================================================ */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: var(--z-topbar);
+      background: rgba(250, 250, 247, 0.85);
+      backdrop-filter: saturate(180%) blur(12px);
+      -webkit-backdrop-filter: saturate(180%) blur(12px);
+      border-bottom: 1px solid var(--border);
+    }
+    [data-theme="dark"] .topbar { background: rgba(26, 23, 20, 0.85); }
+    .topbar-inner {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 10px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 600;
+      color: var(--text);
+      font-size: 14px;
+    }
+    .brand-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 0 4px var(--accent-soft);
+      animation: brand-pulse 2.8s ease-in-out infinite;
+    }
+    @keyframes brand-pulse {
+      0%, 100% { box-shadow: 0 0 0 4px var(--accent-soft); }
+      50%      { box-shadow: 0 0 0 7px transparent; }
+    }
+    .topbar-actions { display: flex; gap: 6px; align-items: center; }
+    .icon-btn {
+      width: 40px; height: 40px;
+      display: inline-flex; align-items: center; justify-content: center;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text-muted);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+      padding: 0;
+    }
+    .icon-btn .icon { width: 18px; height: 18px; stroke-width: 2; }
+    .icon-btn[hidden] { display: none; }
+
+    /* ============================================================
+       LAYOUT
+       ============================================================ */
+    .layout {
+      max-width: 1280px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      gap: 48px;
+      padding: 32px 24px 96px;
+    }
+    .content { min-width: 0; }
+
+    /* ============================================================
+       TOC (desktop + mobile drawer)
+       ============================================================ */
+    .toc {
+      position: sticky;
+      top: 80px;
+      align-self: start;
+      max-height: calc(100vh - 100px);
+      overflow-y: auto;
+      padding-right: 8px;
+    }
+    .toc::-webkit-scrollbar { width: 6px; }
+    .toc::-webkit-scrollbar-track { background: transparent; }
+    .toc::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
+    .toc-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 12px 12px;
+    }
+    .toc-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-subtle);
+      margin: 0;
+    }
+    .toc-close { display: none; }
+    .toc-nav { display: flex; flex-direction: column; gap: 2px; }
+    .toc-nav a {
+      display: flex; align-items: center;
+      min-height: 36px;
+      padding: 8px 14px;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 13.5px;
+      border-left: 2px solid transparent;
+      border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+      transition: color 0.15s, background-color 0.15s, border-color 0.15s;
+      line-height: 1.4;
+    }
+    .toc-nav a.active {
+      color: var(--accent);
+      border-left-color: var(--accent);
+      background: var(--accent-soft);
+      font-weight: 500;
+    }
+    .toc-nav a.lvl-3 { padding-left: 26px; font-size: 12.5px; }
+    .toc-backdrop {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0, 0, 0, 0.45);
+      z-index: var(--z-backdrop);
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+
+    /* ============================================================
+       DOC HEADER
+       ============================================================ */
+    .doc-header {
+      margin-bottom: 40px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+    }
+    .doc-eyebrow {
+      display: inline-flex; align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      border: 1px solid var(--accent-border);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+      margin-bottom: 16px;
+    }
+    .doc-title {
+      font-size: clamp(28px, 3vw + 16px, 40px);
+      font-weight: 700;
+      line-height: 1.15;
+      letter-spacing: -0.02em;
+      margin: 0 0 12px;
+      color: var(--text);
+      text-wrap: balance;
+    }
+    .doc-subtitle {
+      font-size: clamp(15px, 0.6vw + 13px, 18px);
+      color: var(--text-muted);
+      line-height: 1.55;
+      margin: 0 0 20px;
+      max-width: 75ch;
+      text-wrap: pretty;
+    }
+    .doc-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      font-size: 13px;
+      color: var(--text-subtle);
+    }
+    .doc-meta-item { display: inline-flex; align-items: center; gap: 6px; }
+    .doc-meta .icon { width: 14px; height: 14px; stroke-width: 2; }
+
+    /* ============================================================
+       CONTENT (typography)
+       ============================================================ */
+    .content h1, .content h2, .content h3, .content h4 {
+      color: var(--text);
+      line-height: 1.3;
+      letter-spacing: -0.01em;
+      scroll-margin-top: 80px;
+      text-wrap: balance;
+    }
+    .content h2 {
+      font-size: 26px;
+      font-weight: 600;
+      margin: 56px 0 16px;
+      padding-top: 8px;
+      position: relative;
+    }
+    .content h3 {
+      font-size: 19px;
+      font-weight: 600;
+      margin: 36px 0 12px;
+      position: relative;
+    }
+    .content h4 {
+      font-size: 13px;
+      font-weight: 600;
+      margin: 24px 0 8px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .content > p,
+    .content > ul,
+    .content > ol,
+    .content > blockquote { max-width: 75ch; }
+    .content p { margin: 0 0 16px; text-wrap: pretty; overflow-wrap: anywhere; }
+    .content a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-border); }
+    .content ul, .content ol { padding-left: 24px; margin: 0 0 16px; }
+    .content li { margin: 4px 0; }
+    .content strong { color: var(--text); font-weight: 600; }
+    .content em { color: var(--text-muted); }
+    .content hr { border: none; border-top: 1px solid var(--border); margin: 40px 0; }
+
+    /* Anchor links injected by JS on h2/h3 with id */
+    .anchor {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 24px; height: 24px;
+      margin-left: 6px;
+      color: var(--text-subtle);
+      opacity: 0;
+      transform: translateY(-1px);
+      transition: opacity 0.15s, color 0.15s;
+      border-bottom: none !important;
+      border-radius: var(--radius-sm);
+    }
+    .anchor .icon { width: 14px; height: 14px; stroke-width: 2; }
+
+    /* Images */
+    .content img {
+      max-width: 100%;
+      height: auto;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      margin: 20px 0;
+      display: block;
+    }
+    .content figure { margin: 20px 0; }
+    .content figure img { margin: 0; }
+    .content figcaption {
+      font-size: 13px;
+      color: var(--text-subtle);
+      margin-top: 8px;
+      text-align: center;
+    }
+
+    /* Task lists (- [ ] / - [x]) */
+    .content .task-list-item { list-style: none; margin-left: -22px; }
+    .content .task-list-item-checkbox {
+      margin-right: 8px;
+      vertical-align: -2px;
+      accent-color: var(--accent);
+    }
+
+    /* Footnotes */
+    .content .footnote-ref a,
+    .content sup a {
+      font-size: 0.75em;
+      vertical-align: super;
+      border-bottom: none;
+      padding: 0 2px;
+    }
+    .content .footnotes {
+      margin-top: 56px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+
+    /* ============================================================
+       CODE
+       ============================================================ */
+    .content code {
+      font-family: var(--font-mono);
+      background: var(--code-bg);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.88em;
+      color: var(--code-text);
+      border: 1px solid var(--border);
+      overflow-wrap: anywhere;
+    }
+    .content pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      overflow-x: auto;
+      font-size: 13.5px;
+      line-height: 1.6;
+      margin: 16px 0;
+      position: relative;
+    }
+    .content pre code {
+      background: none; padding: 0; border: none;
+      color: var(--code-text);
+      font-size: inherit;
+    }
+    .copy-btn {
+      position: absolute;
+      top: 8px; right: 8px;
+      width: 32px; height: 32px;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      color: var(--text-subtle);
+      opacity: 0;
+      transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+      padding: 0;
+    }
+    .copy-btn .icon { width: 14px; height: 14px; stroke-width: 2; }
+    .copy-btn.copied { color: var(--success); border-color: var(--success-border); opacity: 1; }
+
+    /* ============================================================
+       TIMELINE / STEPS
+       ============================================================ */
+    .timeline {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin: 24px 0;
+      position: relative;
+    }
+    .timeline::before {
+      content: "";
+      position: absolute;
+      left: 19px;
+      top: 20px;
+      bottom: 20px;
+      width: 2px;
+      background: linear-gradient(180deg, var(--accent-border), var(--border));
+    }
+    .step {
+      display: grid;
+      grid-template-columns: 40px 1fr;
+      gap: 16px;
+      align-items: start;
+      padding: 16px 4px;
+      position: relative;
+      border-radius: var(--radius);
+      transition: background-color 0.15s;
+    }
+    .step-num {
+      width: 40px; height: 40px;
+      display: inline-flex; align-items: center; justify-content: center;
+      background: var(--surface);
+      border: 2px solid var(--accent);
+      color: var(--accent);
+      border-radius: 50%;
+      font-weight: 600;
+      font-size: 14px;
+      flex-shrink: 0;
+      box-shadow: var(--shadow-sm);
+      position: relative;
+      z-index: 1;
+      transition: background-color 0.15s, color 0.15s, transform 0.15s;
+    }
+    .step.done .step-num { background: var(--accent); color: #fff; }
+    .step-body { padding-top: 6px; min-width: 0; }
+    .step-body h3 {
+      margin: 0 0 6px;
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .step-body p { margin: 0 0 8px; color: var(--text-muted); font-size: 14.5px; max-width: 75ch; }
+    .step-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      font-size: 11.5px;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+    }
+
+    /* ============================================================
+       CALLOUTS
+       ============================================================ */
+    .callout {
+      display: grid;
+      grid-template-columns: 24px 1fr;
+      gap: 14px;
+      padding: 14px 18px;
+      border-radius: var(--radius);
+      border: 1px solid;
+      margin: 20px 0;
+      font-size: 14.5px;
+      line-height: 1.6;
+      max-width: 75ch;
+    }
+    .callout-icon { width: 20px; height: 20px; margin-top: 2px; stroke-width: 2; }
+    .callout-body { min-width: 0; }
+    .callout-title { font-weight: 600; margin: 0 0 4px; font-size: 14px; }
+    .callout-body p:last-child { margin-bottom: 0; }
+    .callout-body code { background: rgba(0,0,0,0.04); }
+    [data-theme="dark"] .callout-body code { background: rgba(255,255,255,0.06); }
+
+    .callout-info     { background: var(--info-soft);     border-color: var(--info-border);     color: var(--text); }
+    .callout-info     .callout-title, .callout-info     .callout-icon { color: var(--info); }
+    .callout-warn     { background: var(--warn-soft);     border-color: var(--warn-border);     color: var(--text); }
+    .callout-warn     .callout-title, .callout-warn     .callout-icon { color: var(--warn); }
+    .callout-danger   { background: var(--danger-soft);   border-color: var(--danger-border);   color: var(--text); }
+    .callout-danger   .callout-title, .callout-danger   .callout-icon { color: var(--danger); }
+    .callout-success  { background: var(--success-soft);  border-color: var(--success-border);  color: var(--text); }
+    .callout-success  .callout-title, .callout-success  .callout-icon { color: var(--success); }
+    .callout-decision { background: var(--decision-soft); border-color: var(--decision-border); color: var(--text); }
+    .callout-decision .callout-title, .callout-decision .callout-icon { color: var(--decision); }
+    .callout-tip      { background: var(--accent-soft);   border-color: var(--accent-border);   color: var(--text); }
+    .callout-tip      .callout-title, .callout-tip      .callout-icon { color: var(--accent-strong); }
+
+    /* ============================================================
+       KEY-POINT HIGHLIGHT
+       ============================================================ */
+    .highlight {
+      background: linear-gradient(135deg, var(--accent-soft), var(--surface-2));
+      border-left: 4px solid var(--accent);
+      padding: 18px 22px;
+      border-radius: 0 var(--radius) var(--radius) 0;
+      margin: 24px 0;
+      font-size: 16px;
+      line-height: 1.65;
+      max-width: 75ch;
+    }
+    .highlight-label {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--accent-strong);
+      margin-bottom: 6px;
+    }
+
+    /* ============================================================
+       MERMAID
+       ============================================================ */
+    .diagram {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin: 24px 0;
+      box-shadow: var(--shadow-sm);
+      overflow-x: auto;
+    }
+    .diagram-caption {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px dashed var(--border);
+      font-size: 13px;
+      color: var(--text-subtle);
+      text-align: center;
+    }
+    .mermaid { text-align: center; min-height: 80px; }
+    .mermaid svg { max-width: 100%; height: auto; }
+    .mermaid:not([data-processed]) {
+      opacity: 0.4;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--text-subtle);
+      white-space: pre-wrap;
+      text-align: left;
+    }
+
+    /* ============================================================
+       PROS / CONS
+       ============================================================ */
+    .proscons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin: 24px 0;
+    }
+    .proscons-col {
+      padding: 16px 20px;
+      border-radius: var(--radius);
+      border: 1px solid;
+    }
+    .proscons-col h4 {
+      margin: 0 0 12px;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .proscons-col ul { margin: 0; padding-left: 18px; }
+    .proscons-col li { margin: 6px 0; }
+    .pros { background: var(--success-soft); border-color: var(--success-border); }
+    .pros h4 { color: var(--success); }
+    .cons { background: var(--danger-soft); border-color: var(--danger-border); }
+    .cons h4 { color: var(--danger); }
+
+    /* ============================================================
+       COMPARISON CARDS
+       ============================================================ */
+    .compare {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 14px;
+      margin: 24px 0;
+    }
+    .compare-card {
+      padding: 18px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      transition: border-color 0.18s, box-shadow 0.18s;
+      position: relative;
+    }
+    .compare-card.recommended { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .compare-card.recommended::before {
+      content: var(--rec-label, "★ Recommended");
+      position: absolute; top: -10px; right: 14px;
+      background: var(--accent); color: #fff;
+      padding: 2px 10px; border-radius: 999px;
+      font-size: 11px; font-weight: 600;
+    }
+    .compare-card h4 { margin: 0 0 8px; font-size: 15px; color: var(--text); text-transform: none; letter-spacing: normal; }
+    .compare-card p { margin: 0; color: var(--text-muted); font-size: 14px; }
+
+    /* ============================================================
+       COLLAPSIBLE
+       ============================================================ */
+    details.collapsible {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin: 16px 0;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    details.collapsible[open] { box-shadow: var(--shadow-sm); }
+    details.collapsible > summary {
+      cursor: pointer;
+      padding: 14px 18px;
+      font-weight: 500;
+      color: var(--text);
+      list-style: none;
+      display: flex; align-items: center; gap: 10px;
+      user-select: none;
+      transition: background 0.15s;
+      min-height: 44px;
+    }
+    details.collapsible > summary::-webkit-details-marker { display: none; }
+    details.collapsible > summary::before {
+      content: "›";
+      display: inline-block;
+      transition: transform 0.18s;
+      color: var(--accent);
+      font-size: 18px;
+      font-weight: 700;
+    }
+    details.collapsible[open] > summary::before { transform: rotate(90deg); }
+    .collapsible-body { padding: 4px 18px 18px; border-top: 1px solid var(--border); }
+    .collapsible-body > *:first-child { margin-top: 12px; }
+
+    /* ============================================================
+       TABLES (wrapped via .table-wrap or naturally responsive)
+       ============================================================ */
+    .table-wrap {
+      overflow-x: auto;
+      margin: 20px 0;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      max-width: 100%;
+    }
+    .content table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      background: var(--surface);
+      margin: 0;
+    }
+    /* Standalone tables (not inside .table-wrap) keep visual border */
+    .content > table {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      margin: 20px 0;
+      display: block;
+      overflow-x: auto;
+    }
+    .content th {
+      background: var(--surface-2);
+      color: var(--text);
+      font-weight: 600;
+      text-align: left;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+    .content td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-muted);
+      vertical-align: top;
+    }
+    .content tr:last-child td { border-bottom: none; }
+
+    /* ============================================================
+       BLOCKQUOTE
+       ============================================================ */
+    .content blockquote {
+      margin: 20px 0;
+      padding: 4px 20px;
+      border-left: 3px solid var(--accent-border);
+      color: var(--text-muted);
+      font-style: italic;
+    }
+
+    /* ============================================================
+       FOOTER
+       ============================================================ */
+    .doc-footer {
+      margin-top: 80px;
+      padding-top: 24px;
+      border-top: 1px solid var(--border);
+      font-size: 13px;
+      color: var(--text-subtle);
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .doc-footer a { color: var(--accent); text-decoration: none; }
+
+    /* ============================================================
+       FOCUS-VISIBLE (a11y)
+       ============================================================ */
+    *:focus { outline: none; }
+    *:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
+      border-radius: var(--radius-sm);
+    }
+    .toc-nav a:focus-visible { outline-offset: -2px; }
+    .icon-btn:focus-visible { outline-offset: 2px; }
+    .anchor:focus-visible { opacity: 1; outline-offset: 2px; }
+    details.collapsible > summary:focus-visible { outline-offset: -2px; }
+
+    /* ============================================================
+       HOVER (only on hover-capable devices to avoid sticky-tap on mobile)
+       ============================================================ */
+    @media (hover: hover) {
+      .icon-btn:hover { color: var(--accent); border-color: var(--accent-border); background: var(--accent-soft); }
+      .toc-nav a:hover { color: var(--accent); background: var(--accent-soft); }
+      .content a:hover { color: var(--accent-hover); border-bottom-color: var(--accent); }
+      .compare-card:hover { border-color: var(--accent-border); box-shadow: var(--shadow); }
+      .compare-card.recommended:hover { border-color: var(--accent); }
+      .content tr:hover td { background: var(--surface-2); }
+      details.collapsible > summary:hover { background: var(--surface-2); }
+      .step:hover { background: var(--surface-2); }
+      .step:hover .step-num { transform: scale(1.05); }
+      .anchor:hover { color: var(--accent); }
+      .content h2:hover .anchor,
+      .content h3:hover .anchor { opacity: 1; }
+      .copy-btn:hover { color: var(--accent); border-color: var(--accent-border); }
+      .content pre:hover .copy-btn { opacity: 1; }
+    }
+    /* On touch devices, copy-btn is always visible at low opacity */
+    @media (hover: none) {
+      .copy-btn { opacity: 0.6; }
+      .anchor { opacity: 0.4; }
+    }
+
+    /* ============================================================
+       MOBILE (≤900px) — TOC becomes off-canvas drawer
+       ============================================================ */
+    @media (max-width: 900px) {
+      .layout {
+        grid-template-columns: 1fr;
+        gap: 16px;
+        padding: 20px 16px 80px;
+      }
+      .topbar-inner { padding: 8px 12px; }
+      .doc-header { margin-bottom: 28px; padding-bottom: 20px; }
+
+      .toc-mobile-trigger { display: inline-flex !important; }
+
+      .toc {
+        position: fixed;
+        top: 0; left: 0;
+        width: min(300px, 82vw);
+        height: 100dvh;
+        max-height: 100dvh;
+        background: var(--surface);
+        z-index: var(--z-drawer);
+        padding: 16px 8px 24px 16px;
+        box-shadow: var(--shadow-lg);
+        transform: translateX(-105%);
+        transition: transform 0.25s ease;
+      }
+      .toc-head { padding: 4px 4px 12px 8px; }
+      .toc-close {
+        display: inline-flex !important;
+        width: 36px; height: 36px;
+        align-items: center; justify-content: center;
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: var(--radius-sm);
+        color: var(--text-muted);
+        cursor: pointer;
+        padding: 0;
+      }
+      .toc-close .icon { width: 18px; height: 18px; stroke-width: 2; }
+      body.toc-open .toc { transform: translateX(0); }
+      body.toc-open .toc-backdrop {
+        display: block;
+        opacity: 1;
+      }
+      .toc-backdrop {
+        display: block;
+        opacity: 0;
+        pointer-events: none;
+      }
+      body.toc-open .toc-backdrop { pointer-events: auto; }
+      body.toc-open { overflow: hidden; }
+    }
+    @media (min-width: 901px) {
+      .toc-mobile-trigger { display: none !important; }
+    }
+
+    /* ============================================================
+       REDUCED MOTION (a11y)
+       ============================================================ */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+      html { scroll-behavior: auto; }
+      .brand-dot { animation: none; box-shadow: 0 0 0 4px var(--accent-soft); }
+    }
+
+    /* ============================================================
+       PRINT
+       ============================================================ */
+    @media print {
+      .topbar, .toc, .toc-backdrop, .icon-btn, .copy-btn, .anchor, .scroll-progress { display: none !important; }
+      .layout { grid-template-columns: 1fr; padding: 0; max-width: 100%; }
+      body { background: #fff; color: #000; }
+      a { color: #000; }
+      .content pre, .callout, .compare-card, .step, .diagram { break-inside: avoid; }
+      .doc-footer { break-before: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Skip link for keyboard users -->
+  <a href="#main" class="skip-link">跳到正文</a>
+
+  <!-- Scroll progress -->
+  <div class="scroll-progress" id="scroll-progress" aria-hidden="true"></div>
+
+  <!-- SVG icon sprite (Lucide-style) -->
+  <svg class="icon-sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></symbol>
+    <symbol id="i-warn" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+    <symbol id="i-danger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></symbol>
+    <symbol id="i-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+    <symbol id="i-decision" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+    <symbol id="i-tip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18h6"/><path d="M10 22h4"/><path d="M15.09 14a5 5 0 1 0-6.18 0 4 4 0 0 1 1.59 2h2.99a4 4 0 0 1 1.6-2Z"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+    <symbol id="i-printer" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="18" y2="18"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="4" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+  </svg>
+
+  <!-- Topbar -->
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <button class="icon-btn toc-mobile-trigger" id="toc-toggle" onclick="openToc()" aria-label="目录" title="目录">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-menu"/></svg>
+        </button>
+        <span class="brand-dot" aria-hidden="true"></span>
+        <span>系统设计</span>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn" onclick="window.print()" title="打印 / 保存 PDF" aria-label="打印 / 保存 PDF">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-printer"/></svg>
+        </button>
+        <button class="icon-btn" id="theme-toggle" onclick="toggleTheme()" title="切换主题" aria-label="切换主题">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use id="theme-icon-use" href="#i-moon"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- TOC drawer backdrop (mobile) -->
+  <div class="toc-backdrop" onclick="closeToc()" aria-hidden="true"></div>
+
+  <div class="layout">
+    <aside class="toc" id="toc" aria-label="目录">
+      <div class="toc-head">
+        <p class="toc-title">目录</p>
+        <button class="toc-close" onclick="closeToc()" aria-label="关闭">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-x"/></svg>
+        </button>
+      </div>
+      <nav class="toc-nav" id="toc-nav">
+        <!-- TOC_ENTRIES -->
+        <a href="#overview" class="lvl-2">概览与核心特性</a>
+        <a href="#architecture" class="lvl-2">系统架构</a>
+        <a href="#layers" class="lvl-3">四层架构</a>
+        <a href="#queue-pkg" class="lvl-2">Queue 包</a>
+        <a href="#store-iface" class="lvl-3">Store 接口</a>
+        <a href="#db-schema" class="lvl-3">数据库表结构</a>
+        <a href="#physical-queue" class="lvl-3">PhysicalQueue — 单分区核心</a>
+        <a href="#ownership" class="lvl-3">运行期开关与写入围栏</a>
+        <a href="#membership-pkg" class="lvl-2">Membership 包</a>
+        <a href="#matching-pkg" class="lvl-2">Matching 包</a>
+        <a href="#frontend-pkg" class="lvl-2">Frontend 包</a>
+        <a href="#enqueue-flow" class="lvl-2">Enqueue 流程</a>
+        <a href="#idempotency" class="lvl-3">At-least-once 与业务幂等契约</a>
+        <a href="#respool-retry" class="lvl-3">投递重试、respool 与 attempt 上限</a>
+        <a href="#dequeue-flow" class="lvl-2">Dequeue 流程</a>
+        <a href="#ack-nack-flow" class="lvl-2">Ack / Nack 流程</a>
+        <a href="#partition-ownership" class="lvl-2">分区所有权流程</a>
+        <a href="#reconcile" class="lvl-2">成员变更 → Reconcile</a>
+        <a href="#internals" class="lvl-2">PhysicalQueue 内部结构</a>
+        <a href="#delivery-state" class="lvl-3">deliveryState 状态</a>
+        <a href="#sync-match" class="lvl-3">Sync Match 与 waiterRegistry</a>
+        <a href="#config" class="lvl-2">配置参考</a>
+        <a href="#quickstart" class="lvl-2">快速开始</a>
+        <a href="#production" class="lvl-3">生产装配</a>
+        <a href="#project-layout" class="lvl-2">项目结构</a>
+        <a href="#deps-tests" class="lvl-2">依赖与测试</a>
+      </nav>
+    </aside>
+
+    <main class="content" id="main">
+      <header class="doc-header">
+        <span class="doc-eyebrow">SYSTEM DESIGN</span>
+        <h1 class="doc-title">TaskQ — 分布式任务队列</h1>
+        <p class="doc-subtitle">Temporal 风格的 Go 分布式任务队列：多分区、at-least-once 投递、一致性哈希路由、dbleader 分区独占与长轮询消费。</p>
+        <div class="doc-meta">
+          <span class="doc-meta-item">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-file"/></svg>
+            README.md
+          </span>
+          <span class="doc-meta-item">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-calendar"/></svg>
+            2026-07-23
+          </span>
+          <span class="doc-meta-item">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-clock"/></svg>
+            ~19 分钟阅读
+          </span>
+        </div>
+      </header>
+
+      <!-- CONTENT_START -->
+      <h2 id="overview">概览与核心特性</h2>
+      <p>TaskQ 是一个 Temporal 风格的分布式任务队列系统，使用 Go 实现。支持多分区、at-least-once 投递语义、一致性哈希路由、<code>dbleader</code> 分区独占、长轮询消费和可见性超时自动重投递。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>特性</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>多分区队列</strong></td><td>水平扩展吞吐量，round-robin 分发写入</td></tr>
+            <tr><td><strong>At-least-once 投递</strong></td><td>可见性超时 + 自动重投递（respool 换新 taskID），失败任务不丢，且不冻结 ackLevel</td></tr>
+            <tr><td><strong>一致性哈希路由</strong></td><td>基于虚拟节点的哈希环，分区自动分配到集群节点</td></tr>
+            <tr><td><strong><code>dbleader</code> 锁 + RangeID CAS</strong></td><td>运行期开关由 <code>dbleader</code> 控制，写入围栏继续由 <code>rangeID</code> CAS 兜底</td></tr>
+            <tr><td><strong>长轮询消费</strong></td><td>无任务时 worker 阻塞等待，任务到达即时唤醒</td></tr>
+            <tr><td><strong>Sync Match</strong></td><td>写入时直接匹配等待中的消费者，零延迟投递</td></tr>
+            <tr><td><strong>定向投递与原行 fallback</strong></td><td>RoutingKey 在 deadline 前定向到指定 worker，过期后由同一 TaskID 参与普通消费</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="architecture">系统架构</h2>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+flowchart LR
+    subgraph WP[Worker 进程]
+        W[业务代码]
+        F(frontend SDK)
+        MO(observer Monitor)
+        W -->|Enqueue/Dequeue| F
+        F -.->|Lookup| MO
+    end
+    subgraph MP[Matching 进程]
+        M(gRPC Server)
+        MEM(Monitor)
+        M -.->|Lookup| MEM
+    end
+    F -->|gRPC| M
+    M -->|SQL| DB[(DB)]
+    MEM -->|心跳/同步| DB
+    MO -->|轮询成员表| DB
+        </pre>
+        <figcaption class="diagram-caption">进程边界：只有 Matching 是独立服务；frontend 与 observer Monitor 都编译进 Worker 进程。</figcaption>
+      </figure>
+
+      <h3 id="layers">四层架构</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>层</th><th>包</th><th>部署形态</th><th>职责</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Worker</strong></td><td>用户代码</td><td>业务进程</td><td>调用 Frontend API 生产/消费任务</td></tr>
+            <tr><td><strong>Frontend</strong></td><td><code>frontend</code></td><td>库（链接进 Worker）</td><td>客户端路由库，一致性哈希定位分区所属节点，gRPC 连接池</td></tr>
+            <tr><td><strong>Matching</strong></td><td><code>matching</code></td><td>独立 gRPC 服务</td><td>管理分区所有权，处理 AddTask/PollTask/Ack/Nack</td></tr>
+            <tr><td><strong>Queue</strong></td><td><code>queue</code></td><td>库（链接进 Matching）</td><td>核心存储引擎，PhysicalQueue 管理单分区的完整生命周期</td></tr>
+            <tr><td><strong>Membership</strong></td><td><code>membership</code></td><td>库（两端各持一个 Monitor）</td><td>节点发现，一致性哈希环，成员变更通知</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <aside class="callout callout-info">
+        <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-info"/></svg>
+        <div class="callout-body">
+          <p class="callout-title">Frontend 是 SDK，不是独立服务</p>
+          <p>「四层架构」描述的是<strong>代码分层</strong>，不是部署单元。整套系统真正独立部署的进程只有 <strong>Matching</strong>。<code>frontend.New()</code> 在 Worker 进程内构造对象、不监听任何端口：round-robin 选分区和哈希环 <code>Lookup(queue/pid)</code> 全在 Worker 本地内存算完，再由自带的 gRPC 连接池直接拨号到 Matching 节点。它依赖的 <code>ResolverProvider</code> 同样是同进程内的 observer-only <code>membership.Monitor</code>，自行轮询成员表。</p>
+        </div>
+      </aside>
+
+      <h2 id="queue-pkg">Queue 包</h2>
+
+      <h3 id="store-iface">Store 接口</h3>
+      <p><code>Store</code> 是可插拔的持久化抽象层。公共实现位于 <code>store/gormstore</code>，基于 GORM 支持 SQLite 和 MySQL。</p>
+
+      <pre><code>type Store interface {
+    // 队列元数据
+    CreateQueue(ctx, info) error
+    GetQueue(ctx, queueName, partitionID) (*QueueInfo, error)
+    AllocateTaskIDRange(ctx, queueName, partitionID, newNextTaskID, prevRangeID) (int64, error)
+    AdvanceAckLevelAndDeleteTasks(ctx, queueName, partitionID, newAckLevel, prevRangeID) (int64, int64, error)
+
+    // 任务 CRUD
+    CreateTasks(ctx, tasks) error
+    GetTasks(ctx, queueName, partitionID, min, max, limit) ([]*TaskRow, error)
+    GetTasksWithOptions(ctx, queueName, partitionID, min, max, limit, opts) ([]*TaskRow, error)
+    DispatchTask(ctx, queueName, partitionID, taskID, dispatchedAt) error
+    UnDispatchTask(ctx, queueName, partitionID, taskID) error
+    ResetTimedOutTasks(ctx, queueName, partitionID, opts VisibilityResetOptions) ([]int64, error)
+    Close() error
+}</code></pre>
+
+      <aside class="callout callout-info">
+        <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-info"/></svg>
+        <div class="callout-body">
+          <p class="callout-title">连接生命周期</p>
+          <p><code>matching.Config.Store</code> 使用显式的 <code>matching.Store</code> 契约，组合 <code>queue.Store</code> 与 <code>dbleader.LockStore</code>。连接生命周期由调用者管理；<code>Matching.Stop</code> 只停止服务自身。<code>Store.Membership()</code> 返回共享同一 GORM 连接的 <code>membership.MemberStore</code> 适配器，连接由父 <code>Store.Close()</code> 统一释放。</p>
+        </div>
+      </aside>
+
+      <h3 id="db-schema">数据库表结构</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>表</th><th>关键列</th><th>用途</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>queue_info</code></td><td>queue_name, partition_id, range_id, ack_level, next_task_id</td><td>分区元数据</td></tr>
+            <tr><td><code>tasks</code></td><td>task_id, queue_name, partition_id, routing_key, routing_deadline, data, created_at, dispatched_at</td><td>任务数据与定向 fallback</td></tr>
+            <tr><td><code>taskq_partition_lock</code></td><td>lock_name, leader_ip, expire_at_ms, version</td><td><code>dbleader</code> 分区锁</td></tr>
+            <tr><td><code>taskq_partition_lock_members</code></td><td>lock_name, instance_id, node_ip, last_seen</td><td><code>dbleader</code> 成员心跳</td></tr>
+            <tr><td><code>taskq_membership_members</code></td><td>service_name, rpc_address, rpc_port, heartbeat_at, expires_at</td><td><code>membership.Monitor</code> 服务发现心跳</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 id="physical-queue">PhysicalQueue — 单分区核心</h3>
+      <p>每个 <code>PhysicalQueue</code> 管理一个分区的内存状态和对外服务逻辑。它本身不再在构造时自动启动后台循环；writer、GC、可见性扫描都由外层单独运行。</p>
+      <p>当前生产路径为每个分区创建一个 <code>dbleader</code> LeaderTask。LeaderTask 获得锁后创建 <code>PhysicalQueue</code>，等待 writer 就绪，再并行运行 writer、GC ticker 和 visibility ticker；任一循环返回错误会取消另外两个循环并关闭该分区。</p>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+flowchart TB
+    subgraph PQ[PhysicalQueue]
+        W(taskWriter)
+        RT(taskRuntime)
+        DS[deliveryState]
+        WR[waiterRegistry]
+        GC(taskGC)
+        VS(visibilityScanner)
+    end
+    W -->|onFlush 回调| RT
+    RT --> DS
+    RT --> WR
+    DS -->|ackLevel| GC
+    VS -->|超时 taskID| RT
+    W -->|批量写入| DB[(DB)]
+    GC -->|DeleteTasks| DB
+    VS -->|ResetTimedOutTasks| DB
+        </pre>
+        <figcaption class="diagram-caption">PhysicalQueue 内部组件协作：写入、状态、等待者、GC 与可见性扫描。</figcaption>
+      </figure>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>组件</th><th>职责</th><th>周期</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>taskWriter</strong></td><td>收集入队请求，批量 flush 到 DB，触发 sync match</td><td>LeaderTask 持锁期间持续运行</td></tr>
+            <tr><td><strong>taskRuntime</strong></td><td>负责取任务、dispatch、ack/nack，把存储操作和内存状态衔接起来</td><td>—</td></tr>
+            <tr><td><strong>deliveryState</strong></td><td>内存中维护 outstanding/redelivery/acked 集合，追踪 ackLevel/maxReadLevel</td><td>—</td></tr>
+            <tr><td><strong>waiterRegistry</strong></td><td>管理长轮询阶段注册的等待者</td><td>—</td></tr>
+            <tr><td><strong>taskGC</strong></td><td>根据 ackLevel 删除已确认的任务，通过 CAS 持久化 ackLevel</td><td>LeaderTask 内每 5s 执行一次</td></tr>
+            <tr><td><strong>visibilityScanner</strong></td><td>检测超时的已分发任务，移入 redelivery 队列</td><td>LeaderTask 内每 1s 执行一次</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <aside class="callout callout-info">
+        <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-info"/></svg>
+        <div class="callout-body">
+          <p class="callout-title">分区分配不在 queue 包内</p>
+          <p><code>membership</code> 负责一致性哈希，把 <code>queue/partition</code> 映射到节点；<code>matching</code> 负责按需加载对应分区，并通过 <code>dbleader.Manager</code> 持锁运行、失锁停止；<code>PhysicalQueue</code> 只负责自己这一个分区的任务生命周期与长轮询。</p>
+        </div>
+      </aside>
+
+      <h3 id="ownership">运行期开关与写入围栏</h3>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+flowchart TD
+    A[节点启动/分区被分配] -->|TryAcquire| B{dbleader 锁}
+    B -->|成功| C[创建 PhysicalQueue 状态]
+    C --> D[启动 partition LeaderTask]
+    D --> E[writer goroutine]
+    D --> F[GC ticker goroutine]
+    D --> G[visibility ticker goroutine]
+    B -->|失败| H[等待下一轮重试]
+    E -->|写入时| I{RangeID CAS}
+    F -->|清理时| I
+    D -->|续约失败/主动停止/子循环失败| J[关闭 PhysicalQueue]
+    I -->|成功| K[操作完成]
+    I -->|ErrOwnershipLost| J
+        </pre>
+        <figcaption class="diagram-caption">分区从抢锁到运行再到失锁关闭的完整生命周期。</figcaption>
+      </figure>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>层</th><th>机制</th><th>时机</th><th>作用</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>运行期开关</strong></td><td><code>dbleader</code> 锁</td><td>分区状态创建、writer/GC/扫描器运行、停止</td><td>保证同一时刻只有一个节点真正对外服务</td></tr>
+            <tr><td><strong>RangeID CAS</strong></td><td>乐观锁：<code>UPDATE WHERE range_id = prevRangeID</code></td><td>每次写入/GC</td><td>检测写冲突，防止脑裂写入</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="membership-pkg">Membership 包</h2>
+      <p>节点发现和一致性哈希路由层。</p>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+flowchart TB
+    MON(Monitor) -->|advertised services 心跳| MS[(MemberStore)]
+    MON -->|watched services 轮询| MS
+    MON -->|setMembers| SR(ServiceResolver)
+    SR -->|原子替换| HR[HashRing 虚拟节点]
+    SR -->|ChangedEvent| L1[Matching Listener]
+    SR -->|ChangedEvent| L2[Frontend Listener]
+        </pre>
+        <figcaption class="diagram-caption">Monitor 写心跳并同步成员，ServiceResolver 重建哈希环并广播变更。</figcaption>
+      </figure>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>组件</th><th>职责</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Monitor</strong></td><td>为 advertised services 写心跳，为 watched services 维护 ServiceResolver</td></tr>
+            <tr><td><strong>ServiceResolver</strong></td><td>维护哈希环，提供 <code>Lookup(key)</code> 路由查询，广播成员变更事件</td></tr>
+            <tr><td><strong>HashRing</strong></td><td>虚拟节点（默认 100 个/节点），farm.Fingerprint32 哈希，顺时针查找</td></tr>
+            <tr><td><strong>HostInfo</strong></td><td>节点元数据：地址、draining 状态、定时加入/退出</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="matching-pkg">Matching 包</h2>
+      <p>gRPC 分区管理服务，每个节点只处理哈希环分配给自己的分区。gRPC 接口定义在 <code>matching.proto</code>：</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>RPC</th><th>功能</th></tr></thead>
+          <tbody>
+            <tr><td><code>AddTask</code></td><td>写入任务到指定分区</td></tr>
+            <tr><td><code>PollTask</code></td><td>消费任务（支持非阻塞和长轮询）</td></tr>
+            <tr><td><code>PollQueue</code></td><td>一次轮询同一 owner 的多个分区，返回一个任务并回收同时命中的其他 lease</td></tr>
+            <tr><td><code>AckTask</code></td><td>确认消费完成</td></tr>
+            <tr><td><code>NackTask</code></td><td>拒绝消费，触发重投递（respool）；<code>undelivered=true</code> 表示仅归还未交付的 lease，不计入 attempt</td></tr>
+            <tr><td><code>GetQueueInfo</code></td><td>查询队列的分区数</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>PartitionManager 核心逻辑</h4>
+      <ul>
+        <li><code>isOwner(queue, pid)</code> — 通过哈希环判断本节点是否拥有该分区</li>
+        <li><code>getOrLoadPartition</code> — 延迟加载，首次请求时启动 <code>dbleader.Manager</code>，等分区真正可服务后再返回</li>
+        <li><code>reconcile()</code> — 成员变更时重新计算分区分配，加载新分区、卸载失去的分区</li>
+      </ul>
+
+      <h2 id="frontend-pkg">Frontend 包</h2>
+      <p>客户端路由 SDK（<strong>不是独立服务、不监听端口</strong>），直接链接进 worker 进程，worker 通过它透明访问分布式队列。</p>
+      <ul>
+        <li>通过 <code>GetQueueInfo</code> 自动发现分区数量</li>
+        <li>round-robin 选分区写入</li>
+        <li>快速扫描 + 长轮询消费</li>
+        <li>gRPC 连接池，成员离开时自动清理</li>
+        <li>失败重试（<code>FailedPrecondition</code> / <code>Unavailable</code>）</li>
+      </ul>
+
+      <h2 id="enqueue-flow">Enqueue 流程</h2>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+    participant W as Worker
+    participant F as Frontend
+    participant M as Matching (gRPC)
+    participant PQ as PhysicalQueue
+    participant DB as SQLite
+
+    W->>F: Enqueue(data)
+    F->>F: pid = round_robin(numPartitions)
+    F->>F: host = hashRing.Lookup(queue/pid)
+    F->>M: gRPC AddTask(queue, pid, data)
+    M->>M: getOrLoadPartition(queue, pid)
+    M->>PQ: AddTask(data)
+    PQ->>PQ: taskWriter.enqueue(data)
+    PQ->>DB: 批量 CreateTasks
+    PQ->>PQ: onFlush 回调
+    alt 有等待中的 waiter
+        PQ->>PQ: sync match 直接投递给 waiter
+    else 无本地 waiter
+        PQ->>PQ: 更新可读水位，等待后续 poll 领取
+    end
+    M-->>F: AddTaskResponse
+    F-->>W: nil (成功)
+        </pre>
+        <figcaption class="diagram-caption">写入路径：round-robin 选分区 → 哈希环定位节点 → 批量落库 → sync match。</figcaption>
+      </figure>
+
+      <h3 id="idempotency">At-least-once 与业务幂等契约</h3>
+      <p><code>Frontend.Enqueue</code> 对可重试的 AddTask 路由或 gRPC 错误最多尝试 3 次，重试间隔为 50ms。Matching 可能已经提交任务，而 AddTask 响应在网络中丢失；后续重试会写入另一条任务。消费者进程退出、visibility timeout 和 Nack 也会触发重新投递。</p>
+
+      <div class="timeline">
+        <article class="step">
+          <div class="step-num">1</div>
+          <div class="step-body">
+            <h3>生产者携带稳定幂等键</h3>
+            <p>在 payload 中携带业务幂等键，例如 <code>order_id + operation</code>，应用层重试继续使用同一个键。</p>
+          </div>
+        </article>
+        <article class="step">
+          <div class="step-num">2</div>
+          <div class="step-body">
+            <h3>消费者在事务内写唯一记录</h3>
+            <p>在业务数据库事务内写入幂等键唯一记录并执行副作用；唯一键冲突表示该任务已经处理。</p>
+          </div>
+        </article>
+        <article class="step">
+          <div class="step-num">3</div>
+          <div class="step-body">
+            <h3>事务提交后再 Ack</h3>
+            <p>业务事务提交成功后调用 <code>Ack</code>。处理失败时返回错误或调用 <code>Nack</code>，让任务重新投递。</p>
+          </div>
+        </article>
+        <article class="step">
+          <div class="step-num">4</div>
+          <div class="step-body">
+            <h3>外部调用复用同一幂等键</h3>
+            <p>外部系统调用使用同一个幂等键作为对方接口的 idempotency key，覆盖"外部调用成功、消费者提交前退出"的窗口。</p>
+          </div>
+        </article>
+      </div>
+
+      <pre><code>CREATE UNIQUE INDEX uk_task_effect_idempotency_key
+ON task_effects (idempotency_key);</code></pre>
+
+      <div class="highlight">
+        <span class="highlight-label">要点</span>
+        <p>TaskQ 提供 <strong>at-least-once delivery</strong>；<strong>业务幂等键定义一次业务效果</strong>。两者共同构成端到端的 exactly-once 语义，缺一不可。</p>
+      </div>
+
+      <h3 id="respool-retry">投递重试、respool 与 attempt 上限</h3>
+      <p>失败任务（<code>Nack</code>、可见性超时）不再原地放回，而是 <strong>respool</strong>：以更高的 <code>taskID</code> 重写一条新任务，再确认（ack）老行。这样单条反复失败的任务不会永久钉死 <code>ackLevel</code>——<code>acked</code> 内存与 <code>tasks</code> 表持续 GC，队列始终能向前推进。该机制对齐 Temporal matching 层的 <code>respoolTaskAfterError</code>。</p>
+      <ul>
+        <li><strong><code>attempt</code> 列</strong> — <code>tasks</code> 表新增，记录该任务已失败的投递次数（首次写入为 0）。持久化在行上，进程重启 / 分区易主后计数不丢。</li>
+        <li><strong><code>MaxAttempts</code>（<code>matching.Config</code>）</strong> — 单任务的总投递次数上限。<strong>默认 <code>0</code> 表示不限次数</strong>：反复失败的任务持续 respool，<code>ackLevel</code> 不会被其阻塞，数据也不会被 TaskQ 主动删除。设为正数才启用上限，超过后任务被丢弃并仅记录一条 <code>error</code> 日志。</li>
+        <li><strong>毒丸处理</strong> — 遇到无法处理的消息，推荐消费者<strong>自行持久化后回 <code>Ack</code></strong>（而非 <code>Nack</code>），让任务正常出队。TaskQ 是运输层，不替业务决定丢弃数据，因此默认不设上限。</li>
+      </ul>
+      <aside class="callout callout-warn">
+        <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-warn"/></svg>
+        <div class="callout-body">
+          <p class="callout-title">行为变化（自 respool 版本起）</p>
+          <p><code>Nack</code> 返回后任务<strong>不再立即可 poll</strong>：新行由 writer 异步落库，需等下一轮 flush。同分区消费顺序进一步弱化：respool 把重试任务排到队尾（新 <code>taskID</code>）。老 attempt 的 token 在其 delivery 退役后，<code>Ack</code>/<code>Nack</code> 返回从 <code>ErrStaleToken</code> 变为 <code>ErrTaskNotOutstanding</code>。</p>
+        </div>
+      </aside>
+
+      <h2 id="dequeue-flow">Dequeue 流程</h2>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+    participant W as Worker
+    participant F as Frontend
+    participant M1 as Matching owner A
+    participant M2 as Matching owner B
+    participant PQ as PhysicalQueue
+
+    W->>F: Dequeue(ctx)
+    F->>F: 按一致性哈希 owner 聚合 partitions
+    Note over F,M2: 阶段 1：按 owner 顺序快速扫描
+    loop 每个 owner
+        F->>M1: PollQueue(partitions, timeout=0)
+        M1->>PQ: 按轮转顺序 TryPoll()
+        M1-->>F: Empty=true / data+token
+    end
+    alt 快速扫描命中
+        F-->>W: data, token, nil
+    else 所有 owner 均为空
+        Note over F,M2: 阶段 2：每个 owner 一个并发长轮询
+        par owner A
+            F->>M1: PollQueue(partitions, timeout=30s)
+            M1->>PQ: 每个 partition 注册 waiter
+            PQ-->>M1: 首批可领取任务
+            M1->>PQ: Nack 同 owner loser lease
+            M1-->>F: winner data+token
+        and owner B
+            F->>M2: PollQueue(partitions, timeout=30s)
+        end
+        F->>F: 首个 owner 胜出并取消其他请求
+        F->>M2: Nack 已返回的其他 owner loser lease
+        F-->>W: winner；所有 owner 超时则 ErrNoTask
+    end
+        </pre>
+        <figcaption class="diagram-caption">两阶段消费：先顺序快速扫描，再对每个 owner 并发长轮询。</figcaption>
+      </figure>
+
+      <div class="highlight">
+        <span class="highlight-label">要点</span>
+        <p><code>PollQueue</code> 将一次 Dequeue 的 RPC fan-out 从分区数量 <code>O(partitions)</code> 收敛为 Matching owner 数量 <code>O(owners)</code>。</p>
+      </div>
+
+      <aside class="callout callout-info">
+        <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-info"/></svg>
+        <div class="callout-body">
+          <p class="callout-title">向后兼容与 lease 回收</p>
+          <p>Frontend 兼容仅实现旧契约的 Matching 节点：<code>PollQueue</code> 返回 <code>Unimplemented</code> 时，同一 owner 内回退为并发 <code>PollTask</code>。Matching 和 Frontend 都使用独立的一秒清理上下文回收 loser lease；调用方取消与 delivery 同时发生时，Matching 先 Nack 已领取的 lease，再返回 <code>Canceled</code>。</p>
+        </div>
+      </aside>
+
+      <h2 id="ack-nack-flow">Ack / Nack 流程</h2>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+    participant W as Worker
+    participant F as Frontend
+    participant M as Matching
+    participant PQ as PhysicalQueue
+    participant RT as taskRuntime
+    participant DS as deliveryState
+    participant DB as SQLite
+
+    Note over W,DB: Ack 流程
+    W->>F: Ack(token)
+    F->>M: gRPC AckTask(token)
+    M->>PQ: Ack(token)
+    PQ->>RT: ack(taskID, deliveryID)
+    RT->>DS: 从 outstanding 移除
+    DS->>DS: 标记 acked, 尝试推进 ackLevel
+    PQ->>DB: (GC 周期) DeleteTasks(ackLevel)
+
+    Note over W,DB: Nack 流程（respool）
+    W->>F: Nack(token)
+    F->>M: gRPC NackTask(token)
+    M->>PQ: Nack(token)
+    PQ->>RT: nack(taskID, deliveryID)
+    RT->>DS: outstanding 移入 respooling
+    RT->>DB: 以新 taskID 重写任务（attempt+1）
+    DS->>DS: 新行落库后 finishRespool，老行记 acked
+    PQ->>PQ: wakeWaiters() 投递给等待中的 poller
+        </pre>
+        <figcaption class="diagram-caption">Token 结构为 <code>queue/partition/taskID/ownershipEpoch/deliveryID</code>；ackLevel 推进到最大连续已确认 ID。</figcaption>
+      </figure>
+
+      <h2 id="partition-ownership">分区所有权流程</h2>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+    participant N as 节点
+    participant HR as HashRing
+    participant DB as SQLite
+    participant L as dbleader.Manager
+    participant PQ as PhysicalQueue
+
+    Note over N,PQ: 启动 / 成员变更时
+    N->>HR: Lookup(queue/pid) == self?
+    alt 本节点拥有该分区
+        N->>L: Start(lock=queue/pid)
+        L->>DB: TryAcquire / Renew
+        alt 成功持锁
+            L->>PQ: 创建并托管 PhysicalQueue
+        else 其他节点仍持锁
+            L->>L: 等待并重试
+        end
+    else 不属于本节点
+        N->>N: 跳过
+    end
+
+    Note over N,PQ: 关闭分区时
+    N->>L: Stop()
+    L->>PQ: cancel context
+    L->>DB: Release(lock)
+        </pre>
+        <figcaption class="diagram-caption">哈希环判定归属，dbleader 锁保证独占，Stop 时释放锁与上下文。</figcaption>
+      </figure>
+
+      <h2 id="reconcile">成员变更 → Reconcile</h2>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+sequenceDiagram
+    participant MS as MemberStore
+    participant MON as Monitor
+    participant SR as ServiceResolver
+    participant PM as PartitionManager
+    participant FE as Frontend
+
+    loop 每 N 秒
+        MON->>MS: GetActiveMembers()
+        MS-->>MON: 成员列表
+        MON->>SR: setMembers(hosts)
+        SR->>SR: 对比差异，重建 HashRing
+        SR->>PM: ChangedEvent
+        SR->>FE: ChangedEvent
+    end
+
+    PM->>PM: reconcile()
+    Note over PM: 计算本节点应拥有的分区
+    PM->>PM: 卸载不再属于本节点的分区
+    PM->>PM: 加载新分配的分区
+    FE->>FE: 清理已离开节点的 gRPC 连接
+        </pre>
+        <figcaption class="diagram-caption">成员变更驱动哈希环重建，Matching 重新分配分区，Frontend 清理连接池。</figcaption>
+      </figure>
+
+      <h2 id="internals">PhysicalQueue 内部结构</h2>
+
+      <h3 id="delivery-state">deliveryState 状态</h3>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>字段</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td><code>ackLevel</code></td><td>已确认的最高连续 taskID</td></tr>
+            <tr><td><code>readLevel</code></td><td>已从 DB 读取的最高 taskID</td></tr>
+            <tr><td><code>maxReadLevel</code></td><td>DB 中已知的最高 taskID</td></tr>
+            <tr><td><code>outstanding</code></td><td><code>{taskID → 已分发但未确认的任务}</code></td></tr>
+            <tr><td><code>respooling</code></td><td><code>{taskID → 正以新 taskID 重写、等待落库}</code></td></tr>
+            <tr><td><code>redelivery</code></td><td><code>[waiter 消失等待原地重投递的任务]</code></td></tr>
+            <tr><td><code>acked</code></td><td><code>{taskID → true}</code>，已确认但 ackLevel 尚未推进</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> DB: CreateTasks
+    DB --> outstanding: tryGetTask / dispatch
+    outstanding --> acked: ack()
+    outstanding --> respooling: nack() / visScan 超时
+    respooling --> acked: 新行落库 finishRespool
+    outstanding --> redelivery: waiter 消失
+    redelivery --> outstanding: tryGetTask
+    acked --> [*]: advanceAckLevel 后 GC 删除
+        </pre>
+        <figcaption class="diagram-caption">失败走 respooling 换新 taskID 排到队尾；仅 waiter 消失才走原地 redelivery。</figcaption>
+      </figure>
+
+      <aside class="callout callout-warn">
+        <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-warn"/></svg>
+        <div class="callout-body">
+          <p class="callout-title">ackLevel 推进规则（advanceAckLevel）</p>
+          <p>从 <code>ackLevel+1</code> 开始逐个检查：在 <code>outstanding</code> 中 → 停止（还在处理中）；在 <code>respooling</code> 中 → 停止（新行未落库，绝不提前 ack 老行）；在 <code>redelivery</code> 中 → 停止（未重新确认，防止 GC 删除）；在 <code>acked</code> 中 → 推进并继续检查下一个；其他 → 停止（还没读到）。</p>
+        </div>
+      </aside>
+
+      <p><code>deliveryState</code> 只维护内存中的任务状态；真正和 DB 打交道的是 <code>taskRuntime</code>。这样状态规则和存储调用分开，<code>PhysicalQueue</code> 自己只需要装配这些组件。</p>
+
+      <h3 id="sync-match">Sync Match 与 waiterRegistry</h3>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+flowchart TD
+    A[taskWriter flush] --> B[onFlush 回调]
+    B --> C[setMaxReadLevel taskID]
+    C --> D[taskRuntime 尝试投递]
+    D --> E{waiterRegistry 有等待者?}
+    E -->|是| F[取出 waiter dispatch 任务]
+    F --> G[发送到 channel]
+    E -->|否| H[保留在本分区]
+        </pre>
+        <figcaption class="diagram-caption">写入 flush 后的 sync match 路径；未命中则由后续 TryPoll / RegisterWaiter 消费。</figcaption>
+      </figure>
+
+      <h2 id="config">配置参考</h2>
+
+      <h4>Queue 内部常量</h4>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>内部常量</th><th>值</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>Partition lease TTL</td><td>3s</td><td><code>matching</code> 分区锁过期时间</td></tr>
+            <tr><td>Partition lease renew</td><td>1s</td><td><code>matching</code> 分区锁续期间隔</td></tr>
+            <tr><td>Partition lease retry</td><td>200ms</td><td>抢锁与续约故障重试间隔</td></tr>
+            <tr><td>GC Interval</td><td>5s</td><td>已确认任务清理间隔</td></tr>
+            <tr><td>Vis Scan Interval</td><td>1s</td><td>超时任务检测间隔</td></tr>
+            <tr><td>Writer Buffer</td><td>256</td><td>写入 channel 大小</td></tr>
+            <tr><td>Matching Reconcile</td><td>5s</td><td>成员事件之外的分区归属周期校验</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Membership</h4>
+      <pre><code>monitor := membership.NewMonitorWithConfig(membership.MonitorConfig{
+    AdvertisedServices: []string{"matching"},
+    WatchedServices:    []string{"matching"},
+    Store:              memberStore,
+    BroadcastAddr:      netip.MustParseAddrPort("10.0.0.1:7235"),
+    PollInterval:       3*time.Second,
+    PropagationTime:    5*time.Second,
+    ReplicaPoints:      100,
+})</code></pre>
+      <p><code>AdvertisedServices</code> 决定本进程写入哪些服务心跳；<code>WatchedServices</code> 决定本进程维护哪些服务的 resolver。Matching 进程通常同时 advertise 和 watch <code>matching</code>。旧 <code>NewMonitor(serviceNames, ...)</code> 保持兼容，它会把 <code>serviceNames</code> 同时映射到两个集合。</p>
+
+      <h4>Matching</h4>
+      <pre><code>matching.Config{
+    Store:         store,                           // 必填
+    Monitor:       monitor,                         // 必填
+    ServiceName:   "matching",                      // 默认 "matching"
+    ListenAddr:    ":7235",                         // gRPC 监听地址
+    BroadcastAddr: "10.0.0.1:7235",                 // 必填，广播地址
+    VisTimeout:    60 * time.Second,                // 默认 60s
+    MaxAttempts:   0,                               // 单任务投递次数上限，0=不限（默认）
+    QueueConfigs:  map[string]int{"my-queue": 4},   // 队列名 → 分区数
+    LeaseOwner:    "",                              // 为空时自动生成 UUID
+    ReconcileInterval: 5 * time.Second,             // 默认 5s
+    GRPCOptions:   []grpc.ServerOption{},           // 可选
+}</code></pre>
+
+      <h4>Frontend</h4>
+      <pre><code>frontend.Config{
+    ResolverProvider: monitor,                     // 推荐：只依赖 resolver provider
+    ServiceName:      "matching",                  // 默认 "matching"
+    QueueName:        "my-queue",                  // 必填
+    DialOpts:         []grpc.DialOption{...},      // gRPC 拨号选项
+    PollTimeout:      30 * time.Second,            // 长轮询超时，默认 30s
+}</code></pre>
+      <p><code>Monitor</code> 字段继续兼容已有调用；新装配使用 <code>ResolverProvider</code>，Frontend 只依赖 <code>GetResolver</code>。</p>
+
+      <h2 id="quickstart">快速开始</h2>
+
+      <details class="collapsible">
+        <summary>完整可运行示例（SQLite 单进程）</summary>
+        <div class="collapsible-body">
+          <pre><code>package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "net"
+    "net/netip"
+    "time"
+
+    "github.com/donutnomad/taskq/frontend"
+    "github.com/donutnomad/taskq/matching"
+    "github.com/donutnomad/taskq/membership"
+    "github.com/donutnomad/taskq/store/gormstore"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+)
+
+func main() {
+    ctx := context.Background()
+
+    // 1. 创建存储
+    store, _ := gormstore.NewSQLite("taskq.db", gormstore.Config{AutoMigrate: true})
+    defer store.Close()
+
+    // 2. Membership 适配器与 queue/leader store 共享连接
+    memberStore := store.Membership()
+
+    // 3. 启动成员发现
+    lis, _ := net.Listen("tcp", "127.0.0.1:0")
+    addr := lis.Addr().String()
+    addrPort, _ := netip.ParseAddrPort(addr)
+    lis.Close()
+
+    monitor := membership.NewMonitorWithConfig(membership.MonitorConfig{
+        AdvertisedServices: []string{"matching"},
+        WatchedServices:    []string{"matching"},
+        Store:              memberStore,
+        BroadcastAddr:      addrPort,
+        PollInterval:       time.Second,
+        PropagationTime:    time.Second,
+        ReplicaPoints:      100,
+    })
+    monitor.Start()
+    monitor.WaitUntilInitialized(ctx)
+    defer monitor.Stop()
+
+    // 4. 启动 Matching 服务
+    srv, _ := matching.NewServer(matching.Config{
+        Store:         store,
+        Monitor:       monitor,
+        ListenAddr:    addr,
+        BroadcastAddr: addr,
+        QueueConfigs:  map[string]int{"demo-queue": 4},
+    })
+    srv.Start()
+    defer srv.Stop()
+
+    // 5. 创建 Frontend
+    fe, _ := frontend.New(frontend.Config{
+        ResolverProvider: monitor,
+        QueueName:        "demo-queue",
+        DialOpts:         []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+        PollTimeout:      5 * time.Second,
+    })
+    defer fe.Close()
+
+    // 6. 生产
+    fe.Enqueue(ctx, []byte(`{"type":"send-email","to":"user@example.com"}`))
+
+    // 7. 消费
+    data, token, err := fe.Dequeue(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("收到任务: %s\n", data)
+
+    // 8. 确认（或 Nack 重投递）
+    fe.Ack(ctx, token)
+    // fe.Nack(ctx, token) // 拒绝，任务会被重新投递
+}</code></pre>
+          <p>可直接运行仓库里的完整示例：</p>
+          <pre><code>go run ./internal/example/</code></pre>
+        </div>
+      </details>
+
+      <h3 id="production">生产装配</h3>
+      <p>生产环境先通过发布系统迁移 <code>queue_info</code>、<code>tasks</code>、<code>taskq_partition_lock</code>、<code>taskq_partition_lock_members</code> 和 <code>taskq_membership_members</code> 五张表，再以 <code>AutoMigrate: false</code> 启动进程。</p>
+
+      <aside class="callout callout-warn">
+        <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-warn"/></svg>
+        <div class="callout-body">
+          <p class="callout-title">上线顺序</p>
+          <p>先创建列与索引，再部署读写 routing 字段的 TaskQ 二进制。零值 deadline 持久化为 <code>NULL</code>，表示永久按 routing key 定向；非空 deadline 到期后由原任务行直接参与普通 poll，原任务行、TaskID 和 AckLevel 保持连续。每次 delivery 生成新的 token；旧 attempt token 无法 Ack 或 Nack 后续 delivery。</p>
+        </div>
+      </aside>
+
+      <details class="collapsible">
+        <summary>routed delivery 兼容迁移 SQL（MySQL / SQLite）</summary>
+        <div class="collapsible-body">
+          <p>MySQL：</p>
+          <pre><code>ALTER TABLE tasks
+    ADD COLUMN routing_key VARCHAR(191) NOT NULL DEFAULT '',
+    ADD COLUMN routing_deadline DATETIME(6) NULL;
+
+CREATE INDEX idx_tasks_visibility
+    ON tasks (queue_name, partition_id, dispatched_at, routing_key, task_id);
+
+CREATE INDEX idx_tasks_routing_deadline
+    ON tasks (queue_name, partition_id, dispatched_at, routing_deadline, task_id);</code></pre>
+          <p>SQLite：</p>
+          <pre><code>ALTER TABLE tasks ADD COLUMN routing_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN routing_deadline DATETIME NULL;
+
+CREATE INDEX idx_tasks_visibility
+    ON tasks (queue_name, partition_id, dispatched_at, routing_key, task_id);
+
+CREATE INDEX idx_tasks_routing_deadline
+    ON tasks (queue_name, partition_id, dispatched_at, routing_deadline, task_id);</code></pre>
+          <p>已经部署 Slice D routing key 的环境保留现有 <code>routing_key</code> 与 <code>idx_tasks_visibility</code>，只执行 deadline 列和 deadline 索引语句。</p>
+        </div>
+      </details>
+
+      <details class="collapsible">
+        <summary>MySQL 生产装配代码与 shutdown 顺序</summary>
+        <div class="collapsible-body">
+          <pre><code>store, err := gormstore.NewMySQL(os.Getenv("TASKQ_MYSQL_DSN"), gormstore.Config{
+    AutoMigrate: false,
+})
+if err != nil {
+    return err
+}
+
+monitor := membership.NewMonitorWithConfig(membership.MonitorConfig{
+    AdvertisedServices: []string{"matching"},
+    WatchedServices:    []string{"matching"},
+    Store:              store.Membership(),
+    BroadcastAddr:      netip.MustParseAddrPort(broadcastAddr),
+    PollInterval:       3*time.Second,
+    PropagationTime:    5*time.Second,
+    ReplicaPoints:      200,
+})
+monitor.Start()
+initCtx, cancelInit := context.WithTimeout(ctx, 30*time.Second)
+defer cancelInit()
+if err := monitor.WaitUntilInitialized(initCtx); err != nil {
+    monitor.Stop()
+    _ = store.Close()
+    return err
+}
+
+server, err := matching.NewServer(matching.Config{
+    Store:             store,
+    Monitor:           monitor,
+    ListenAddr:        listenAddr,
+    BroadcastAddr:     broadcastAddr,
+    QueueConfigs:      queueConfigs,
+    ReconcileInterval: 5 * time.Second,
+})
+if err != nil {
+    monitor.Stop()
+    _ = store.Close()
+    return err
+}
+if err := server.Start(); err != nil {
+    monitor.Stop()
+    _ = store.Close()
+    return err
+}
+
+&lt;-ctx.Done()
+
+// Shutdown 顺序：停止流量与分区，再停止成员心跳，最后关闭共享 DB。
+server.Stop()
+monitor.Stop()
+return store.Close()</code></pre>
+          <p>每个进程创建一个父 <code>gormstore.Store</code>，Matching 与 Membership 共用该连接池。应用负责在 <code>Store.Close()</code> 前停止所有 Server、Monitor 和 Frontend 实例。<code>AutoMigrate: true</code> 适用于本地开发和测试。</p>
+          <p>独立 Worker 使用 observer-only Monitor。该进程读取 Matching 成员记录并维护 resolver，成员表只保留真实 Matching 节点：</p>
+          <pre><code>observer := membership.NewMonitorWithConfig(membership.MonitorConfig{
+    WatchedServices: []string{"matching"},
+    Store:           store.Membership(),
+    PollInterval:    3*time.Second,
+    PropagationTime: 5*time.Second,
+    ReplicaPoints:   200,
+})
+observer.Start()
+if err := observer.WaitUntilInitialized(ctx); err != nil {
+    return err
+}
+defer observer.Stop()
+
+workflowTasks, err := frontend.New(frontend.Config{
+    ResolverProvider: observer,
+    QueueName:        "workflow-tasks",
+    PollTimeout:      30*time.Second,
+})</code></pre>
+        </div>
+      </details>
+
+      <h2 id="project-layout">项目结构</h2>
+
+      <pre><code>taskq/
+├── queue/                      # 核心存储引擎
+│   ├── store.go                # Store 接口定义
+│   ├── session_claim.go        # PhysicalQueue 会话 claim
+│   ├── physical_queue.go       # 单分区队列总控
+│   ├── writer.go               # 批量写入器
+│   ├── task_runtime.go         # 任务获取 / ack / nack 编排
+│   ├── delivery_state.go       # 内存任务状态
+│   ├── waiter_registry.go      # 长轮询等待者管理
+│   ├── token.go                # token 生成与校验
+│   ├── gc.go                   # 已确认任务垃圾回收
+│   ├── visibility.go           # 可见性超时扫描器
+│   └── ownership.go            # rangeID CAS 所有权
+├── membership/                 # 成员发现 + 一致性哈希
+│   ├── membership.go           # 接口定义
+│   ├── monitor.go              # 心跳 + 成员同步
+│   ├── service_resolver.go     # 哈希环路由 + 事件通知
+│   ├── hashring.go             # 一致性哈希环
+│   ├── hostinfo.go             # 节点元数据
+│   └── example/                # 使用示例
+├── matching/                   # gRPC 分区管理服务
+│   ├── matching.proto          # Protobuf 定义
+│   ├── matching.go             # Server 生命周期
+│   ├── server.go               # gRPC Handler
+│   ├── partition_mgr.go        # 分区管理 + Reconcile
+│   ├── matching.pb.go          # 生成代码
+│   └── matching_grpc.pb.go     # 生成代码
+├── frontend/                   # 客户端路由库
+│   ├── frontend.go             # 路由器（Enqueue/Dequeue/Ack/Nack）
+│   └── client.go               # gRPC 连接池
+├── store/gormstore/            # GORM 持久化实现
+│   ├── store.go                # SQLite/MySQL queue.Store + dbleader.LockStore
+│   ├── membership.go           # membership.MemberStore 独立表适配器
+│   ├── store_test.go           # SQLite 契约测试
+│   └── mysql_integration_test.go # MySQL Docker 集成测试
+├── internal/example/
+│   └── main.go                 # 完整使用示例
+├── go.mod
+└── go.sum</code></pre>
+
+      <h2 id="deps-tests">依赖与测试</h2>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>依赖</th><th>用途</th></tr></thead>
+          <tbody>
+            <tr><td><code>github.com/dgryski/go-farm</code></td><td>FarmHash — 一致性哈希环的哈希函数</td></tr>
+            <tr><td><code>github.com/google/uuid</code></td><td>UUID 生成 — 节点标识和 Lease Owner</td></tr>
+            <tr><td><code>google.golang.org/grpc</code></td><td>gRPC 框架 — Matching 服务通信</td></tr>
+            <tr><td><code>google.golang.org/protobuf</code></td><td>Protobuf 序列化</td></tr>
+            <tr><td><code>gorm.io/gorm</code></td><td>GORM 持久化框架</td></tr>
+            <tr><td><code>github.com/glebarez/sqlite</code></td><td>纯 Go SQLite GORM 驱动</td></tr>
+            <tr><td><code>gorm.io/driver/mysql</code></td><td>MySQL GORM 驱动</td></tr>
+            <tr><td><code>testcontainers-go</code></td><td>MySQL 集成测试容器</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>运行测试</h4>
+      <pre><code># 全量测试
+go test ./... -v
+
+# MySQL 集成测试
+go test -tags=integration ./store/gormstore -v
+
+# 主要包做 race 检测
+go test ./membership ./queue ./matching ./frontend -v -race
+
+# 运行示例
+go run ./internal/example/</code></pre>
+
+      <footer class="doc-footer">
+        <span>Generated by <a href="#">md2html</a></span>
+        <span>来源: README.md</span>
+      </footer>
+    </main>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+  <script>
+    // ---------- Theme ----------
+    const STORAGE_KEY = "md2html-theme";
+    function currentTheme() { return document.documentElement.dataset.theme || "light"; }
+    function applyThemeIcon() {
+      const use = document.getElementById("theme-icon-use");
+      if (use) use.setAttribute("href", currentTheme() === "dark" ? "#i-sun" : "#i-moon");
+    }
+    (function restoreTheme() {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) document.documentElement.dataset.theme = saved;
+    })();
+
+    // ---------- Mermaid ----------
+    const diagramSources = new Map();
+    function initMermaid() {
+      const isDark = currentTheme() === "dark";
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: isDark ? "dark" : "default",
+        themeVariables: {
+          primaryColor: isDark ? "#3A2A22" : "#FBEEE6",
+          primaryTextColor: isDark ? "#F5F0E8" : "#1A1A1A",
+          primaryBorderColor: isDark ? "#E89572" : "#D97757",
+          lineColor: isDark ? "#9A938A" : "#6B6B66",
+          secondaryColor: isDark ? "#2A2520" : "#F5F5F0",
+          tertiaryColor: isDark ? "#221E1A" : "#FFFFFF",
+          fontFamily: "Inter, system-ui, sans-serif",
+        },
+      });
+    }
+    async function renderMermaid() {
+      initMermaid();
+      const els = document.querySelectorAll(".mermaid");
+      els.forEach(el => {
+        if (!diagramSources.has(el)) diagramSources.set(el, el.textContent.trim());
+        el.textContent = diagramSources.get(el);
+        el.removeAttribute("data-processed");
+      });
+      try { await mermaid.run({ nodes: els }); } catch (e) { console.error(e); }
+    }
+    function toggleTheme() {
+      const next = currentTheme() === "light" ? "dark" : "light";
+      document.documentElement.dataset.theme = next;
+      localStorage.setItem(STORAGE_KEY, next);
+      applyThemeIcon();
+      renderMermaid();
+    }
+
+    // ---------- TOC drawer (mobile) ----------
+    function openToc()  { document.body.classList.add("toc-open"); }
+    function closeToc() { document.body.classList.remove("toc-open"); }
+    document.addEventListener("keydown", e => {
+      if (e.key === "Escape" && document.body.classList.contains("toc-open")) closeToc();
+    });
+
+    // ---------- TOC scrollspy ----------
+    function setupTocSpy() {
+      const links = document.querySelectorAll("#toc-nav a[href^='#']");
+      if (!links.length) {
+        const toc = document.getElementById("toc");
+        if (toc) toc.style.display = "none";
+        return;
+      }
+      const map = new Map();
+      links.forEach(a => {
+        const id = a.getAttribute("href").slice(1);
+        const el = document.getElementById(id);
+        if (el) map.set(el, a);
+        a.addEventListener("click", () => {
+          if (window.matchMedia("(max-width: 900px)").matches) closeToc();
+        });
+      });
+      const obs = new IntersectionObserver((entries) => {
+        entries.forEach(en => {
+          const link = map.get(en.target);
+          if (!link) return;
+          if (en.isIntersecting) {
+            links.forEach(l => l.classList.remove("active"));
+            link.classList.add("active");
+          }
+        });
+      }, { rootMargin: "-80px 0px -70% 0px", threshold: 0 });
+      map.forEach((_, el) => obs.observe(el));
+    }
+
+    // ---------- Anchor links on h2/h3 ----------
+    function injectAnchors() {
+      document.querySelectorAll(".content h2[id], .content h3[id]").forEach(h => {
+        if (h.querySelector(".anchor")) return;
+        const a = document.createElement("a");
+        a.className = "anchor";
+        a.href = "#" + h.id;
+        a.setAttribute("aria-label", "Permalink");
+        a.innerHTML = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-link"/></svg>';
+        h.appendChild(a);
+      });
+    }
+
+    // ---------- Copy-to-clipboard on <pre> ----------
+    function injectCopyButtons() {
+      document.querySelectorAll(".content pre").forEach(pre => {
+        if (pre.classList.contains("mermaid")) return;
+        if (pre.querySelector(".copy-btn")) return;
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "copy-btn";
+        btn.setAttribute("aria-label", "Copy code");
+        btn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-copy"/></svg>';
+        btn.addEventListener("click", async () => {
+          const code = pre.querySelector("code")?.textContent ?? pre.textContent;
+          try {
+            await navigator.clipboard.writeText(code);
+            btn.classList.add("copied");
+            btn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-check"/></svg>';
+            setTimeout(() => {
+              btn.classList.remove("copied");
+              btn.innerHTML = '<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-copy"/></svg>';
+            }, 1500);
+          } catch (e) { console.error(e); }
+        });
+        pre.appendChild(btn);
+      });
+    }
+
+    // ---------- Scroll progress ----------
+    function setupScrollProgress() {
+      const bar = document.getElementById("scroll-progress");
+      if (!bar) return;
+      const onScroll = () => {
+        const h = document.documentElement.scrollHeight - document.documentElement.clientHeight;
+        const p = h > 0 ? (document.documentElement.scrollTop / h * 100) : 0;
+        bar.style.width = p + "%";
+      };
+      window.addEventListener("scroll", onScroll, { passive: true });
+      onScroll();
+    }
+
+    // ---------- Boot ----------
+    document.addEventListener("DOMContentLoaded", () => {
+      applyThemeIcon();
+      injectAnchors();
+      injectCopyButtons();
+      renderMermaid();
+      setupTocSpy();
+      setupScrollProgress();
+    });
+  </script>
+</body>
+</html>

@@ -161,6 +161,7 @@ type taskRow struct {
 	RoutingKey      string     `gorm:"column:routing_key;not null;default:'';size:191;index:idx_tasks_visibility,priority:4"`
 	RoutingDeadline *time.Time `gorm:"column:routing_deadline;index:idx_tasks_routing_deadline,priority:4"`
 	Data            []byte     `gorm:"column:data;not null"`
+	Attempt         int        `gorm:"column:attempt;not null;default:0"`
 	CreatedAt       time.Time  `gorm:"column:created_at;not null"`
 	DispatchedAt    *time.Time `gorm:"column:dispatched_at;index:idx_tasks_visibility,priority:3;index:idx_tasks_routing_deadline,priority:3"`
 }
@@ -207,6 +208,7 @@ func fromTask(row *queue.TaskRow) taskRow {
 		RoutingKey:      row.RoutingKey,
 		RoutingDeadline: nullableTime(row.RoutingDeadline),
 		Data:            row.Data,
+		Attempt:         row.Attempt,
 		CreatedAt:       row.CreatedAt,
 		DispatchedAt:    row.DispatchedAt,
 	}
@@ -220,6 +222,7 @@ func toTask(row taskRow) *queue.TaskRow {
 		RoutingKey:      row.RoutingKey,
 		RoutingDeadline: valueTime(row.RoutingDeadline),
 		Data:            row.Data,
+		Attempt:         row.Attempt,
 		CreatedAt:       row.CreatedAt,
 		DispatchedAt:    row.DispatchedAt,
 	}
@@ -447,10 +450,13 @@ func (s *Store) ResetTimedOutTasks(ctx context.Context, queueName string, partit
 	var candidateIDs []int64
 	var resetIDs []int64
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&taskRow{}).
+		candidateQuery := tx.Model(&taskRow{}).
 			Where("queue_name = ? AND partition_id = ? AND task_id > ? AND dispatched_at IS NOT NULL AND dispatched_at < ?", queueName, partitionID, opts.AckLevel, cutoff).
-			Order("task_id ASC").
-			Pluck("task_id", &candidateIDs).Error; err != nil {
+			Order("task_id ASC")
+		if opts.MaxReset > 0 {
+			candidateQuery = candidateQuery.Limit(opts.MaxReset)
+		}
+		if err := candidateQuery.Pluck("task_id", &candidateIDs).Error; err != nil {
 			return err
 		}
 		resetIDs = make([]int64, 0, len(candidateIDs))

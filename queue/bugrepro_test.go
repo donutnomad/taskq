@@ -121,7 +121,7 @@ func TestBugRepro_TryPollShouldNotDeliverSameTaskConcurrently(t *testing.T) {
 	base := newTestStore(t)
 	store := newGetTasksBarrierStore(base)
 
-	pq, err := newPhysicalQueue(context.Background(), store, "dup-q", 0, 60*time.Second, "owner-a")
+	pq, err := newPhysicalQueue(context.Background(), store, "dup-q", 0, 60*time.Second, defaultMaxAttempts, "owner-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestBugRepro_TryPollShouldNotDeliverSameTaskConcurrently(t *testing.T) {
 func TestBugRepro_NewQueueInstanceShouldReadExistingUndispatchedTasks(t *testing.T) {
 	store := newTestStore(t)
 
-	pq1, err := newPhysicalQueue(context.Background(), store, "persisted-q", 0, 60*time.Second, "owner-a")
+	pq1, err := newPhysicalQueue(context.Background(), store, "persisted-q", 0, 60*time.Second, defaultMaxAttempts, "owner-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestBugRepro_NewQueueInstanceShouldReadExistingUndispatchedTasks(t *testing
 	}
 	pq1.Close()
 
-	pq2, err := newPhysicalQueue(context.Background(), store, "persisted-q", 0, 60*time.Second, "owner-b")
+	pq2, err := newPhysicalQueue(context.Background(), store, "persisted-q", 0, 60*time.Second, defaultMaxAttempts, "owner-b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestBugRepro_LeaseHandoverWindowDoesNotDoubleDeliverSameTask(t *testing.T) 
 	base := newTestStore(t)
 	barrierStore := newGetTasksBarrierStore(base)
 
-	pqOld, err := newPhysicalQueue(context.Background(), barrierStore, "handover-q", 0, 60*time.Second, "owner-a")
+	pqOld, err := newPhysicalQueue(context.Background(), barrierStore, "handover-q", 0, 60*time.Second, defaultMaxAttempts, "owner-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestBugRepro_LeaseHandoverWindowDoesNotDoubleDeliverSameTask(t *testing.T) 
 		t.Fatalf("expire old lease: %v", err)
 	}
 
-	pqNew, err := newPhysicalQueue(context.Background(), barrierStore, "handover-q", 0, 60*time.Second, "owner-b")
+	pqNew, err := newPhysicalQueue(context.Background(), barrierStore, "handover-q", 0, 60*time.Second, defaultMaxAttempts, "owner-b")
 	if err != nil {
 		t.Fatal(err)
 	}

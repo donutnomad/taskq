@@ -69,7 +69,7 @@ func (s *transitionBarrierStore) ResetTimedOutTasks(
 
 func newTransitionTestQueue(t *testing.T, store Store, visTimeout time.Duration) *PhysicalQueue {
 	t.Helper()
-	pq, err := newPhysicalQueue(context.Background(), store, "delivery-attempt-q", 0, visTimeout, "owner")
+	pq, err := newPhysicalQueue(context.Background(), store, "delivery-attempt-q", 0, visTimeout, defaultMaxAttempts, "owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,18 +92,19 @@ func TestPhysicalQueue_PreviousDeliveryCannotAckOrNackRedelivery(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	pq.RunVisibilityScanOnce(ctx)
 
-	_, secondToken, ok, err := pq.TryPoll(ctx)
-	if err != nil || !ok {
-		t.Fatalf("redelivery poll ok = %v, err = %v", ok, err)
+	_, secondToken, ok := awaitTestPoll(t, pq, PollOptions{})
+	if !ok {
+		t.Fatal("respooled task never became pollable")
 	}
 	if firstToken == secondToken {
 		t.Fatal("redelivery reused the previous delivery token")
 	}
-	if err := pq.Ack(ctx, firstToken); !errors.Is(err, ErrStaleToken) {
-		t.Fatalf("previous delivery ack error = %v, want ErrStaleToken", err)
+	// 可见性超时会 respool 出新 taskID，老 taskID 随之退役。
+	if err := pq.Ack(ctx, firstToken); !errors.Is(err, ErrTaskNotOutstanding) {
+		t.Fatalf("previous delivery ack error = %v, want ErrTaskNotOutstanding", err)
 	}
-	if err := pq.Nack(ctx, firstToken); !errors.Is(err, ErrStaleToken) {
-		t.Fatalf("previous delivery nack error = %v, want ErrStaleToken", err)
+	if err := pq.Nack(ctx, firstToken); !errors.Is(err, ErrTaskNotOutstanding) {
+		t.Fatalf("previous delivery nack error = %v, want ErrTaskNotOutstanding", err)
 	}
 	if err := pq.Ack(ctx, secondToken); err != nil {
 		t.Fatalf("current delivery ack: %v", err)
@@ -135,9 +136,9 @@ func TestPhysicalQueue_VisibilityScanPreservesOutOfOrderAcknowledgedTask(t *test
 
 	time.Sleep(30 * time.Millisecond)
 	pq.RunVisibilityScanOnce(ctx)
-	row, redeliveryToken, ok, err := pq.TryPoll(ctx)
-	if err != nil || !ok {
-		t.Fatalf("redelivery poll ok = %v, err = %v", ok, err)
+	row, redeliveryToken, ok := awaitTestPoll(t, pq, PollOptions{})
+	if !ok {
+		t.Fatal("respooled task never became pollable")
 	}
 	if string(row.Data) != "task-1" {
 		t.Fatalf("redelivery data = %q, want task-1", row.Data)
@@ -151,7 +152,7 @@ func TestPhysicalQueue_VisibilityScanPreservesOutOfOrderAcknowledgedTask(t *test
 	if duplicate, _, ok, err := pq.TryPoll(ctx); err != nil {
 		t.Fatal(err)
 	} else if ok {
-		t.Fatalf("visibility scan exposed acknowledged Task2: %+v", duplicate)
+		t.Fatalf("visibility scan exposed acknowledged Task2 or a duplicate of the respooled Task1: %+v", duplicate)
 	}
 	if err := pq.RunGCOnce(ctx); err != nil {
 		t.Fatal(err)
@@ -160,8 +161,9 @@ func TestPhysicalQueue_VisibilityScanPreservesOutOfOrderAcknowledgedTask(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.AckLevel != 2 {
-		t.Fatalf("ack level = %d, want 2", info.AckLevel)
+	// Task1 超时后被 respool 成任务 3，老行随 respool 完成一并 ack。
+	if info.AckLevel != 3 {
+		t.Fatalf("ack level = %d, want 3", info.AckLevel)
 	}
 }
 
@@ -183,6 +185,9 @@ func TestPhysicalQueue_NackTransitionPreventsConcurrentRedispatch(t *testing.T) 
 	if err != nil || !ok {
 		t.Fatalf("first poll ok = %v, err = %v", ok, err)
 	}
+	// 写满 writer 队列，让 Nack 降级为 UnDispatchTask + 原地 redelivery，
+	// 该降级路径是唯一仍会把老行放回可见状态的 nack 路径。
+	blockTestWriterQueue(t, pq)
 
 	nackDone := make(chan error, 1)
 	go func() { nackDone <- pq.Nack(ctx, firstToken) }()
@@ -292,10 +297,19 @@ func TestPhysicalQueue_VisibilityResetPreventsConcurrentRedispatch(t *testing.T)
 	close(store.resetRelease)
 	<-scanDone
 	result := <-pollDone
-	if result.err != nil || !result.ok {
+	if result.err != nil {
 		t.Fatalf("redelivery poll = %+v", result)
 	}
-	if err := pq.Ack(ctx, result.token); err != nil {
+	token := result.token
+	if !result.ok {
+		// respool 的新行由 writer 异步落库，这次 poll 可能早于新行可读。
+		_, respooledToken, ok := awaitTestPoll(t, pq, PollOptions{})
+		if !ok {
+			t.Fatal("respooled task never became pollable")
+		}
+		token = respooledToken
+	}
+	if err := pq.Ack(ctx, token); err != nil {
 		t.Fatalf("redelivery ack: %v", err)
 	}
 }

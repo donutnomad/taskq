@@ -13,6 +13,7 @@ type TaskRow struct {
 	RoutingKey      string
 	RoutingDeadline time.Time
 	Data            []byte
+	Attempt         int // 投递失败重试次数，首次写入为 0
 	CreatedAt       time.Time
 	DispatchedAt    *time.Time // nil = 未分发
 }
@@ -30,6 +31,9 @@ type VisibilityResetOptions struct {
 	AckLevel          int64
 	VisibilityTimeout time.Duration
 	AcknowledgedIDs   []int64
+	// MaxReset 限制单轮扫描处理的候选任务数（按 task_id 升序取最小的若干条），
+	// 0 表示不限。上限让一轮扫描的重置与调用方随后的逐条重新隐藏都保持有界。
+	MaxReset int
 }
 
 // QueueInfo 队列元数据

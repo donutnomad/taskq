@@ -102,6 +102,111 @@ func TestDeliveryStateRedeliveryBlocksAckLevel(t *testing.T) {
 	}
 }
 
+func TestDeliveryStateRespoolingBlocksAckLevel(t *testing.T) {
+	state := newDeliveryState(0)
+	now := time.Now()
+
+	state.markDispatched(&TaskRow{TaskID: 1}, now, 1)
+	state.markDispatched(&TaskRow{TaskID: 2}, now, 2)
+	state.markDispatched(&TaskRow{TaskID: 3}, now, 3)
+
+	if _, err := state.beginRespool(1, 2); err != ErrStaleToken {
+		t.Fatalf("stale respool error = %v, want ErrStaleToken", err)
+	}
+	if _, err := state.beginRespool(1, 1); err != nil {
+		t.Fatalf("beginRespool task 1: %v", err)
+	}
+	if _, err := state.beginRespool(1, 1); err != ErrTaskNotOutstanding {
+		t.Fatalf("duplicate respool error = %v, want ErrTaskNotOutstanding", err)
+	}
+
+	if err := state.ack(2, 2); err != nil {
+		t.Fatalf("ack task 2: %v", err)
+	}
+	if err := state.ack(3, 3); err != nil {
+		t.Fatalf("ack task 3: %v", err)
+	}
+	// 新行未落库前绝不能 ack 老行，ackLevel 必须停在 0。
+	if state.ackLevelValue() != 0 {
+		t.Fatalf("ackLevel should stay blocked at 0 while task 1 is respooling, got %d", state.ackLevelValue())
+	}
+}
+
+func TestDeliveryStateFinishRespoolAdvancesAckLevel(t *testing.T) {
+	state := newDeliveryState(0)
+	now := time.Now()
+
+	state.markDispatched(&TaskRow{TaskID: 1}, now, 1)
+	state.markDispatched(&TaskRow{TaskID: 2}, now, 2)
+	state.markDispatched(&TaskRow{TaskID: 3}, now, 3)
+
+	if _, err := state.beginRespool(1, 1); err != nil {
+		t.Fatalf("beginRespool task 1: %v", err)
+	}
+	if err := state.ack(2, 2); err != nil {
+		t.Fatalf("ack task 2: %v", err)
+	}
+	if err := state.ack(3, 3); err != nil {
+		t.Fatalf("ack task 3: %v", err)
+	}
+
+	state.finishRespool(1)
+
+	if state.ackLevelValue() != 3 {
+		t.Fatalf("ackLevel should advance to 3 after respool finished, got %d", state.ackLevelValue())
+	}
+	if len(state.respooling) != 0 {
+		t.Fatalf("respooling should be empty, got %+v", state.respooling)
+	}
+	if len(state.acked) != 0 {
+		t.Fatalf("acked entries should be released by the advance, got %+v", state.acked)
+	}
+}
+
+func TestDeliveryStateAbortRespoolKeepsTaskUnacked(t *testing.T) {
+	state := newDeliveryState(0)
+	state.markDispatched(&TaskRow{TaskID: 1, Data: []byte("a")}, time.Now(), 1)
+
+	if _, err := state.beginRespool(1, 1); err != nil {
+		t.Fatalf("beginRespool task 1: %v", err)
+	}
+	state.abortRespool(1)
+
+	if state.acked[1] {
+		t.Fatal("aborted respool must not ack the original task")
+	}
+	if !state.inRedeliveryLocked(1) {
+		t.Fatalf("aborted respool should leave task 1 in redelivery, got %+v", state.redelivery)
+	}
+	if state.ackLevelValue() != 0 {
+		t.Fatalf("ackLevel = %d, want 0", state.ackLevelValue())
+	}
+}
+
+func TestDeliveryStateResetExclusionIDsCoversRespooling(t *testing.T) {
+	state := newDeliveryState(0)
+	now := time.Now()
+
+	state.markDispatched(&TaskRow{TaskID: 1}, now, 1)
+	state.markDispatched(&TaskRow{TaskID: 2}, now, 2)
+	state.markDispatched(&TaskRow{TaskID: 3}, now, 3)
+
+	if _, err := state.beginRespool(2, 2); err != nil {
+		t.Fatalf("beginRespool task 2: %v", err)
+	}
+	if err := state.ack(3, 3); err != nil {
+		t.Fatalf("ack task 3: %v", err)
+	}
+
+	excluded := make(map[int64]bool)
+	for _, taskID := range state.resetExclusionIDs() {
+		excluded[taskID] = true
+	}
+	if !excluded[2] || !excluded[3] || excluded[1] {
+		t.Fatalf("reset exclusion IDs = %v, want {2,3}", state.resetExclusionIDs())
+	}
+}
+
 func TestDeliveryStateRejectsDuplicateAckAndNack(t *testing.T) {
 	state := newDeliveryState(0)
 	now := time.Now()

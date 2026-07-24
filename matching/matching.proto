@@ -66,6 +66,9 @@ message NackTaskRequest {
     string queue_name = 1;
     int32 partition_id = 2;
     string token = 3;
+    // undelivered=true 表示任务从未交付给消费者（例如 frontend 多 owner 扇出后
+    // 归还非获胜 owner 的租约），只归还租约、不计 attempt、不重写新行。
+    bool undelivered = 4;
 }
 message NackTaskResponse {}
 

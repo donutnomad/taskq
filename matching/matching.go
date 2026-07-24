@@ -26,6 +26,10 @@ const (
 	defaultReconcileInterval = 5 * time.Second
 )
 
+// defaultMaxAttempts 是启用投递上限时的一个参考值。生产默认为不限次数
+// （Config.MaxAttempts 零值），仅当调用方显式设为正数时才启用上限。
+const defaultMaxAttempts = 10
+
 var matchingListenerSeq atomic.Int64
 
 // Store provides durable queue operations and fenced partition leadership.
@@ -49,6 +53,11 @@ type Config struct {
 	BroadcastAddr string
 	// VisTimeout 可见性超时，默认 60s
 	VisTimeout time.Duration
+	// MaxAttempts 单条任务的总投递次数上限（含首次投递）。
+	// 0（默认）表示不限次数：反复失败的任务会持续以新 taskID 重投，ackLevel 不会被其阻塞。
+	// 设为正数则启用上限，超过后任务被丢弃并仅记录一条 error 日志。
+	// 消费者遇到无法处理的消息时，推荐自行持久化后回 Ack（而非 Nack），而不是依赖此上限丢弃。
+	MaxAttempts int
 	// QueueConfigs 队列名 → 分区数
 	QueueConfigs map[string]int
 	// LeaseOwner 节点唯一标识，用于 DB lease 独占分区。为空时自动生成 UUID。
@@ -104,7 +113,7 @@ func NewServer(cfg Config) (*Server, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	mgr := newPartitionManager(ctx, cfg.Store, cfg.Store, cfg.BroadcastAddr, cfg.LeaseOwner, resolver, cfg.VisTimeout, cfg.QueueConfigs)
+	mgr := newPartitionManager(ctx, cfg.Store, cfg.Store, cfg.BroadcastAddr, cfg.LeaseOwner, resolver, cfg.VisTimeout, cfg.MaxAttempts, cfg.QueueConfigs)
 
 	grpcServer := grpc.NewServer(cfg.GRPCOptions...)
 	handler := &matchingHandler{mgr: mgr}

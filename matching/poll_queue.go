@@ -128,7 +128,7 @@ func scanQueuePollTargets(
 		candidate, err := newQueuePollCandidate(target, lease)
 		if err != nil {
 			diagnostics = append(diagnostics, fmt.Errorf("partition %d: %w", target.partitionID, err))
-			if cleanupErr := nackQueuePollLeases([]queuePollCandidate{{target: target, lease: lease}}); cleanupErr != nil {
+			if cleanupErr := returnQueuePollLeases([]queuePollCandidate{{target: target, lease: lease}}); cleanupErr != nil {
 				diagnostics = append(diagnostics, cleanupErr)
 			}
 			continue
@@ -268,7 +268,7 @@ func claimQueuePollWaiter(waiter queuePollWaiter) (*queuePollCandidate, error) {
 	}
 	candidate, err := newQueuePollCandidate(waiter.target, result.Lease())
 	if err != nil {
-		if cleanupErr := nackQueuePollLeases([]queuePollCandidate{{target: waiter.target, lease: result.Lease()}}); cleanupErr != nil {
+		if cleanupErr := returnQueuePollLeases([]queuePollCandidate{{target: waiter.target, lease: result.Lease()}}); cleanupErr != nil {
 			return nil, errors.Join(fmt.Errorf("partition %d: %w", waiter.target.partitionID, err), cleanupErr)
 		}
 		return nil, fmt.Errorf("partition %d: %w", waiter.target.partitionID, err)
@@ -289,20 +289,20 @@ func newQueuePollCandidate(target queuePollTarget, lease queue.Lease) (queuePoll
 
 func finishQueuePoll(ctx context.Context, candidates []queuePollCandidate) (*PollQueueResponse, error) {
 	if err := ctx.Err(); err != nil {
-		if cleanupErr := nackQueuePollLeases(candidates); cleanupErr != nil {
+		if cleanupErr := returnQueuePollLeases(candidates); cleanupErr != nil {
 			return nil, status.Errorf(codes.Canceled, "%v; return canceled poll leases: %v", err, cleanupErr)
 		}
 		return nil, status.Error(codes.Canceled, err.Error())
 	}
 	winner := candidates[0]
-	if err := nackQueuePollLeases(candidates[1:]); err != nil {
-		if winnerErr := nackQueuePollLeases([]queuePollCandidate{winner}); winnerErr != nil {
+	if err := returnQueuePollLeases(candidates[1:]); err != nil {
+		if winnerErr := returnQueuePollLeases([]queuePollCandidate{winner}); winnerErr != nil {
 			err = errors.Join(err, fmt.Errorf("return winner: %w", winnerErr))
 		}
 		return nil, toGRPCError(err)
 	}
 	if err := ctx.Err(); err != nil {
-		if cleanupErr := nackQueuePollLeases([]queuePollCandidate{winner}); cleanupErr != nil {
+		if cleanupErr := returnQueuePollLeases([]queuePollCandidate{winner}); cleanupErr != nil {
 			return nil, status.Errorf(codes.Canceled, "%v; return canceled poll lease: %v", err, cleanupErr)
 		}
 		return nil, status.Error(codes.Canceled, err.Error())
@@ -310,7 +310,10 @@ func finishQueuePoll(ctx context.Context, candidates []queuePollCandidate) (*Pol
 	return pollQueueResponse(winner.target.partitionID, winner.lease), nil
 }
 
-func nackQueuePollLeases(candidates []queuePollCandidate) error {
+// returnQueuePollLeases 归还本次 poll 没有真正交付出去的租约（竞速败者、
+// 调用方取消时的胜者）。任务从未到过消费者手里，因此走 ReturnLease 原地归还，
+// 不消耗投递次数、不重写新行。
+func returnQueuePollLeases(candidates []queuePollCandidate) error {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -318,7 +321,7 @@ func nackQueuePollLeases(candidates []queuePollCandidate) error {
 	defer cancel()
 	var errs []error
 	for _, candidate := range candidates {
-		if err := candidate.target.handle.Nack(ctx, candidate.lease.Token); err != nil {
+		if err := candidate.target.handle.ReturnLease(ctx, candidate.lease.Token); err != nil {
 			slog.Error("matching failed to return queue poll loser", "partition_id", candidate.target.partitionID, "err", err)
 			errs = append(errs, fmt.Errorf("return partition %d poll lease: %w", candidate.target.partitionID, err))
 		}

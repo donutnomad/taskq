@@ -456,8 +456,11 @@ func nackPollLease(ctx context.Context, client matching.MatchingServiceClient, q
 	if err != nil {
 		return fmt.Errorf("frontend: parse cleanup token: %w", err)
 	}
+	// 竞速败者从未交付给消费者，标记 Undelivered 让 matching 原地归还租约，
+	// 不消耗任务的投递次数。
 	_, err = client.NackTask(ctx, &matching.NackTaskRequest{
 		QueueName: queueName, PartitionId: int32(partitionID), Token: lease.Token,
+		Undelivered: true,
 	})
 	if err != nil {
 		return fmt.Errorf("frontend: return poll loser partition %d: %w", partitionID, err)

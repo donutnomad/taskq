@@ -361,6 +361,70 @@ func TestFrontend_NackRedelivery(t *testing.T) {
 	}
 }
 
+// Frontend.Nack 是消费者的真实拒绝，必须照常消耗一次投递并以新 taskID 重写任务，
+// 不能被内部归还语义带偏。
+func TestFrontend_NackConsumesAttemptAndRewritesTask(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver()
+	startMatchingServer(t, store, resolver, map[string]int{"test-q": 1})
+
+	fe, err := New(Config{
+		Monitor:     &stubMonitor{resolver: resolver},
+		QueueName:   "test-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fe.Close()
+
+	ctx := context.Background()
+	if err := fe.Enqueue(ctx, []byte("rejected")); err != nil {
+		t.Fatal(err)
+	}
+	_, token, err := fe.Dequeue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := queue.ParseTaskToken(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fe.Nack(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+
+	// respool 出的新行由 matching 侧的 writer 异步落库。
+	var rewritten *queue.TaskRow
+	deadline := time.Now().Add(2 * time.Second)
+	for rewritten == nil {
+		rows, err := store.GetTasks(ctx, "test-q", 0, 0, 1<<30, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) == 1 {
+			rewritten = rows[0]
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("respooled rows = %+v, want a single rewritten row", rows)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if rewritten.TaskID <= original.TaskID || rewritten.Attempt != 1 {
+		t.Fatalf("rewritten row = %+v, want a task ID above %d at attempt 1", rewritten, original.TaskID)
+	}
+
+	data, _, err := fe.Dequeue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "rejected" {
+		t.Fatalf("redelivered data = %q, want %q", data, "rejected")
+	}
+}
+
 func TestFrontend_MultipleEnqueue(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	resolver := newStubResolver()

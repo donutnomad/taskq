@@ -344,8 +344,8 @@ func TestMatchingServer_NackRedelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 再次 poll 应该拿到同一个任务
-	resp2, err := client.PollTask(ctx, &PollTaskRequest{QueueName: "test-q", PartitionId: 0})
+	// 再次 poll 应该拿到同一份任务数据（nack 以新 taskID 重写，新行由 writer 异步落库）
+	resp2, err := client.PollTask(ctx, &PollTaskRequest{QueueName: "test-q", PartitionId: 0, PollTimeoutMs: 2000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,6 +481,83 @@ func TestMatchingServer_AckTaskRejectsTokenPartitionMismatch(t *testing.T) {
 	}
 }
 
+// undelivered=true 表示调用方只是归还一个没用上的租约，任务必须原地恢复可投递。
+func TestMatchingServer_NackTaskUndeliveredReturnsLeaseInPlace(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 1})
+	client := newTestClient(t, addr)
+	ctx := context.Background()
+
+	if _, err := client.AddTask(ctx, &AddTaskRequest{QueueName: "test-q", PartitionId: 0, Data: []byte("undelivered")}); err != nil {
+		t.Fatal(err)
+	}
+	polled, err := client.PollTask(ctx, &PollTaskRequest{QueueName: "test-q", PartitionId: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.NackTask(ctx, &NackTaskRequest{
+		QueueName: "test-q", PartitionId: 0, Token: polled.Token, Undelivered: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := visibleTestTasks(t, store, "test-q", 0)
+	if len(rows) != 1 || rows[0].TaskID != 1 || rows[0].Attempt != 0 {
+		t.Fatalf("partition rows = %+v, want only the original task 1 at attempt 0", rows)
+	}
+	returned, err := client.PollTask(ctx, &PollTaskRequest{QueueName: "test-q", PartitionId: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returned.Empty || string(returned.Data) != "undelivered" {
+		t.Fatalf("returned response = %+v", returned)
+	}
+	token, err := queue.ParseTaskToken(returned.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.TaskID != 1 {
+		t.Fatalf("returned task ID = %d, want the original task 1", token.TaskID)
+	}
+}
+
+// 未标记 undelivered 的 NackTask 是消费方真实拒绝，仍须消耗一次投递并重写新行。
+func TestMatchingServer_NackTaskWithoutUndeliveredRespoolsTask(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	resolver := newStubResolver("127.0.0.1:9999")
+	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 1})
+	client := newTestClient(t, addr)
+	ctx := context.Background()
+
+	if _, err := client.AddTask(ctx, &AddTaskRequest{QueueName: "test-q", PartitionId: 0, Data: []byte("rejected")}); err != nil {
+		t.Fatal(err)
+	}
+	polled, err := client.PollTask(ctx, &PollTaskRequest{QueueName: "test-q", PartitionId: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.NackTask(ctx, &NackTaskRequest{
+		QueueName: "test-q", PartitionId: 0, Token: polled.Token,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// respool 出的新行由 writer 异步落库。
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rows := visibleTestTasks(t, store, "test-q", 0)
+		if len(rows) == 1 && rows[0].TaskID == 2 && rows[0].Attempt == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("respooled rows = %+v, want a single rewritten task 2 at attempt 1", rows)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 func TestMatchingServer_NackTaskRejectsTokenPartitionMismatch(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	resolver := newStubResolver("127.0.0.1:9999")
@@ -531,6 +608,7 @@ func TestPartitionManager_ReloadsClosedPartition(t *testing.T) {
 		"lease-owner",
 		resolver,
 		time.Minute,
+		defaultMaxAttempts,
 		map[string]int{"test-q": 1},
 	)
 	defer pm.close()
@@ -571,5 +649,49 @@ func TestMatchingServer_NotOwner(t *testing.T) {
 	s, ok := status.FromError(err)
 	if !ok || s.Code() != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition, got %v", err)
+	}
+}
+
+// TestNewServerDefaultsToUnlimitedMaxAttempts 锁定生产默认：不设 MaxAttempts 时
+// 透传为 0（不限次数），任务不会因反复失败而被静默丢弃。
+func TestNewServerDefaultsToUnlimitedMaxAttempts(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	monitor := &stubMonitor{resolver: newStubResolver("127.0.0.1:9999")}
+
+	srv, err := NewServer(Config{
+		Store:         store,
+		Monitor:       monitor,
+		BroadcastAddr: "127.0.0.1:9999",
+		QueueConfigs:  map[string]int{"test-q": 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Stop)
+
+	if srv.mgr.maxAttempts != 0 {
+		t.Fatalf("默认 MaxAttempts 应为 0（不限次数），实际 %d", srv.mgr.maxAttempts)
+	}
+}
+
+// TestNewServerHonorsExplicitMaxAttempts 确认显式设置的上限被透传到 partitionManager。
+func TestNewServerHonorsExplicitMaxAttempts(t *testing.T) {
+	store := newTestSQLiteStore(t)
+	monitor := &stubMonitor{resolver: newStubResolver("127.0.0.1:9999")}
+
+	srv, err := NewServer(Config{
+		Store:         store,
+		Monitor:       monitor,
+		BroadcastAddr: "127.0.0.1:9999",
+		QueueConfigs:  map[string]int{"test-q": 1},
+		MaxAttempts:   5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.Stop)
+
+	if srv.mgr.maxAttempts != 5 {
+		t.Fatalf("显式 MaxAttempts=5 应透传，实际 %d", srv.mgr.maxAttempts)
 	}
 }

@@ -18,14 +18,17 @@ type deliveryState struct {
 	maxReadLevel int64
 
 	outstanding map[int64]*outstandingTask
-	redelivery  []*TaskRow
-	acked       map[int64]bool
+	// respooling 中的任务正在以新 taskID 重写，新行落库前必须阻止 ackLevel 推进。
+	respooling map[int64]*outstandingTask
+	redelivery []*TaskRow
+	acked      map[int64]bool
 }
 
 func newDeliveryState(ackLevel int64) *deliveryState {
 	return &deliveryState{
 		ackLevel:    ackLevel,
 		outstanding: make(map[int64]*outstandingTask),
+		respooling:  make(map[int64]*outstandingTask),
 		acked:       make(map[int64]bool),
 	}
 }
@@ -108,28 +111,77 @@ func (s *deliveryState) finishNack(ot *outstandingTask) {
 func (s *deliveryState) restoreOutstanding(taskID int64, ot *outstandingTask) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	delete(s.respooling, taskID)
 	s.outstanding[taskID] = ot
 }
 
-func (s *deliveryState) moveToRedelivery(taskID int64) bool {
+// beginRespool 校验投递身份后把任务移入 respooling，等待新行落库。
+func (s *deliveryState) beginRespool(taskID, deliveryID int64) (*outstandingTask, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	ot, ok := s.outstanding[taskID]
 	if !ok {
-		return false
+		return nil, ErrTaskNotOutstanding
 	}
-	delete(s.outstanding, taskID)
-	s.redelivery = append(s.redelivery, ot.row)
-	return true
+	if ot.deliveryID != deliveryID {
+		return nil, ErrStaleToken
+	}
+	s.beginRespoolLocked(taskID, ot)
+	return ot, nil
 }
 
-func (s *deliveryState) ackedTaskIDs() []int64 {
+// moveToRespooling 供可见性超时使用，超时方没有投递身份可校验。
+func (s *deliveryState) moveToRespooling(taskID int64) (*outstandingTask, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ids := make([]int64, 0, len(s.acked))
+	ot, ok := s.outstanding[taskID]
+	if !ok {
+		return nil, false
+	}
+	s.beginRespoolLocked(taskID, ot)
+	return ot, true
+}
+
+func (s *deliveryState) beginRespoolLocked(taskID int64, ot *outstandingTask) {
+	delete(s.outstanding, taskID)
+	s.respooling[taskID] = ot
+}
+
+// finishRespool 在新行确认落库（或任务被丢弃）后 ack 老行并放行 ackLevel。
+func (s *deliveryState) finishRespool(taskID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.respooling, taskID)
+	s.acked[taskID] = true
+	s.advanceAckLevelLocked()
+}
+
+// abortRespool 在新行未能落库时把老任务落回 redelivery，绝不 ack。
+func (s *deliveryState) abortRespool(taskID int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ot, ok := s.respooling[taskID]
+	if !ok {
+		return
+	}
+	delete(s.respooling, taskID)
+	s.redelivery = append(s.redelivery, ot.row)
+}
+
+// resetExclusionIDs 返回不允许被可见性扫描重置为可见的任务 ID。
+func (s *deliveryState) resetExclusionIDs() []int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ids := make([]int64, 0, len(s.acked)+len(s.respooling))
 	for taskID := range s.acked {
+		ids = append(ids, taskID)
+	}
+	for taskID := range s.respooling {
 		ids = append(ids, taskID)
 	}
 	return ids
@@ -145,6 +197,9 @@ func (s *deliveryState) advanceAckLevelLocked() {
 	for {
 		next := s.ackLevel + 1
 		if _, inFlight := s.outstanding[next]; inFlight {
+			return
+		}
+		if _, rewriting := s.respooling[next]; rewriting {
 			return
 		}
 		if s.inRedeliveryLocked(next) {

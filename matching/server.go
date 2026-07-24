@@ -98,7 +98,8 @@ func finishPollTask(ctx context.Context, target *partitionHandle, lease queue.Le
 	if err := ctx.Err(); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), pollCleanupTimeout)
 		defer cancel()
-		if cleanupErr := target.Nack(cleanupCtx, lease.Token); cleanupErr != nil {
+		// 调用方在投递瞬间取消：任务从未交到消费者手里，原地归还、不消耗投递次数。
+		if cleanupErr := target.ReturnLease(cleanupCtx, lease.Token); cleanupErr != nil {
 			return nil, status.Errorf(codes.Canceled, "%v; return canceled poll lease: %v", err, cleanupErr)
 		}
 		return nil, status.Error(codes.Canceled, err.Error())
@@ -164,7 +165,13 @@ func (h *matchingHandler) NackTask(ctx context.Context, req *NackTaskRequest) (*
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
-	if err := pq.Nack(ctx, req.Token); err != nil {
+	// Undelivered 表示任务从未交付给消费者（调用方只是归还一个没用上的租约），
+	// 这类归还不算消费失败，必须原地归还而不是消耗一次投递机会。
+	release := pq.Nack
+	if req.Undelivered {
+		release = pq.ReturnLease
+	}
+	if err := release(ctx, req.Token); err != nil {
 		if errors.Is(err, queue.ErrTaskNotOutstanding) {
 			return &NackTaskResponse{}, nil
 		}

@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 	routing_key   TEXT NOT NULL DEFAULT '',
 	routing_deadline TIMESTAMP,
 	data          BLOB NOT NULL,
+	attempt       INTEGER NOT NULL DEFAULT 0,
 	created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 	dispatched_at TIMESTAMP,
 	PRIMARY KEY (queue_name, partition_id, task_id)
@@ -209,7 +210,7 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, tasks []*TaskRow) error {
 
 	stmt, err := tx.PrepareContext(
 		ctx,
-		`INSERT INTO tasks (task_id, queue_name, partition_id, routing_key, routing_deadline, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (task_id, queue_name, partition_id, routing_key, routing_deadline, data, attempt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return err
@@ -225,6 +226,7 @@ func (s *sqliteStore) CreateTasks(ctx context.Context, tasks []*TaskRow) error {
 			task.RoutingKey,
 			nullableTestTime(task.RoutingDeadline),
 			task.Data,
+			task.Attempt,
 			task.CreatedAt,
 		); err != nil {
 			return err
@@ -273,7 +275,7 @@ func (s *sqliteStore) CreateTasksAndAdvanceRange(
 
 	stmt, err := tx.PrepareContext(
 		ctx,
-		`INSERT INTO tasks (task_id, queue_name, partition_id, routing_key, routing_deadline, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tasks (task_id, queue_name, partition_id, routing_key, routing_deadline, data, attempt, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return 0, err
@@ -288,6 +290,7 @@ func (s *sqliteStore) CreateTasksAndAdvanceRange(
 			task.RoutingKey,
 			nullableTestTime(task.RoutingDeadline),
 			task.Data,
+			task.Attempt,
 			task.CreatedAt,
 		); err != nil {
 			return 0, err
@@ -348,7 +351,7 @@ func (s *sqliteStore) queryTasks(
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT task_id, queue_name, partition_id, routing_key, routing_deadline, data, created_at
+		`SELECT task_id, queue_name, partition_id, routing_key, routing_deadline, data, attempt, created_at
 		 FROM tasks
 		 WHERE queue_name = ? AND partition_id = ?
 		   AND task_id > ? AND task_id <= ?
@@ -373,6 +376,7 @@ func (s *sqliteStore) queryTasks(
 			&task.RoutingKey,
 			&routingDeadline,
 			&task.Data,
+			&task.Attempt,
 			&task.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -442,18 +446,18 @@ func (s *sqliteStore) ResetTimedOutTasks(
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.QueryContext(
-		ctx,
-		`SELECT task_id FROM tasks
+	candidateSQL := `SELECT task_id FROM tasks
 		 WHERE queue_name = ? AND partition_id = ?
 		   AND task_id > ?
 		   AND dispatched_at IS NOT NULL
-		   AND dispatched_at < ?`,
-		queueName,
-		partitionID,
-		opts.AckLevel,
-		cutoff,
-	)
+		   AND dispatched_at < ?
+		 ORDER BY task_id ASC`
+	candidateArgs := []any{queueName, partitionID, opts.AckLevel, cutoff}
+	if opts.MaxReset > 0 {
+		candidateSQL += " LIMIT ?"
+		candidateArgs = append(candidateArgs, opts.MaxReset)
+	}
+	rows, err := tx.QueryContext(ctx, candidateSQL, candidateArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("reset timed out tasks: %w", err)
 	}

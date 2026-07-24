@@ -7,6 +7,9 @@ import (
 	"time"
 )
 
+// defaultMaxAttempts 是投递次数上限的一个参考值；传入 maxAttempts <= 0 表示不限次数。
+const defaultMaxAttempts = 10
+
 // PollResult 长轮询结果
 type PollResult struct {
 	Row   *TaskRow
@@ -91,6 +94,7 @@ func newPhysicalQueue(
 	queueName string,
 	partitionID int,
 	visTimeout time.Duration,
+	maxAttempts int,
 	_ string,
 ) (*PhysicalQueue, error) {
 	info, err := claimQueueOwnership(ctx, store, queueName, partitionID)
@@ -111,7 +115,7 @@ func newPhysicalQueue(
 		cancel:         cancel,
 	}
 
-	pq.runtime = newTaskRuntime(pq, info.AckLevel)
+	pq.runtime = newTaskRuntime(pq, info.AckLevel, maxAttempts)
 	if info.NextTaskID > 1 {
 		pq.runtime.setMaxReadLevel(info.NextTaskID - 1)
 	}
@@ -222,6 +226,28 @@ func (pq *PhysicalQueue) nack(ctx context.Context, token string) error {
 	return nil
 }
 
+// returnLease 归还一个从未交付给消费者的租约：任务原地回到可投递状态，
+// 既不消耗 attempt 也不以新 taskID 重写行。
+func (pq *PhysicalQueue) returnLease(ctx context.Context, token string) error {
+	if pq.IsClosed() {
+		return ErrQueueClosed
+	}
+
+	parsed, err := ParseTaskToken(token)
+	if err != nil {
+		return err
+	}
+	if err := validateTaskToken(pq.queueName, pq.partitionID, pq.ownershipEpoch, parsed); err != nil {
+		return err
+	}
+
+	if err := pq.runtime.returnTask(ctx, parsed.TaskID, parsed.DeliveryID); err != nil {
+		return err
+	}
+	pq.wakeWaiters()
+	return nil
+}
+
 func (pq *PhysicalQueue) close() {
 	pq.closeOnce.Do(func() {
 		pq.cancel()
@@ -250,15 +276,17 @@ func (pq *PhysicalQueue) runVisibilityScanOnce(ctx context.Context) {
 
 // NewPhysicalQueue 创建单个分区的物理队列。
 // 分布式模式下由 matching 服务调用，每个 PhysicalQueue 独立管理一个分区。
+// maxAttempts 为单条任务的总投递次数上限，超过后任务被丢弃；0 表示不限次数。
 func NewPhysicalQueue(
 	ctx context.Context,
 	store Store,
 	queueName string,
 	partitionID int,
 	visTimeout time.Duration,
+	maxAttempts int,
 	leaseOwner string,
 ) (*PhysicalQueue, error) {
-	return newPhysicalQueue(ctx, store, queueName, partitionID, visTimeout, leaseOwner)
+	return newPhysicalQueue(ctx, store, queueName, partitionID, visTimeout, maxAttempts, leaseOwner)
 }
 
 // AddTask 写入任务到本分区
@@ -304,6 +332,16 @@ func (pq *PhysicalQueue) Ack(ctx context.Context, token string) error {
 // Nack 拒绝消费，触发重投递
 func (pq *PhysicalQueue) Nack(ctx context.Context, token string) error {
 	return pq.nack(ctx, token)
+}
+
+// ReturnLease 归还一个未交付给消费者的租约，任务原地恢复可投递。
+//
+// 与 Nack 的区别：Nack 表示消费方明确拒绝了任务，会把 attempt 加一并以新
+// taskID 重写任务，次数耗尽后丢弃；ReturnLease 用于任务根本没交到消费者手里
+// 的内部仲裁（多分区 poll 竞速的败者、调用方 ctx 取消），不消耗任何投递配额，
+// 也不产生新行。
+func (pq *PhysicalQueue) ReturnLease(ctx context.Context, token string) error {
+	return pq.returnLease(ctx, token)
 }
 
 // Close 关闭分区，停止所有后台组件

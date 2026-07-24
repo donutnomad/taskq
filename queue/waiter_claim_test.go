@@ -53,7 +53,7 @@ func TestPollWaiterCancellationMakesTaskImmediatelyReadable(t *testing.T) {
 		dispatched: make(chan struct{}),
 		release:    make(chan struct{}),
 	}
-	pq, err := newPhysicalQueue(context.Background(), store, "claim-race-q", 0, time.Minute, "owner")
+	pq, err := newPhysicalQueue(context.Background(), store, "claim-race-q", 0, time.Minute, defaultMaxAttempts, "owner")
 	if err != nil {
 		t.Fatal(err)
 	}

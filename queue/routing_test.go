@@ -129,14 +129,16 @@ func TestPhysicalQueue_NackKeepsExpiredTaskInFallback(t *testing.T) {
 	if err := pq.Nack(ctx, first.Token); err != nil {
 		t.Fatal(err)
 	}
+	awaitTestReadLevel(t, pq, 2)
 	retry, ok, err := pq.TryPollWithOptions(ctx, PollOptions{AcceptedRoutingKeys: []string{"worker-b"}})
 	if err != nil || !ok || !retry.RoutingFallback || string(retry.Data) != "fallback-retry" {
 		t.Fatalf("retry lease = %+v, ok = %v, err = %v", retry, ok, err)
 	}
 	firstToken, _ := ParseTaskToken(first.Token)
 	retryToken, _ := ParseTaskToken(retry.Token)
-	if firstToken.TaskID != retryToken.TaskID {
-		t.Fatalf("fallback Nack changed task ID: %d -> %d", firstToken.TaskID, retryToken.TaskID)
+	// respool 以新 taskID 重写任务，路由元数据必须原样保留。
+	if retryToken.TaskID <= firstToken.TaskID {
+		t.Fatalf("fallback Nack should respool to a higher task ID: %d -> %d", firstToken.TaskID, retryToken.TaskID)
 	}
 }
 
@@ -285,6 +287,7 @@ func TestPhysicalQueue_NackPreservesRoutingEligibility(t *testing.T) {
 	if err := pq.Nack(ctx, first.Token); err != nil {
 		t.Fatal(err)
 	}
+	awaitTestReadLevel(t, pq, 2)
 	if lease, ok, err := pq.TryPollWithOptions(ctx, PollOptions{AcceptedRoutingKeys: []string{"worker-b"}}); err != nil {
 		t.Fatal(err)
 	} else if ok {
@@ -349,7 +352,7 @@ func TestPhysicalQueue_OutOfOrderRoutedAckAdvancesGCContiguously(t *testing.T) {
 
 func TestPhysicalQueue_VisibilityScanPreservesOutOfOrderAck(t *testing.T) {
 	store := newTestStore(t)
-	pq, err := newPhysicalQueue(context.Background(), store, "acked-visibility-q", 0, 20*time.Millisecond, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), store, "acked-visibility-q", 0, 20*time.Millisecond, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,7 +447,7 @@ func TestPhysicalQueue_MultipleAcceptedKeysUseTaskIDFIFO(t *testing.T) {
 
 func TestPhysicalQueue_VisibilityRedeliveryPreservesRoutingEligibility(t *testing.T) {
 	store := newTestStore(t)
-	pq, err := newPhysicalQueue(context.Background(), store, "routed-timeout-q", 0, 20*time.Millisecond, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), store, "routed-timeout-q", 0, 20*time.Millisecond, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,6 +463,7 @@ func TestPhysicalQueue_VisibilityRedeliveryPreservesRoutingEligibility(t *testin
 	}
 	time.Sleep(30 * time.Millisecond)
 	pq.RunVisibilityScanOnce(ctx)
+	awaitTestReadLevel(t, pq, 2)
 
 	if lease, ok, err := pq.TryPollWithOptions(ctx, PollOptions{AcceptedRoutingKeys: []string{"worker-b"}}); err != nil {
 		t.Fatal(err)

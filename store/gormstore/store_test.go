@@ -603,6 +603,32 @@ func TestSQLiteStoreTasksDispatchAndReset(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreTaskAttemptRoundTrip(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateTasks(ctx, []*queue.TaskRow{
+		{TaskID: 1, QueueName: "attempt-q", PartitionID: 0, Data: []byte("first"), CreatedAt: now},
+		{TaskID: 2, QueueName: "attempt-q", PartitionID: 0, Data: []byte("retried"), Attempt: 3, CreatedAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetTasks(ctx, "attempt-q", 0, 0, 2, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 tasks, got %+v", got)
+	}
+	if got[0].TaskID != 1 || got[0].Attempt != 0 {
+		t.Fatalf("first attempt = %+v", got[0])
+	}
+	if got[1].TaskID != 2 || got[1].Attempt != 3 {
+		t.Fatalf("retried attempt = %+v", got[1])
+	}
+}
+
 func TestSQLiteStoreResetTimedOutTasksScalesAcknowledgedFilter(t *testing.T) {
 	s := newSQLiteTestStore(t)
 	ctx := context.Background()

@@ -543,10 +543,13 @@ func (*AckTaskResponse) Descriptor() ([]byte, []int) {
 }
 
 type NackTaskRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	QueueName     string                 `protobuf:"bytes,1,opt,name=queue_name,json=queueName,proto3" json:"queue_name,omitempty"`
-	PartitionId   int32                  `protobuf:"varint,2,opt,name=partition_id,json=partitionId,proto3" json:"partition_id,omitempty"`
-	Token         string                 `protobuf:"bytes,3,opt,name=token,proto3" json:"token,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	QueueName   string                 `protobuf:"bytes,1,opt,name=queue_name,json=queueName,proto3" json:"queue_name,omitempty"`
+	PartitionId int32                  `protobuf:"varint,2,opt,name=partition_id,json=partitionId,proto3" json:"partition_id,omitempty"`
+	Token       string                 `protobuf:"bytes,3,opt,name=token,proto3" json:"token,omitempty"`
+	// undelivered=true 表示任务从未交付给消费者（例如 frontend 多 owner 扇出后
+	// 归还非获胜 owner 的租约），只归还租约、不计 attempt、不重写新行。
+	Undelivered   bool `protobuf:"varint,4,opt,name=undelivered,proto3" json:"undelivered,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -600,6 +603,13 @@ func (x *NackTaskRequest) GetToken() string {
 		return x.Token
 	}
 	return ""
+}
+
+func (x *NackTaskRequest) GetUndelivered() bool {
+	if x != nil {
+		return x.Undelivered
+	}
+	return false
 }
 
 type NackTaskResponse struct {
@@ -774,12 +784,13 @@ const file_matching_matching_proto_rawDesc = "" +
 	"queue_name\x18\x01 \x01(\tR\tqueueName\x12!\n" +
 	"\fpartition_id\x18\x02 \x01(\x05R\vpartitionId\x12\x14\n" +
 	"\x05token\x18\x03 \x01(\tR\x05token\"\x11\n" +
-	"\x0fAckTaskResponse\"i\n" +
+	"\x0fAckTaskResponse\"\x8b\x01\n" +
 	"\x0fNackTaskRequest\x12\x1d\n" +
 	"\n" +
 	"queue_name\x18\x01 \x01(\tR\tqueueName\x12!\n" +
 	"\fpartition_id\x18\x02 \x01(\x05R\vpartitionId\x12\x14\n" +
-	"\x05token\x18\x03 \x01(\tR\x05token\"\x12\n" +
+	"\x05token\x18\x03 \x01(\tR\x05token\x12 \n" +
+	"\vundelivered\x18\x04 \x01(\bR\vundelivered\"\x12\n" +
 	"\x10NackTaskResponse\"4\n" +
 	"\x13GetQueueInfoRequest\x12\x1d\n" +
 	"\n" +

@@ -115,7 +115,7 @@ func newTestPhysicalQueue(t *testing.T) (*PhysicalQueue, Store) {
 	t.Helper()
 	s := newTestStore(t)
 	ctx := context.Background()
-	pq, err := newPhysicalQueue(ctx, s, "test-q", 0, 60*time.Second, "test-owner")
+	pq, err := newPhysicalQueue(ctx, s, "test-q", 0, 60*time.Second, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,6 +140,78 @@ func startTestWriterTask(t *testing.T, pq *PhysicalQueue) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for writer task to start")
+}
+
+// awaitTestReadLevel 等待 writer 把 respool 重写出的新行发布为可读。
+// respool 由 writer goroutine 异步收尾，nack/可见性扫描返回时新行尚未落库。
+func awaitTestReadLevel(t *testing.T, pq *PhysicalQueue, level int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pq.runtime.state.mu.Lock()
+		current := pq.runtime.state.maxReadLevel
+		pq.runtime.state.mu.Unlock()
+		if current >= level {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for read level %d, current %d", level, current)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// awaitTestPoll 轮询直到取到任务，用于等待异步落库的 respool 新行。
+func awaitTestPoll(t *testing.T, pq *PhysicalQueue, opts PollOptions) (*TaskRow, string, bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		row, token, ok, err := pq.tryPollWithOptions(context.Background(), opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			return row, token, true
+		}
+		if time.Now().After(deadline) {
+			return nil, "", false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// blockTestWriterQueue 把 writer 卡在 flush 内并写满 reqCh，
+// 使随后的 respool 投递必然失败并降级为原地 redelivery。
+func blockTestWriterQueue(t *testing.T, pq *PhysicalQueue) func() {
+	t.Helper()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var blockOnce, releaseOnce sync.Once
+	original := pq.writer.onFlush
+	pq.writer.onFlush = func(rows []*TaskRow) {
+		blockOnce.Do(func() {
+			close(entered)
+			<-release
+		})
+		if original != nil {
+			original(rows)
+		}
+	}
+
+	go func() { _ = pq.AddTask(pq.ctx, []byte("writer-block")) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer did not enter flush")
+	}
+	for len(pq.writer.reqCh) < cap(pq.writer.reqCh) {
+		pq.writer.reqCh <- nil
+	}
+
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	return unblock
 }
 
 func tickTestRun(ctx context.Context, interval time.Duration, f func(context.Context) error) error {
@@ -179,7 +251,7 @@ func startTestVisibilityTask(pq *PhysicalQueue) {
 
 func TestPhysicalQueue_NewQueueDoesNotAcceptWritesUntilWriterTaskRuns(t *testing.T) {
 	s := newTestStore(t)
-	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +269,7 @@ func TestCreateTasksRollbackOnFailure(t *testing.T) {
 		Store: base,
 		err:   createErr,
 	}
-	pq, err := newPhysicalQueue(context.Background(), store, "rollback-q", 0, 60*time.Second, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), store, "rollback-q", 0, 60*time.Second, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +303,7 @@ func TestPhysicalQueue_RestartKeepsTaskIDsContiguousForGC(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	first, err := newPhysicalQueue(ctx, store, "restart-q", 0, time.Minute, "owner-a")
+	first, err := newPhysicalQueue(ctx, store, "restart-q", 0, time.Minute, defaultMaxAttempts, "owner-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +313,7 @@ func TestPhysicalQueue_RestartKeepsTaskIDsContiguousForGC(t *testing.T) {
 	}
 	first.Close()
 
-	second, err := newPhysicalQueue(ctx, store, "restart-q", 0, time.Minute, "owner-b")
+	second, err := newPhysicalQueue(ctx, store, "restart-q", 0, time.Minute, defaultMaxAttempts, "owner-b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +353,7 @@ func TestPhysicalQueue_RestartKeepsTaskIDsContiguousForGC(t *testing.T) {
 
 func TestPhysicalQueue_CloseStopsWriterWithIndependentContext(t *testing.T) {
 	store := newTestStore(t)
-	pq, err := newPhysicalQueue(context.Background(), store, "close-q", 0, time.Minute, "owner-a")
+	pq, err := newPhysicalQueue(context.Background(), store, "close-q", 0, time.Minute, defaultMaxAttempts, "owner-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +381,7 @@ func TestPhysicalQueue_CloseStopsWriterWithIndependentContext(t *testing.T) {
 
 func TestPhysicalQueue_ClosePreservesAcceptedFlushResult(t *testing.T) {
 	store := newTestStore(t)
-	pq, err := newPhysicalQueue(context.Background(), store, "flush-close-q", 0, time.Minute, "owner-a")
+	pq, err := newPhysicalQueue(context.Background(), store, "flush-close-q", 0, time.Minute, defaultMaxAttempts, "owner-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,7 +432,7 @@ func TestPhysicalQueue_ClosePreservesAcceptedFlushError(t *testing.T) {
 		release: make(chan struct{}),
 		err:     writeErr,
 	}
-	pq, err := newPhysicalQueue(context.Background(), store, "flush-error-close-q", 0, time.Minute, "owner-a")
+	pq, err := newPhysicalQueue(context.Background(), store, "flush-error-close-q", 0, time.Minute, defaultMaxAttempts, "owner-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +468,7 @@ func TestPhysicalQueue_ClosePreservesAcceptedFlushError(t *testing.T) {
 
 func TestPhysicalQueue_GCDoesNotRunUntilExplicitlyStarted(t *testing.T) {
 	s := newTestStore(t)
-	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +504,7 @@ func TestPhysicalQueue_GCDoesNotRunUntilExplicitlyStarted(t *testing.T) {
 
 func TestPhysicalQueue_GCRunsAfterExplicitStart(t *testing.T) {
 	s := newTestStore(t)
-	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -477,7 +549,7 @@ func TestPhysicalQueue_GCRunsAfterExplicitStart(t *testing.T) {
 
 func TestPhysicalQueue_VisibilityScanDoesNotRunUntilExplicitlyStarted(t *testing.T) {
 	s := newTestStore(t)
-	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 50*time.Millisecond, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 50*time.Millisecond, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +578,7 @@ func TestPhysicalQueue_VisibilityScanDoesNotRunUntilExplicitlyStarted(t *testing
 
 func TestPhysicalQueue_VisibilityScanRunsAfterExplicitStart(t *testing.T) {
 	s := newTestStore(t)
-	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 50*time.Millisecond, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 50*time.Millisecond, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +621,7 @@ func TestPhysicalQueue_WriterOwnershipLossDoesNotLocallyCancelQueue(t *testing.T
 	base := newTestStore(t)
 	store := &conditionFailedUpdateStore{Store: base}
 
-	pq, err := newPhysicalQueue(context.Background(), store, "test-q", 0, 60*time.Second, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), store, "test-q", 0, 60*time.Second, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +642,7 @@ func TestPhysicalQueue_GCOwnershipLossDoesNotLocallyCancelQueue(t *testing.T) {
 	base := newTestStore(t)
 	store := &conditionFailedUpdateStore{Store: base}
 
-	pq, err := newPhysicalQueue(context.Background(), store, "test-q", 0, 60*time.Second, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), store, "test-q", 0, 60*time.Second, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -604,7 +676,7 @@ func TestPhysicalQueue_GCOwnershipLossDoesNotLocallyCancelQueue(t *testing.T) {
 
 func TestPhysicalQueue_AddTaskWaitsUntilTaskBecomesReadable(t *testing.T) {
 	s := newTestStore(t)
-	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, "test-owner")
+	pq, err := newPhysicalQueue(context.Background(), s, "test-q", 0, 60*time.Second, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -732,11 +804,8 @@ func TestPhysicalQueue_AckAndNack(t *testing.T) {
 	// nack task 2
 	pq.nack(ctx, tok2)
 
-	// nack 后 task2 应可再次被 poll
-	r3, _, ok, err := pq.tryPoll(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// nack 后 task2 以新 taskID 重写，writer 落库后应可再次被 poll
+	r3, _, ok := awaitTestPoll(t, pq, PollOptions{})
 	if !ok {
 		t.Fatal("expected redelivered task after nack")
 	}
@@ -914,14 +983,14 @@ func TestPhysicalQueue_AckRejectsTokenForDifferentQueue(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	pqA, err := newPhysicalQueue(ctx, store, "queue-a", 0, 60*time.Second, "owner-a")
+	pqA, err := newPhysicalQueue(ctx, store, "queue-a", 0, 60*time.Second, defaultMaxAttempts, "owner-a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	startTestWriterTask(t, pqA)
 	defer pqA.Close()
 
-	pqB, err := newPhysicalQueue(ctx, store, "queue-b", 0, 60*time.Second, "owner-b")
+	pqB, err := newPhysicalQueue(ctx, store, "queue-b", 0, 60*time.Second, defaultMaxAttempts, "owner-b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -963,7 +1032,7 @@ func TestPhysicalQueue_AckRejectsTokenFromPreviousOwnershipEpoch(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
-	pq1, err := newPhysicalQueue(ctx, store, "epoch-q", 0, 60*time.Second, "owner-a")
+	pq1, err := newPhysicalQueue(ctx, store, "epoch-q", 0, 60*time.Second, defaultMaxAttempts, "owner-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -981,7 +1050,7 @@ func TestPhysicalQueue_AckRejectsTokenFromPreviousOwnershipEpoch(t *testing.T) {
 	}
 	pq1.Close()
 
-	pq2, err := newPhysicalQueue(ctx, store, "epoch-q", 0, 60*time.Second, "owner-b")
+	pq2, err := newPhysicalQueue(ctx, store, "epoch-q", 0, 60*time.Second, defaultMaxAttempts, "owner-b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1051,7 +1120,7 @@ func TestPhysicalQueue_TryPollDoesNotSkipTaskAfterDispatchFailure(t *testing.T) 
 	store.failDispatchFor[1] = dispatchErr
 
 	ctx := context.Background()
-	pq, err := newPhysicalQueue(ctx, store, "test-q", 0, 60*time.Second, "test-owner")
+	pq, err := newPhysicalQueue(ctx, store, "test-q", 0, 60*time.Second, defaultMaxAttempts, "test-owner")
 	if err != nil {
 		t.Fatal(err)
 	}

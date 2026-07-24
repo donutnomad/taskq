@@ -11,8 +11,11 @@ type writeRequest struct {
 	data            []byte
 	routingKey      string
 	routingDeadline time.Time
-	taskID          int64 // flush 后填入
-	done            chan error
+	createdAt       time.Time // 零值表示由 flush 取当前时间
+	attempt         int
+	respoolOf       int64      // 非 0 表示本次写入是该老任务的 respool 重写
+	taskID          int64      // flush 后填入
+	done            chan error // respool 请求为 nil，无人等待结果
 }
 
 type taskWriter struct {
@@ -67,6 +70,42 @@ func (w *taskWriter) enqueue(data []byte, opts EnqueueOptions) (int64, error) {
 	}
 	err := <-req.done
 	return req.taskID, err
+}
+
+// tryEnqueueRespool 非阻塞地把 respool 重写请求投入写入批次。
+// 该方法可能在 writer goroutine 自身（onFlush → tryDeliverToWaiters → nack）以及
+// transitionMu 之下被调用，因此绝不能等待任何返回 channel；队列满或已关闭时返回
+// false，由调用方降级为原地 redelivery。
+func (w *taskWriter) tryEnqueueRespool(row *TaskRow, respoolOf int64) bool {
+	// senders.Add 必须在 stateMu 之下、且确认未关闭后进行，与 enqueue 对齐：
+	// 这样 close() 的 senders.Wait() 屏障同样覆盖 respool 生产者。否则 close()
+	// 可能在本次发送前排空并返回，随后本次发送落入缓冲区却无人接收，
+	// respooling 条目将永远得不到 finishRespool/abortRespool 结算。
+	w.stateMu.RLock()
+	ready := w.started && !w.closed
+	if ready {
+		w.senders.Add(1)
+	}
+	w.stateMu.RUnlock()
+	if !ready {
+		return false
+	}
+	defer w.senders.Done()
+
+	req := &writeRequest{
+		data:            row.Data,
+		routingKey:      row.RoutingKey,
+		routingDeadline: row.RoutingDeadline,
+		createdAt:       row.CreatedAt,
+		attempt:         row.Attempt,
+		respoolOf:       respoolOf,
+	}
+	select {
+	case w.reqCh <- req:
+		return true
+	default:
+		return false
+	}
 }
 
 func (w *taskWriter) run(ctx context.Context) error {
@@ -141,6 +180,10 @@ func (w *taskWriter) flush(batch []*writeRequest) error {
 	rows := make([]*TaskRow, len(batch))
 	for i, req := range batch {
 		taskID := startID + int64(i)
+		createdAt := req.createdAt
+		if createdAt.IsZero() {
+			createdAt = now
+		}
 		rows[i] = &TaskRow{
 			TaskID:          taskID,
 			QueueName:       w.pq.queueName,
@@ -148,7 +191,8 @@ func (w *taskWriter) flush(batch []*writeRequest) error {
 			RoutingKey:      req.routingKey,
 			RoutingDeadline: req.routingDeadline,
 			Data:            req.data,
-			CreatedAt:       now,
+			Attempt:         req.attempt,
+			CreatedAt:       createdAt,
 		}
 		req.taskID = taskID
 	}
@@ -163,7 +207,13 @@ func (w *taskWriter) flush(batch []*writeRequest) error {
 	)
 	if err != nil {
 		for _, req := range batch {
-			req.done <- err
+			if req.done != nil {
+				req.done <- err
+			}
+			// 新行没落库，老任务绝不能被 ack，落回 redelivery 保持可恢复。
+			if req.respoolOf != 0 {
+				w.pq.runtime.state.abortRespool(req.respoolOf)
+			}
 		}
 		if errors.Is(err, ErrOwnershipLost) {
 			return err
@@ -171,12 +221,20 @@ func (w *taskWriter) flush(batch []*writeRequest) error {
 		return nil
 	}
 	w.nextID = newNextID
+	// 新行已落库，此时才允许 ack 老行并放行 ackLevel。
+	for _, req := range batch {
+		if req.respoolOf != 0 {
+			w.pq.runtime.state.finishRespool(req.respoolOf)
+		}
+	}
 	// 成功返回给写入方之前，先把新任务发布到本地可读状态。
 	if w.onFlush != nil {
 		w.onFlush(rows)
 	}
 	for _, req := range batch {
-		req.done <- nil
+		if req.done != nil {
+			req.done <- nil
+		}
 	}
 	return nil
 }
@@ -197,8 +255,14 @@ func (w *taskWriter) close() {
 	for {
 		select {
 		case req := <-w.reqCh:
-			if req != nil {
+			if req == nil {
+				continue
+			}
+			if req.done != nil {
 				req.done <- ErrQueueClosed
+			}
+			if req.respoolOf != 0 {
+				w.pq.runtime.state.abortRespool(req.respoolOf)
 			}
 		default:
 			return

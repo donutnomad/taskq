@@ -130,10 +130,11 @@ func TestFrontend_LongPollSuccessClearsFastScanOwnerError(t *testing.T) {
 
 type simultaneousLegacyPollServer struct {
 	matching.UnimplementedMatchingServiceServer
-	started  atomic.Int64
-	nacks    atomic.Int64
-	ready    chan struct{}
-	readyOne sync.Once
+	started          atomic.Int64
+	nacks            atomic.Int64
+	undeliveredNacks atomic.Int64
+	ready            chan struct{}
+	readyOne         sync.Once
 }
 
 func (s *simultaneousLegacyPollServer) GetQueueInfo(context.Context, *matching.GetQueueInfoRequest) (*matching.GetQueueInfoResponse, error) {
@@ -158,8 +159,11 @@ func (s *simultaneousLegacyPollServer) PollTask(ctx context.Context, request *ma
 	}
 }
 
-func (s *simultaneousLegacyPollServer) NackTask(context.Context, *matching.NackTaskRequest) (*matching.NackTaskResponse, error) {
+func (s *simultaneousLegacyPollServer) NackTask(_ context.Context, request *matching.NackTaskRequest) (*matching.NackTaskResponse, error) {
 	s.nacks.Add(1)
+	if request.Undelivered {
+		s.undeliveredNacks.Add(1)
+	}
 	return &matching.NackTaskResponse{}, nil
 }
 
@@ -195,13 +199,18 @@ func TestFrontend_LegacyFallbackReturnsSimultaneousLoser(t *testing.T) {
 	if got := server.nacks.Load(); got != 1 {
 		t.Fatalf("legacy fallback loser Nacks = %d, want 1", got)
 	}
+	// 败者从未交付给消费者，必须标记 undelivered，避免被计为一次消费失败。
+	if got := server.undeliveredNacks.Load(); got != 1 {
+		t.Fatalf("legacy fallback loser undelivered Nacks = %d, want 1", got)
+	}
 }
 
 type simultaneousOwnerPollState struct {
-	started  atomic.Int64
-	nacks    atomic.Int64
-	ready    chan struct{}
-	readyOne sync.Once
+	started          atomic.Int64
+	nacks            atomic.Int64
+	undeliveredNacks atomic.Int64
+	ready            chan struct{}
+	readyOne         sync.Once
 }
 
 type simultaneousOwnerPollServer struct {
@@ -233,8 +242,11 @@ func (s *simultaneousOwnerPollServer) PollQueue(ctx context.Context, request *ma
 	}
 }
 
-func (s *simultaneousOwnerPollServer) NackTask(context.Context, *matching.NackTaskRequest) (*matching.NackTaskResponse, error) {
+func (s *simultaneousOwnerPollServer) NackTask(_ context.Context, request *matching.NackTaskRequest) (*matching.NackTaskResponse, error) {
 	s.state.nacks.Add(1)
+	if request.Undelivered {
+		s.state.undeliveredNacks.Add(1)
+	}
 	return &matching.NackTaskResponse{}, nil
 }
 
@@ -263,6 +275,10 @@ func TestFrontend_MultipleOwnersReturnSimultaneousLoser(t *testing.T) {
 	}
 	if got := state.nacks.Load(); got != 1 {
 		t.Fatalf("multi-owner loser Nacks = %d, want 1", got)
+	}
+	// 非获胜 owner 的租约从未交付给消费者，必须标记 undelivered。
+	if got := state.undeliveredNacks.Load(); got != 1 {
+		t.Fatalf("multi-owner loser undelivered Nacks = %d, want 1", got)
 	}
 }
 

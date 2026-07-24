@@ -5,7 +5,7 @@ TaskQ 是一个 Temporal 风格的分布式任务队列系统，使用 Go 实现
 ## 核心特性
 
 - **多分区队列** — 水平扩展吞吐量，round-robin 分发写入
-- **At-least-once 投递** — 可见性超时 + 自动重投递，确保任务不丢失
+- **At-least-once 投递** — 可见性超时 + 自动重投递（respool 换新 taskID），失败任务不丢，且不冻结 `ackLevel`
 - **一致性哈希路由** — 基于虚拟节点的哈希环，分区自动分配到集群节点
 - **`dbleader` 锁 + RangeID CAS** — 运行期开关由 `dbleader` 控制，写入围栏继续由 `rangeID` CAS 兜底
 - **长轮询消费** — 无任务时 worker 阻塞等待，任务到达即时唤醒
@@ -182,7 +182,7 @@ gRPC 分区管理服务，每个节点只处理哈希环分配给自己的分区
 | `PollTask` | 消费任务（支持非阻塞和长轮询） |
 | `PollQueue` | 一次轮询同一 owner 的多个分区，返回一个任务并回收同时命中的其他 lease |
 | `AckTask` | 确认消费完成 |
-| `NackTask` | 拒绝消费，触发重投递 |
+| `NackTask` | 拒绝消费，触发重投递（respool）；`undelivered=true` 表示仅归还未交付的 lease，不计入 attempt |
 | `GetQueueInfo` | 查询队列的分区数 |
 
 **PartitionManager** 核心逻辑：
@@ -193,7 +193,7 @@ gRPC 分区管理服务，每个节点只处理哈希环分配给自己的分区
 
 ### Frontend 包
 
-客户端路由库（不是独立服务），worker 通过它透明访问分布式队列。
+客户端路由 SDK（**不是独立服务、不监听端口**），直接链接进 worker 进程，worker 通过它透明访问分布式队列。
 
 - 通过 `GetQueueInfo` 自动发现分区数量
 - round-robin 选分区写入
@@ -250,6 +250,19 @@ ON task_effects (idempotency_key);
 ```
 
 TaskQ 提供 at-least-once delivery；业务幂等键定义一次业务效果。
+
+### 投递重试、respool 与 attempt 上限
+
+失败任务（`Nack`、可见性超时）不再原地放回，而是 **respool**：以更高的 `taskID` 重写一条新任务，再确认（ack）老行。这样单条反复失败的任务不会永久钉死 `ackLevel`——`acked` 内存与 `tasks` 表持续 GC，队列始终能向前推进。该机制对齐 Temporal matching 层的 `respoolTaskAfterError`。
+
+- **`attempt` 列** — `tasks` 表新增，记录该任务已失败的投递次数（首次写入为 0）。持久化在行上，进程重启 / 分区易主后计数不丢。
+- **`MaxAttempts`（`matching.Config`）** — 单任务的总投递次数上限。**默认 `0` 表示不限次数**：反复失败的任务持续 respool，`ackLevel` 不会被其阻塞，数据也不会被 TaskQ 主动删除。设为正数才启用上限，超过后任务被丢弃并仅记录一条 `error` 日志。
+- **毒丸处理** — 遇到无法处理的消息，推荐消费者**自行持久化后回 `Ack`**（而非 `Nack`），让任务正常出队。TaskQ 是运输层，不替业务决定丢弃数据，因此默认不设上限。
+
+> **行为变化（自 respool 版本起）**
+> - `Nack` 返回后任务**不再立即可 poll**：新行由 writer 异步落库，需等下一轮 flush。
+> - 同分区消费顺序进一步弱化：respool 把重试任务排到队尾（新 `taskID`）。TaskQ 本就不保证跨分区顺序，同分区顺序也因重试被打乱。
+> - 老 attempt 的 token 在其 delivery 退役后，`Ack`/`Nack` 返回从 `ErrStaleToken` 变为 `ErrTaskNotOutstanding`（老 `taskID` 已退役，无从判定 stale）。
 
 ### Dequeue 流程
 
@@ -316,15 +329,18 @@ sequenceDiagram
     Note over DS: ackLevel 推进到最大连续已确认 ID
     PQ->>DB: (GC 周期) DeleteTasks(ackLevel)
 
-    Note over W,DB: Nack 流程
+    Note over W,DB: Nack 流程（respool）
     W->>F: Nack(token)
     F->>M: gRPC NackTask(token)
     M->>PQ: Nack(token)
     PQ->>RT: nack(taskID, deliveryID)
-    RT->>DB: UnDispatchTask(taskID)
-    RT->>DS: 从 outstanding 移除，放入 redelivery
+    RT->>DS: outstanding → respooling
+    RT->>DB: 以新 taskID 重写任务（attempt+1，老行仍隐藏）
+    DS->>DS: 新行落库后 finishRespool，老行记 acked
     PQ->>PQ: wakeWaiters() → 投递给等待中的 poller
 ```
+
+> Nack 返回后任务**不再立即可 poll**：新行由 writer 异步落库，需等下一轮批量 flush 才可读。内部归还未交付的 lease（多分区 poll 竞速的败者、调用方取消）走 `ReturnLease` / `undelivered=true`，原地退回、**不消耗 attempt**。
 
 ### 分区所有权流程
 
@@ -395,18 +411,22 @@ sequenceDiagram
 │ maxReadLevel: DB 中已知的最高 taskID                    │
 │                                                     │
 │ outstanding: {taskID → 已分发但未确认的任务}              │
-│ redelivery:  [nack 或超时待重投递的任务]                  │
+│ respooling:  {taskID → 正以新 taskID 重写、等待落库}      │
+│ redelivery:  [waiter 消失等待原地重投递的任务]             │
 │ acked:       {taskID → true, 已确认但 ackLevel 尚未推进} │
 └─────────────────────────────────────────────────────┘
 
 任务状态流转：
-  DB → taskRuntime.tryGetTask() → outstanding → ack() → acked → advanceAckLevel → GC 删除
-                                             nack() → redelivery → taskRuntime.tryGetTask() → outstanding → ...
-                        visScan 超时 → redelivery → taskRuntime.tryGetTask() → outstanding → ...
+  DB → tryGetTask() → outstanding ─ ack() ─────────→ acked → advanceAckLevel → GC 删除
+                                 ├ nack()/超时 → respooling → (新行落库) finishRespool → acked
+                                 └ waiter 消失 → redelivery → tryGetTask() → outstanding → ...
+
+  respooling 的老行在新行落库后记为 acked（相当于就地退役）；新行以 attempt+1 排到队尾重新参与消费。
 
 ackLevel 推进规则 (advanceAckLevel)：
   从 ackLevel+1 开始逐个检查：
   - 在 outstanding 中 → 停止（还在处理中）
+  - 在 respooling 中 → 停止（新行未落库，绝不提前 ack 老行）
   - 在 redelivery 中 → 停止（未重新确认，防止 GC 删除）
   - 在 acked 中 → 推进，继续检查下一个
   - 其他 → 停止（还没读到）
@@ -473,6 +493,7 @@ matching.Config{
     ListenAddr:    ":7235",                         // gRPC 监听地址
     BroadcastAddr: "10.0.0.1:7235",                 // 必填，广播地址
     VisTimeout:    60 * time.Second,                // 默认 60s
+    MaxAttempts:   0,                               // 单任务投递次数上限，0=不限（默认）
     QueueConfigs:  map[string]int{"my-queue": 4},   // 队列名 → 分区数
     LeaseOwner:    "",                              // 为空时自动生成 UUID
     ReconcileInterval: 5 * time.Second,             // 默认 5s
@@ -615,6 +636,18 @@ CREATE INDEX idx_tasks_visibility
 
 CREATE INDEX idx_tasks_routing_deadline
     ON tasks (queue_name, partition_id, dispatched_at, routing_deadline, task_id);
+```
+
+从记录重试次数之前的版本升级时，MySQL 使用以下兼容迁移：
+
+```sql
+ALTER TABLE tasks ADD COLUMN attempt INT NOT NULL DEFAULT 0;
+```
+
+SQLite 使用以下兼容迁移：
+
+```sql
+ALTER TABLE tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
 ```
 
 已经部署 Slice D routing key 的环境保留现有 `routing_key` 与 `idx_tasks_visibility`，只执行 deadline 列和 deadline 索引语句。上线顺序为先创建列与索引，再部署读写 routing 字段的 TaskQ 二进制。零值 deadline 持久化为 `NULL`，表示永久按 routing key 定向；非空 deadline 到期后由原任务行直接参与普通 poll，原任务行、TaskID 和 AckLevel 保持连续。每次 delivery 生成新的 token；旧 attempt token 无法 Ack 或 Nack 后续 delivery。
