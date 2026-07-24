@@ -32,7 +32,7 @@ type Config struct {
 
 // Store is a GORM-backed implementation of queue.Store and dbleader.LockStore.
 type Store struct {
-	db              *gorm.DB
+	db              DB
 	lockTable       string
 	memberTable     string
 	membershipTable string
@@ -41,7 +41,7 @@ type Store struct {
 var _ queue.Store = (*Store)(nil)
 var _ dbleader.LockStore = (*Store)(nil)
 
-func New(db *gorm.DB, cfg Config) (*Store, error) {
+func New(db DB, cfg Config) (*Store, error) {
 	if db == nil {
 		return nil, fmt.Errorf("gormstore: db is required")
 	}
@@ -109,8 +109,17 @@ func NewMySQL(dsn string, cfg Config) (*Store, error) {
 	return s, nil
 }
 
+// DB 返回可直接使用的 *gorm.DB（而非 DB 接口），供调用方做 Migrator、Callback
+// 等接口未覆盖的操作。注入自定义句柄时经 WithContext 派生，语义与原句柄一致。
 func (s *Store) DB() *gorm.DB {
-	return s.db
+	return s.db.WithContext(context.Background())
+}
+
+// dialectName 取当前方言名，用于区分 MySQL 与其他数据库的 upsert 写法。
+// Dialector 是 gorm.DB 上的字段而非方法，无法进入 DB 接口，故经 WithContext
+// 派生出的 *gorm.DB 上读取——派生实例与原句柄共享同一 Dialector。
+func (s *Store) dialectName(ctx context.Context) string {
+	return s.db.WithContext(ctx).Dialector.Name()
 }
 
 func (s *Store) Close() error {
@@ -475,7 +484,7 @@ func (s *Store) TryAcquire(ctx context.Context, lockName, nodeIP string, ttlSeco
 	expireAtMS := nowMS + int64(ttlSeconds)*1000
 	var row lockRow
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if s.db.Dialector.Name() == "mysql" {
+		if s.dialectName(ctx) == "mysql" {
 			if err := tx.Exec(`
 				INSERT INTO `+s.lockTable+` (lock_name, leader_ip, expire_at_ms, version)
 				VALUES (?, ?, ?, 1)
@@ -557,7 +566,7 @@ func (s *Store) ForceAssign(ctx context.Context, lockName, newLeaderIP string, t
 
 func (s *Store) UpsertMember(ctx context.Context, m dbleader.MemberInfo) error {
 	now := time.Now()
-	if s.db.Dialector.Name() == "mysql" {
+	if s.dialectName(ctx) == "mysql" {
 		return s.db.WithContext(ctx).Exec(`
 			INSERT INTO `+s.memberTable+`
 				(lock_name, instance_id, node_ip, mac_address, hostname, pid, os, go_version, service_version, description, start_time, last_seen)

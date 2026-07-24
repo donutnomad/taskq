@@ -15,7 +15,7 @@ import (
 // MembershipStore shares its parent's database connection. Store.Close owns
 // that connection and must run after the membership Monitor stops.
 type MembershipStore struct {
-	db    *gorm.DB
+	db    DB
 	table string
 }
 
