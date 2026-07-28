@@ -3,3 +3,6 @@
 .trash
 .hive
 docs
+
+# macOS
+.DS_Store

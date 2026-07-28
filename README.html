@@ -980,6 +980,8 @@
         <a href="#ack-nack-flow" class="lvl-2">Ack / Nack 流程</a>
         <a href="#partition-ownership" class="lvl-2">分区所有权流程</a>
         <a href="#reconcile" class="lvl-2">成员变更 → Reconcile</a>
+        <a href="#dynamic-partitions" class="lvl-2">运行时调整分区数</a>
+        <a href="#drain-timeout" class="lvl-3">drain 超时与安全中间态</a>
         <a href="#internals" class="lvl-2">PhysicalQueue 内部结构</a>
         <a href="#delivery-state" class="lvl-3">deliveryState 状态</a>
         <a href="#sync-match" class="lvl-3">Sync Match 与 waiterRegistry</a>
@@ -1023,6 +1025,7 @@
           </thead>
           <tbody>
             <tr><td><strong>多分区队列</strong></td><td>水平扩展吞吐量，round-robin 分发写入</td></tr>
+            <tr><td><strong>自动分区</strong></td><td>queue 按需自动创建；分区数纯 dynamic（DB 配置，全局默认 + per-queue override），运行时可安全增减</td></tr>
             <tr><td><strong>At-least-once 投递</strong></td><td>可见性超时 + 自动重投递（respool 换新 taskID），失败任务不丢，且不冻结 ackLevel</td></tr>
             <tr><td><strong>一致性哈希路由</strong></td><td>基于虚拟节点的哈希环，分区自动分配到集群节点</td></tr>
             <tr><td><strong><code>dbleader</code> 锁 + RangeID CAS</strong></td><td>运行期开关由 <code>dbleader</code> 控制，写入围栏继续由 <code>rangeID</code> CAS 兜底</td></tr>
@@ -1512,6 +1515,65 @@ sequenceDiagram
         <figcaption class="diagram-caption">成员变更驱动哈希环重建，Matching 重新分配分区，Frontend 清理连接池。</figcaption>
       </figure>
 
+      <h2 id="dynamic-partitions">运行时调整分区数</h2>
+
+      <p>分区数是<strong>纯 dynamic</strong> 的（DB <code>partition_config</code> 表：<code>_default_</code> 全局默认行 + per-queue override 行），queue 按需自动创建，无需预先声明。<strong>唯一安全的调整入口是 <code>matching.Server.ResizePartitions</code></strong>：</p>
+
+      <pre><code>// 把 my-queue 的分区数调整为 8（扩容）或 2（缩容），期间不丢任务。
+if err := matchingServer.ResizePartitions(ctx, "my-queue", 8); err != nil {
+    log.Fatal(err)
+}</code></pre>
+
+      <p>分区数分裂为 <code>num_read</code> / <code>num_write</code> 两个值，不变式 <code>1 &lt;= write &lt;= read</code>：写只落在 <code>[0, write)</code>，读枚举 <code>[0, read)</code>，因此<strong>被写的分区一定在被读的集合内</strong>。</p>
+
+      <figure class="diagram">
+        <pre class="mermaid">
+flowchart TD
+    A[ResizePartitions target] --> B{target vs 当前 read}
+    B -->|扩容| C[1. Set read=target, write=旧]
+    C --> D[2. 等待 &gt; configTTL 5s]
+    D --> E[3. Set read=target, write=target]
+    B -->|缩容| F[1. Set write=target 只减写]
+    F --> G[2. 写收敛静默期 &gt; TTL]
+    G --> H[3. drain 轮询 稳定 &gt; GC 5s]
+    H -->|全排空| I[4. Set read=target 才减读]
+    H -->|超时| J[中止：停在安全中间态]
+        </pre>
+        <figcaption class="diagram-caption">扩容先加 read 后加 write；缩容先减 write、静默、排空确认后才减 read。</figcaption>
+      </figure>
+
+      <aside class="callout callout-danger">
+        <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-danger"/></svg>
+        <div class="callout-body">
+          <p class="callout-title">为什么缩容必须走 orchestrator，不能直接 SetPartitions 减 read</p>
+          <p>「停止写高位分区」是<strong>跨节点最终一致</strong>的——靠各节点配置缓存 TTL 过期传播；而「减 read」是<strong>一步到位</strong>的。若在还可能有滞后节点往高位分区写入时就减小 read，该分区立刻失去 owner：没人 poll、GC 也停摆 → 其中的任务<strong>永不被消费、静默丢失</strong>。静默期 + drain 确认就是把这个最终一致的过程收敛为全局事实之后再动 read。</p>
+        </div>
+      </aside>
+
+      <aside class="callout callout-warn">
+        <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-warn"/></svg>
+        <div class="callout-body">
+          <p class="callout-title">全局默认只允许 grow</p>
+          <p><code>SetDefaultPartitions</code> 有硬 guard：缩小全局默认等于对所有无 override 的 queue 做一次<strong>无 drain 的隐式缩容</strong>。确需缩小时，先给每个目标 queue 显式 <code>SetPartitions</code> 钉住旧值，逐个 <code>ResizePartitions</code> 缩容后再调默认。</p>
+        </div>
+      </aside>
+
+      <h3 id="drain-timeout">drain 超时与安全中间态</h3>
+      <p>drain 轮询有总超时（默认 2 分钟），超时返回包装 <code>ErrPartitionDrainTimeout</code> 的错误，并上报<strong>卡住的分区号、<code>ack_level</code>/<code>next_task_id</code>、最早未确认的 <code>task_id</code></strong>。最常见原因是高位分区里有反复失败的 poison 任务：<code>MaxAttempts=0</code>（默认）不限投递次数，这类任务会持续 respool，把 <code>ackLevel</code> 永久钉住。处理方式是先定位该任务（消费者自行持久化后回 <code>Ack</code>，或设置 <code>MaxAttempts</code> 上限），再重试缩容。</p>
+
+      <div class="highlight">
+        <span class="highlight-label">要点</span>
+        <p>超时 / 取消 / DB 错误时，缩容停在 <code>(read=旧值, write=target)</code> —— 这是<strong>安全中间态</strong>：高位分区停写但仍被 own、仍可 poll/ack、GC 仍在跑，<strong>数据不会孤立</strong>，修复后直接重试即可。</p>
+      </div>
+
+      <aside class="callout callout-info">
+        <svg class="callout-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-info"/></svg>
+        <div class="callout-body">
+          <p class="callout-title">迟到 Ack/Nack 与配置不可读</p>
+          <p>缩容完成后，指向已退役分区的 Ack/Nack 重试返回<strong>幂等成功</strong>而非 <code>InvalidArgument</code>——能推进到「减 read」就意味着该分区已确认完全排空，此类请求必然是重复的。另外，当分区配置读不到且无缓存时，matching 返回 <code>Unavailable</code> 拒绝服务（而非回退到默认值），避免把写入放行到已退役的分区。</p>
+        </div>
+      </aside>
+
       <h2 id="internals">PhysicalQueue 内部结构</h2>
 
       <h3 id="delivery-state">deliveryState 状态</h3>
@@ -1611,7 +1673,7 @@ flowchart TD
     BroadcastAddr: "10.0.0.1:7235",                 // 必填，广播地址
     VisTimeout:    60 * time.Second,                // 默认 60s
     MaxAttempts:   0,                               // 单任务投递次数上限，0=不限（默认）
-    QueueConfigs:  map[string]int{"my-queue": 4},   // 队列名 → 分区数
+    DefaultPartitions: 4,                           // 仅 bootstrap 全局默认行，已存在则不覆盖
     LeaseOwner:    "",                              // 为空时自动生成 UUID
     ReconcileInterval: 5 * time.Second,             // 默认 5s
     GRPCOptions:   []grpc.ServerOption{},           // 可选
