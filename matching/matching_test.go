@@ -98,10 +98,16 @@ func startTestServer(t *testing.T, store Store, resolver *stubResolver, broadcas
 		Monitor:       monitor,
 		ListenAddr:    addr,
 		BroadcastAddr: broadcastAddr,
-		QueueConfigs:  queueConfigs,
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// 保持各测试原有的分区数语义：为每个声明的 queue 设 override(N,N)（稳态 write==read）。
+	for q, n := range queueConfigs {
+		if err := store.SetPartitions(context.Background(), q, n, n); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if err := srv.Start(); err != nil {
@@ -597,6 +603,9 @@ func TestMatchingServer_NackTaskRejectsTokenPartitionMismatch(t *testing.T) {
 
 func TestPartitionManager_ReloadsClosedPartition(t *testing.T) {
 	store := newTestSQLiteStore(t)
+	if err := store.EnsureDefaultPartitions(context.Background(), 1, 1); err != nil {
+		t.Fatal(err)
+	}
 	resolver := newStubResolver("127.0.0.1:9999")
 	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress("127.0.0.1:9999")}
 
@@ -609,17 +618,16 @@ func TestPartitionManager_ReloadsClosedPartition(t *testing.T) {
 		resolver,
 		time.Minute,
 		defaultMaxAttempts,
-		map[string]int{"test-q": 1},
 	)
 	defer pm.close()
 
-	pq1, err := pm.getOrLoadPartition(context.Background(), "test-q", 0)
+	pq1, err := pm.getOrLoadPartition(context.Background(), "test-q", 0, accessRead)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pq1.close()
 
-	pq2, err := pm.getOrLoadPartition(context.Background(), "test-q", 0)
+	pq2, err := pm.getOrLoadPartition(context.Background(), "test-q", 0, accessRead)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +670,6 @@ func TestNewServerDefaultsToUnlimitedMaxAttempts(t *testing.T) {
 		Store:         store,
 		Monitor:       monitor,
 		BroadcastAddr: "127.0.0.1:9999",
-		QueueConfigs:  map[string]int{"test-q": 1},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -683,7 +690,6 @@ func TestNewServerHonorsExplicitMaxAttempts(t *testing.T) {
 		Store:         store,
 		Monitor:       monitor,
 		BroadcastAddr: "127.0.0.1:9999",
-		QueueConfigs:  map[string]int{"test-q": 1},
 		MaxAttempts:   5,
 	})
 	if err != nil {

@@ -36,12 +36,14 @@ func (h *matchingHandler) PollQueue(ctx context.Context, request *PollQueueReque
 	if len(request.PartitionIds) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "partition_ids is required")
 	}
-	partitionCount, ok := h.mgr.getQueuePartitionCount(request.QueueName)
-	if !ok {
-		return nil, toGRPCError(ErrUnknownQueue)
+	// PollQueue 是读操作：按 numRead 界定合法分区集合。queue 未知不再报错（fallback 全局默认）。
+	// 配置不可知时返回 Unavailable（可重试），不猜测分区数。
+	numRead, err := h.mgr.resolveReadPartitions(request.QueueName)
+	if err != nil {
+		return nil, toGRPCError(err)
 	}
-	if len(request.PartitionIds) > partitionCount {
-		return nil, status.Errorf(codes.InvalidArgument, "partition_ids has %d entries for a %d-partition queue", len(request.PartitionIds), partitionCount)
+	if len(request.PartitionIds) > numRead {
+		return nil, status.Errorf(codes.InvalidArgument, "partition_ids has %d entries for a %d-partition queue", len(request.PartitionIds), numRead)
 	}
 	opts, err := (queue.PollOptions{AcceptedRoutingKeys: request.AcceptedRoutingKeys}).Normalize()
 	if err != nil {
@@ -86,11 +88,11 @@ func (h *matchingHandler) loadQueuePollTargets(
 			continue
 		}
 		seen[partitionID] = struct{}{}
-		if err := h.mgr.validatePartition(queueName, int(partitionID)); err != nil {
+		if err := h.mgr.validatePartition(queueName, int(partitionID), accessRead); err != nil {
 			diagnostics = append(diagnostics, fmt.Errorf("partition %d: %w", partitionID, err))
 			continue
 		}
-		handle, err := h.mgr.getOrLoadPartition(ctx, queueName, int(partitionID))
+		handle, err := h.mgr.getOrLoadPartition(ctx, queueName, int(partitionID), accessRead)
 		if err != nil {
 			diagnostics = append(diagnostics, fmt.Errorf("partition %d: %w", partitionID, err))
 			continue

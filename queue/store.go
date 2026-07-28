@@ -45,6 +45,13 @@ type QueueInfo struct {
 	NextTaskID  int64
 }
 
+// QueuePartitionConfig 表示某个 queue 的分区 override 配置（读/写分区数）。
+type QueuePartitionConfig struct {
+	QueueName string
+	Read      int
+	Write     int
+}
+
 // QueueMetaStore 管理 queue_info 元数据。
 type QueueMetaStore interface {
 	CreateQueue(ctx context.Context, info *QueueInfo) error
@@ -55,6 +62,21 @@ type QueueMetaStore interface {
 	AdvanceAckLevelAndDeleteTasks(ctx context.Context,
 		queueName string, partitionID int,
 		newAckLevel int64, prevRangeID int64) (newRangeID int64, deleted int64, err error)
+	// ResolvePartitions 读时取值：优先 per-queue override 行，缺失则 fallback 到
+	// 全局默认行。queue 没有自己的 override 行是常态，不物化。
+	ResolvePartitions(ctx context.Context, queueName string) (read, write int, err error)
+	// SetPartitions upsert 某 queue 的 override 行，硬校验 1<=write<=read。
+	SetPartitions(ctx context.Context, queueName string, read, write int) error
+	// SetDefaultPartitions 更新全局默认行，硬校验 1<=write<=read 且 grow-only：
+	// 新值任一维度小于当前默认值则拒绝。
+	SetDefaultPartitions(ctx context.Context, read, write int) error
+	// EnsureDefaultPartitions 幂等 bootstrap 全局默认行，已存在则不覆盖。
+	EnsureDefaultPartitions(ctx context.Context, read, write int) error
+	// ListPartitionOverrides 返回所有 override 行（不含全局默认），供 reconcile 枚举。
+	ListPartitionOverrides(ctx context.Context) ([]QueuePartitionConfig, error)
+	// ListQueueNames 返回 queue_info 中出现过的所有 queue 名（DISTINCT），
+	// 供 reconcile 枚举已物化分区的 queue。
+	ListQueueNames(ctx context.Context) ([]string, error)
 }
 
 // TaskStore 管理 tasks 表中的任务数据。

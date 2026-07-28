@@ -12,6 +12,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -19,6 +20,8 @@ const (
 	defaultMemberTable     = "taskq_partition_lock_members"
 	defaultMembershipTable = "taskq_membership_members"
 	visibilityResetBatch   = 500
+	// defaultPartitionScope 是 partition_config 表中全局默认行的保留 scope 值。
+	defaultPartitionScope = "_default_"
 )
 
 // Config controls Store initialization. AutoMigrate is explicit so production
@@ -132,7 +135,7 @@ func (s *Store) Close() error {
 
 func (s *Store) AutoMigrate(ctx context.Context) error {
 	db := s.db.WithContext(ctx)
-	if err := db.AutoMigrate(&queueInfoRow{}, &taskRow{}); err != nil {
+	if err := db.AutoMigrate(&queueInfoRow{}, &taskRow{}, &partitionConfigRow{}); err != nil {
 		return err
 	}
 	if err := db.Table(s.lockTable).AutoMigrate(&lockRow{}); err != nil {
@@ -153,6 +156,17 @@ type queueInfoRow struct {
 }
 
 func (queueInfoRow) TableName() string { return "queue_info" }
+
+// partitionConfigRow 持久化 queue 分区数（读时取值，全局默认 + per-queue override）。
+// scope 为 defaultPartitionScope 时是全局默认行，否则是某 queue 的显式 override 行。
+type partitionConfigRow struct {
+	Scope     string    `gorm:"column:scope;primaryKey;size:191"`
+	NumRead   int       `gorm:"column:num_read;not null"`
+	NumWrite  int       `gorm:"column:num_write;not null"`
+	UpdatedAt time.Time `gorm:"column:updated_at;not null"`
+}
+
+func (partitionConfigRow) TableName() string { return "partition_config" }
 
 type taskRow struct {
 	QueueName       string     `gorm:"column:queue_name;primaryKey;size:191;index:idx_tasks_visibility,priority:1;index:idx_tasks_routing_deadline,priority:1"`
@@ -323,6 +337,114 @@ func (s *Store) AdvanceAckLevelAndDeleteTasks(ctx context.Context, queueName str
 		return prevRangeID, 0, nil
 	}
 	return newRangeID, deleted, nil
+}
+
+// validatePartitionCounts 强校验 1<=write<=read 不变式。
+func validatePartitionCounts(read, write int) error {
+	if write < 1 || read < write {
+		return fmt.Errorf("gormstore: invalid partition counts read=%d write=%d, require 1<=write<=read", read, write)
+	}
+	return nil
+}
+
+func (s *Store) ResolvePartitions(ctx context.Context, queueName string) (int, int, error) {
+	var row partitionConfigRow
+	err := s.db.WithContext(ctx).Where("scope = ?", queueName).First(&row).Error
+	if err == nil {
+		return row.NumRead, row.NumWrite, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, 0, err
+	}
+	// override 缺失是常态，fallback 到全局默认行。
+	err = s.db.WithContext(ctx).Where("scope = ?", defaultPartitionScope).First(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, 0, fmt.Errorf("gormstore: default partition config %q is missing; call EnsureDefaultPartitions first", defaultPartitionScope)
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	return row.NumRead, row.NumWrite, nil
+}
+
+func (s *Store) SetPartitions(ctx context.Context, queueName string, read, write int) error {
+	if queueName == "" || queueName == defaultPartitionScope {
+		return fmt.Errorf("gormstore: %q is not a valid override queue name", queueName)
+	}
+	if err := validatePartitionCounts(read, write); err != nil {
+		return err
+	}
+	row := partitionConfigRow{Scope: queueName, NumRead: read, NumWrite: write, UpdatedAt: time.Now().UTC()}
+	return s.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "scope"}},
+		DoUpdates: clause.AssignmentColumns([]string{"num_read", "num_write", "updated_at"}),
+	}).Create(&row).Error
+}
+
+func (s *Store) SetDefaultPartitions(ctx context.Context, read, write int) error {
+	if err := validatePartitionCounts(read, write); err != nil {
+		return err
+	}
+	// 条件 UPDATE 做 CAS：仅当当前值不超过新值（grow-only，相等允许）时才写入。
+	// 单条原子语句避免 read-compare-write 三步在 MySQL REPEATABLE READ 下的
+	// lost update——并发缩容不会基于旧快照绕过 grow-only 覆盖已提交的更大值。
+	// 用 <= 而非 FOR UPDATE：跨 SQLite/glebarez 与 MySQL 均安全。
+	result := s.db.WithContext(ctx).Model(&partitionConfigRow{}).
+		Where("scope = ? AND num_read <= ? AND num_write <= ?", defaultPartitionScope, read, write).
+		Updates(map[string]any{"num_read": read, "num_write": write, "updated_at": time.Now().UTC()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 1 {
+		return nil
+	}
+	// RowsAffected == 0：行不存在、违反 grow-only、或值未变（MySQL 下匹配但未改）。
+	// 读回当前行区分：不存在→未初始化错误；当前某维 > 新值→grow-only 违反；
+	// 否则（当前各维 <= 新值）为幂等 no-op，视为成功。
+	var cur partitionConfigRow
+	err := s.db.WithContext(ctx).Where("scope = ?", defaultPartitionScope).First(&cur).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("gormstore: default partition config %q is missing; call EnsureDefaultPartitions first", defaultPartitionScope)
+	}
+	if err != nil {
+		return err
+	}
+	if cur.NumRead > read || cur.NumWrite > write {
+		return fmt.Errorf("gormstore: default partitions are grow-only, cannot shrink from read=%d write=%d to read=%d write=%d", cur.NumRead, cur.NumWrite, read, write)
+	}
+	return nil
+}
+
+func (s *Store) EnsureDefaultPartitions(ctx context.Context, read, write int) error {
+	if err := validatePartitionCounts(read, write); err != nil {
+		return err
+	}
+	row := partitionConfigRow{Scope: defaultPartitionScope, NumRead: read, NumWrite: write, UpdatedAt: time.Now().UTC()}
+	return s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error
+}
+
+func (s *Store) ListPartitionOverrides(ctx context.Context) ([]queue.QueuePartitionConfig, error) {
+	var rows []partitionConfigRow
+	err := s.db.WithContext(ctx).Where("scope != ?", defaultPartitionScope).Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make([]queue.QueuePartitionConfig, len(rows))
+	for i, row := range rows {
+		out[i] = queue.QueuePartitionConfig{QueueName: row.Scope, Read: row.NumRead, Write: row.NumWrite}
+	}
+	return out, nil
+}
+
+func (s *Store) ListQueueNames(ctx context.Context) ([]string, error) {
+	var names []string
+	err := s.db.WithContext(ctx).Model(&queueInfoRow{}).
+		Distinct("queue_name").
+		Pluck("queue_name", &names).Error
+	if err != nil {
+		return nil, err
+	}
+	return names, nil
 }
 
 func (s *Store) CreateTasks(ctx context.Context, tasks []*queue.TaskRow) error {

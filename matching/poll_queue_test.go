@@ -272,7 +272,7 @@ func TestMatchingPollQueueLoserReturnDoesNotConsumeAttempt(t *testing.T) {
 	handles := make([]*partitionHandle, 2)
 	candidates := make([]queuePollCandidate, 2)
 	for partitionID := range 2 {
-		handle, err := server.mgr.getOrLoadPartition(ctx, "test-q", partitionID)
+		handle, err := server.mgr.getOrLoadPartition(ctx, "test-q", partitionID, accessRead)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -319,7 +319,7 @@ func TestMatchingPollTaskCancelReturnDoesNotConsumeAttempt(t *testing.T) {
 	server, _ := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"test-q": 1})
 	ctx := context.Background()
 
-	handle, err := server.mgr.getOrLoadPartition(ctx, "test-q", 0)
+	handle, err := server.mgr.getOrLoadPartition(ctx, "test-q", 0, accessRead)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func TestMatchingPollFinalizationReturnsLeaseWhenRequestIsCanceled(t *testing.T)
 		}); err != nil {
 			t.Fatal(err)
 		}
-		handle, err := server.mgr.getOrLoadPartition(ctx, "test-q", partitionID)
+		handle, err := server.mgr.getOrLoadPartition(ctx, "test-q", partitionID, accessRead)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -421,7 +421,7 @@ func TestMatchingPollFinalizationRechecksCancellationAfterLoserCleanup(t *testin
 	handles := make([]*partitionHandle, 2)
 	candidates := make([]queuePollCandidate, 2)
 	for partitionID := range 2 {
-		handle, err := server.mgr.getOrLoadPartition(ctx, "test-q", partitionID)
+		handle, err := server.mgr.getOrLoadPartition(ctx, "test-q", partitionID, accessRead)
 		if err != nil {
 			t.Fatal(err)
 		}

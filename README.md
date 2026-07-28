@@ -399,6 +399,59 @@ sequenceDiagram
     FE->>FE: 清理已离开节点的 gRPC 连接
 ```
 
+### 运行时调整分区数
+
+分区数是纯 dynamic 的（DB `partition_config` 表：`_default_` 全局默认行 + per-queue override 行），
+运行时可增可减。**唯一安全的调整入口是 `matching.Server.ResizePartitions`**：
+
+```go
+// 把 my-queue 的分区数调整为 8（扩容）或 2（缩容），期间不丢任务。
+if err := matchingServer.ResizePartitions(ctx, "my-queue", 8); err != nil {
+    log.Fatal(err)
+}
+```
+
+分区数分裂为 `num_read` / `num_write` 两个值，不变式 `1 <= write <= read`：
+写只落在 `[0, write)`，读枚举 `[0, read)`，因此被写的分区一定在被读的集合内。
+
+**扩容（target > 当前 read）——先 read 后 write：**
+
+1. `Set(read=target, write=旧值)`：新分区先被 matching own 并可被 poll，此时还没人往里写
+2. 等待 > `partitionConfigTTL`（5s），让各 matching 节点与 frontend 感知新 read
+3. `Set(read=target, write=target)`：写开始命中新分区
+
+**缩容（target < 当前 read）——四步严格有序、不可压缩：**
+
+1. `Set(read=旧值, write=target)`：**只减 write**。matching 立刻按新 `numWrite` 硬拒
+   `partID >= target` 的 `AddTask`（`FailedPrecondition`），frontend 收到后刷新快照重选分区
+2. **写收敛静默期**：等待 > `partitionConfigTTL`，让缓存滞后的 frontend 过期、在途 `AddTask` 落定
+3. **drain 轮询**：对每个高位分区 `[target, 旧 read)` 检查 `ack_level == next_task_id - 1`，
+   且该状态必须**连续稳定持续 > `partitionGCInterval`（5s）**
+4. `Set(read=target, write=target)`：确认全部排空后才减 read
+
+**为什么缩容必须走 orchestrator，不能直接 `SetPartitions` 减 read：**
+「停止写高位分区」是**跨节点最终一致**的——它靠各节点配置缓存的 TTL 过期来传播；
+而「减 read」是**一步到位**的。如果在还可能有滞后节点往高位分区写入时就减小 read，
+该分区立刻失去 owner：没有节点 own 它 → 没人 poll、GC 也停摆 → 其中的任务**永不被消费、
+静默丢失**。静默期 + drain 确认就是把这个最终一致的过程收敛为全局事实之后再动 read。
+同理，`SetDefaultPartitions`（全局默认行）**硬 guard 只允许 grow**：缩小全局默认等于对所有
+无 override 的 queue 做了一次无 drain 的隐式缩容。确需缩全局默认时，先给每个目标 queue
+显式 `SetPartitions` 钉住旧值，逐个 `ResizePartitions` 缩容后再调默认。
+
+**drain 超时的含义：**
+`ResizePartitions` 的 drain 轮询有总超时（默认 2 分钟），超时返回包装 `ErrPartitionDrainTimeout`
+的错误，并上报**卡住的分区号、`ack_level`/`next_task_id`、最早未确认的 `task_id`**。
+最常见的原因是高位分区里有反复失败的 poison 任务：`MaxAttempts=0`（默认）不限投递次数，
+这类任务会持续 respool，把 `ackLevel` 永久钉住。处理方式是先定位并处理该任务
+（消费者自行持久化后回 Ack，或设置 `MaxAttempts` 上限），再重试缩容。
+
+超时/取消/DB 错误时缩容停在 `(read=旧值, write=target)`——这是**安全中间态**：
+高位分区停写但仍被 own、仍可 poll/ack、GC 仍在跑，数据不会孤立，修复后直接重试即可。
+
+**迟到 Ack/Nack：** 缩容完成后，指向已退役分区的 Ack/Nack 重试返回**幂等成功**而非
+`InvalidArgument`。理由是能推进到「减 read」这一步就意味着该分区已被确认完全排空，
+此类请求必然是重复的。
+
 ## PhysicalQueue 内部结构
 
 ### deliveryState 状态
@@ -494,7 +547,7 @@ matching.Config{
     BroadcastAddr: "10.0.0.1:7235",                 // 必填，广播地址
     VisTimeout:    60 * time.Second,                // 默认 60s
     MaxAttempts:   0,                               // 单任务投递次数上限，0=不限（默认）
-    QueueConfigs:  map[string]int{"my-queue": 4},   // 队列名 → 分区数
+    DefaultPartitions: 4,                           // 仅 bootstrap 全局默认行，已存在则不覆盖
     LeaseOwner:    "",                              // 为空时自动生成 UUID
     ReconcileInterval: 5 * time.Second,             // 默认 5s
     GRPCOptions:   []grpc.ServerOption{},           // 可选
@@ -609,7 +662,7 @@ go run ./internal/example/
 
 ### 生产装配
 
-生产环境先通过发布系统迁移 `queue_info`、`tasks`、`taskq_partition_lock`、`taskq_partition_lock_members` 和 `taskq_membership_members` 五张表，再以 `AutoMigrate: false` 启动进程：
+生产环境先通过发布系统迁移 `queue_info`、`tasks`、`partition_config`、`taskq_partition_lock`、`taskq_partition_lock_members` 和 `taskq_membership_members` 六张表，再以 `AutoMigrate: false` 启动进程：
 
 从 routed delivery 之前的版本升级时，MySQL 使用以下兼容迁移：
 
@@ -648,6 +701,36 @@ SQLite 使用以下兼容迁移：
 
 ```sql
 ALTER TABLE tasks ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0;
+```
+
+自动分区（`partition_config`）配置表按 `scope` 主键存全局默认行与 per-queue override 行，`_default_` 为保留 scope，初始 `num_read=num_write=4`。MySQL 建表与初始化：
+
+```sql
+CREATE TABLE partition_config (
+    scope      VARCHAR(191) NOT NULL,
+    num_read   INT NOT NULL,
+    num_write  INT NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    PRIMARY KEY (scope)
+);
+
+INSERT INTO partition_config (scope, num_read, num_write, updated_at)
+VALUES ('_default_', 4, 4, NOW(6))
+ON DUPLICATE KEY UPDATE scope = scope;
+```
+
+SQLite 建表与初始化：
+
+```sql
+CREATE TABLE partition_config (
+    scope      TEXT NOT NULL PRIMARY KEY,
+    num_read   INTEGER NOT NULL,
+    num_write  INTEGER NOT NULL,
+    updated_at DATETIME NOT NULL
+);
+
+INSERT OR IGNORE INTO partition_config (scope, num_read, num_write, updated_at)
+VALUES ('_default_', 4, 4, CURRENT_TIMESTAMP);
 ```
 
 已经部署 Slice D routing key 的环境保留现有 `routing_key` 与 `idx_tasks_visibility`，只执行 deadline 列和 deadline 索引语句。上线顺序为先创建列与索引，再部署读写 routing 字段的 TaskQ 二进制。零值 deadline 持久化为 `NULL`，表示永久按 routing key 定向；非空 deadline 到期后由原任务行直接参与普通 poll，原任务行、TaskID 和 AckLevel 保持连续。每次 delivery 生成新的 token；旧 attempt token 无法 Ack 或 Nack 后续 delivery。

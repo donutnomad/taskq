@@ -177,10 +177,16 @@ func startMatchingServerWithHandle(t *testing.T, store matching.Store, resolver 
 		Monitor:       monitor,
 		ListenAddr:    addr,
 		BroadcastAddr: addr,
-		QueueConfigs:  queueConfigs,
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// 保持各测试原有的分区数语义：为每个声明的 queue 设 override(N,N)。
+	for q, n := range queueConfigs {
+		if err := store.SetPartitions(context.Background(), q, n, n); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// 让 resolver 指向本服务

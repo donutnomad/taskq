@@ -42,9 +42,11 @@ func TestFrontendObserverMonitorConsumesQueueWithoutAdvertisingMatching(t *testi
 		Monitor:       matchingMonitor,
 		ListenAddr:    address,
 		BroadcastAddr: address,
-		QueueConfigs:  map[string]int{"workflow-tasks": 2},
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetPartitions(context.Background(), "workflow-tasks", 2, 2); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.Start(); err != nil {

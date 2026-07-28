@@ -101,11 +101,11 @@ func main() {
 
 	// 4. 启动真实 matching gRPC 服务
 	srv, err := matching.NewServer(matching.Config{
-		Store:         store,
-		Monitor:       monitor,
-		ListenAddr:    addr,
-		BroadcastAddr: addr,
-		QueueConfigs:  map[string]int{queueName: 4},
+		Store:             store,
+		Monitor:           monitor,
+		ListenAddr:        addr,
+		BroadcastAddr:     addr,
+		DefaultPartitions: 4,
 	})
 	if err != nil {
 		log.Fatal(err)

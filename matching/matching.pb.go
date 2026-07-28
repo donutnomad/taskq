@@ -693,10 +693,13 @@ func (x *GetQueueInfoRequest) GetQueueName() string {
 }
 
 type GetQueueInfoResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	NumPartitions int32                  `protobuf:"varint,1,opt,name=num_partitions,json=numPartitions,proto3" json:"num_partitions,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// num_partitions 向后兼容旧 frontend，等于 num_read_partitions。
+	NumPartitions      int32 `protobuf:"varint,1,opt,name=num_partitions,json=numPartitions,proto3" json:"num_partitions,omitempty"`
+	NumReadPartitions  int32 `protobuf:"varint,2,opt,name=num_read_partitions,json=numReadPartitions,proto3" json:"num_read_partitions,omitempty"`
+	NumWritePartitions int32 `protobuf:"varint,3,opt,name=num_write_partitions,json=numWritePartitions,proto3" json:"num_write_partitions,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *GetQueueInfoResponse) Reset() {
@@ -732,6 +735,20 @@ func (*GetQueueInfoResponse) Descriptor() ([]byte, []int) {
 func (x *GetQueueInfoResponse) GetNumPartitions() int32 {
 	if x != nil {
 		return x.NumPartitions
+	}
+	return 0
+}
+
+func (x *GetQueueInfoResponse) GetNumReadPartitions() int32 {
+	if x != nil {
+		return x.NumReadPartitions
+	}
+	return 0
+}
+
+func (x *GetQueueInfoResponse) GetNumWritePartitions() int32 {
+	if x != nil {
+		return x.NumWritePartitions
 	}
 	return 0
 }
@@ -794,9 +811,11 @@ const file_matching_matching_proto_rawDesc = "" +
 	"\x10NackTaskResponse\"4\n" +
 	"\x13GetQueueInfoRequest\x12\x1d\n" +
 	"\n" +
-	"queue_name\x18\x01 \x01(\tR\tqueueName\"=\n" +
+	"queue_name\x18\x01 \x01(\tR\tqueueName\"\x9f\x01\n" +
 	"\x14GetQueueInfoResponse\x12%\n" +
-	"\x0enum_partitions\x18\x01 \x01(\x05R\rnumPartitions2\xac\x03\n" +
+	"\x0enum_partitions\x18\x01 \x01(\x05R\rnumPartitions\x12.\n" +
+	"\x13num_read_partitions\x18\x02 \x01(\x05R\x11numReadPartitions\x120\n" +
+	"\x14num_write_partitions\x18\x03 \x01(\x05R\x12numWritePartitions2\xac\x03\n" +
 	"\x0fMatchingService\x12>\n" +
 	"\aAddTask\x12\x18.matching.AddTaskRequest\x1a\x19.matching.AddTaskResponse\x12A\n" +
 	"\bPollTask\x12\x19.matching.PollTaskRequest\x1a\x1a.matching.PollTaskResponse\x12D\n" +

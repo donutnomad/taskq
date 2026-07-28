@@ -197,6 +197,20 @@ func (s *sqliteStore) AdvanceAckLevelAndDeleteTasks(ctx context.Context, queueNa
 	return newRangeID, deleted, nil
 }
 
+// 分区配置方法在 queue 包测试中不被调用，仅为满足 Store 接口提供 no-op 桩。
+func (s *sqliteStore) ResolvePartitions(context.Context, string) (int, int, error) {
+	return 0, 0, nil
+}
+func (s *sqliteStore) SetPartitions(context.Context, string, int, int) error { return nil }
+func (s *sqliteStore) SetDefaultPartitions(context.Context, int, int) error  { return nil }
+func (s *sqliteStore) EnsureDefaultPartitions(context.Context, int, int) error {
+	return nil
+}
+func (s *sqliteStore) ListPartitionOverrides(context.Context) ([]QueuePartitionConfig, error) {
+	return nil, nil
+}
+func (s *sqliteStore) ListQueueNames(context.Context) ([]string, error) { return nil, nil }
+
 func (s *sqliteStore) CreateTasks(ctx context.Context, tasks []*TaskRow) error {
 	if len(tasks) == 0 {
 		return nil

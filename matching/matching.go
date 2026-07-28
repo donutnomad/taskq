@@ -24,6 +24,8 @@ const (
 	defaultVisTimeout        = 60 * time.Second
 	defaultServiceName       = "matching"
 	defaultReconcileInterval = 5 * time.Second
+	// defaultPartitionCount 是 bootstrap 全局默认行时的读/写分区数。
+	defaultPartitionCount = 4
 )
 
 // defaultMaxAttempts 是启用投递上限时的一个参考值。生产默认为不限次数
@@ -58,8 +60,10 @@ type Config struct {
 	// 设为正数则启用上限，超过后任务被丢弃并仅记录一条 error 日志。
 	// 消费者遇到无法处理的消息时，推荐自行持久化后回 Ack（而非 Nack），而不是依赖此上限丢弃。
 	MaxAttempts int
-	// QueueConfigs 队列名 → 分区数
-	QueueConfigs map[string]int
+	// DefaultPartitions 启动时 bootstrap 全局默认行（_default_）的读/写分区数，默认 4。
+	// 仅在 _default_ 行不存在时 insert，已存在则不覆盖（幂等）。分区数运行时纯 dynamic，
+	// 由 DB partition_config 表决定，不再要求各节点 Config 一致。
+	DefaultPartitions int
 	// LeaseOwner 节点唯一标识，用于 DB lease 独占分区。为空时自动生成 UUID。
 	LeaseOwner string
 	// GRPCOptions 额外的 gRPC server 选项
@@ -105,6 +109,9 @@ func NewServer(cfg Config) (*Server, error) {
 	if cfg.ReconcileInterval <= 0 {
 		cfg.ReconcileInterval = defaultReconcileInterval
 	}
+	if cfg.DefaultPartitions <= 0 {
+		cfg.DefaultPartitions = defaultPartitionCount
+	}
 
 	resolver, err := cfg.Monitor.GetResolver(cfg.ServiceName)
 	if err != nil {
@@ -113,7 +120,13 @@ func NewServer(cfg Config) (*Server, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	mgr := newPartitionManager(ctx, cfg.Store, cfg.Store, cfg.BroadcastAddr, cfg.LeaseOwner, resolver, cfg.VisTimeout, cfg.MaxAttempts, cfg.QueueConfigs)
+	// bootstrap 全局默认行（幂等，已存在不覆盖）：分区数纯 dynamic，各节点读同一行。
+	if err := cfg.Store.EnsureDefaultPartitions(ctx, cfg.DefaultPartitions, cfg.DefaultPartitions); err != nil {
+		cancel()
+		return nil, fmt.Errorf("matching: bootstrap default partitions: %w", err)
+	}
+
+	mgr := newPartitionManager(ctx, cfg.Store, cfg.Store, cfg.BroadcastAddr, cfg.LeaseOwner, resolver, cfg.VisTimeout, cfg.MaxAttempts)
 
 	grpcServer := grpc.NewServer(cfg.GRPCOptions...)
 	handler := &matchingHandler{mgr: mgr}

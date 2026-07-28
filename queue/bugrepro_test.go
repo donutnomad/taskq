@@ -22,7 +22,19 @@ func (s *rangeUpdateErrorStore) AllocateTaskIDRange(context.Context, string, int
 func (s *rangeUpdateErrorStore) AdvanceAckLevelAndDeleteTasks(context.Context, string, int, int64, int64) (int64, int64, error) {
 	return 0, 0, nil
 }
-func (s *rangeUpdateErrorStore) CreateTasks(context.Context, []*TaskRow) error { return nil }
+func (s *rangeUpdateErrorStore) ResolvePartitions(context.Context, string) (int, int, error) {
+	return 0, 0, nil
+}
+func (s *rangeUpdateErrorStore) SetPartitions(context.Context, string, int, int) error { return nil }
+func (s *rangeUpdateErrorStore) SetDefaultPartitions(context.Context, int, int) error  { return nil }
+func (s *rangeUpdateErrorStore) EnsureDefaultPartitions(context.Context, int, int) error {
+	return nil
+}
+func (s *rangeUpdateErrorStore) ListPartitionOverrides(context.Context) ([]QueuePartitionConfig, error) {
+	return nil, nil
+}
+func (s *rangeUpdateErrorStore) ListQueueNames(context.Context) ([]string, error) { return nil, nil }
+func (s *rangeUpdateErrorStore) CreateTasks(context.Context, []*TaskRow) error    { return nil }
 func (s *rangeUpdateErrorStore) CreateTasksAndAdvanceRange(context.Context, string, int, []*TaskRow, int64, int64) (int64, error) {
 	return 0, s.err
 }

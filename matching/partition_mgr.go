@@ -17,6 +17,18 @@ const (
 	partitionStartTimeout           = 1500 * time.Millisecond
 	partitionGCInterval             = 5 * time.Second
 	partitionVisibilityScanInterval = time.Second
+	// partitionConfigTTL 是分区配置（read/write 分区数、已知 queue 列表）缓存的存活时间。
+	// 全集群一致、有上界：matching 与 frontend 共用同一常量，缩容静默期以它为基准（见 S4）。
+	partitionConfigTTL = 5 * time.Second
+)
+
+// partitionAccess 区分请求是写入（AddTask）还是读取（Poll/Ack/Nack），
+// 决定 partitionID 按 numWrite 还是 numRead 校验（读写闸门分裂，缩容安全核心）。
+type partitionAccess int
+
+const (
+	accessRead  partitionAccess = iota // Poll/PollQueue/Ack/Nack：放行 [0, numRead)
+	accessWrite                        // AddTask：硬拒绝 partID >= numWrite
 )
 
 // partitionKey 返回用于一致性哈希查找的 key
@@ -25,18 +37,40 @@ func partitionKey(queueName string, partitionID int) string {
 }
 
 type partitionManager struct {
-	mu           sync.RWMutex
-	store        queue.Store
-	lockStore    dbleader.LockStore
-	selfAddr     string // 本节点广播地址
-	leaseOwner   string // DB lease 标识
-	resolver     membership.ServiceResolver
-	visTimeout   time.Duration
-	maxAttempts  int
-	partitions   map[string]*partitionHandle // key = partitionKey(...)
-	queueConfigs map[string]int              // queueName → numPartitions
-	ctx          context.Context
-	cancel       context.CancelFunc
+	mu          sync.RWMutex
+	store       queue.Store
+	lockStore   dbleader.LockStore
+	selfAddr    string // 本节点广播地址
+	leaseOwner  string // DB lease 标识
+	resolver    membership.ServiceResolver
+	visTimeout  time.Duration
+	maxAttempts int
+	partitions  map[string]*partitionHandle // key = partitionKey(...)
+	ctx         context.Context
+	cancel      context.CancelFunc
+
+	// configCache 缓存每个 queue 的 read/write 分区数，短 TTL 过期重查（store-backed resolver）。
+	configMu    sync.Mutex
+	configCache map[string]partitionCounts
+
+	// queueListCache 缓存已知 queue 名列表（供 reconcile 枚举），短 TTL。
+	queueListMu    sync.Mutex
+	queueListCache []string
+	queueListAt    time.Time
+
+	// 以下三个时长是 ResizePartitions 编排的等待参数，生产使用 default* 常量，
+	// 仅测试为了跑得快才注入更小值。生产环境不要调小：它们与 partitionConfigTTL /
+	// partitionGCInterval 绑定，调小等于削弱缩容的安全屏障。
+	resizeQuiesceDelay time.Duration
+	resizeStablePeriod time.Duration
+	resizeDrainTimeout time.Duration
+}
+
+// partitionCounts 是某 queue 分区配置的缓存项。
+type partitionCounts struct {
+	read  int
+	write int
+	at    time.Time
 }
 
 type partitionHandle struct {
@@ -353,22 +387,114 @@ func newPartitionManager(
 	resolver membership.ServiceResolver,
 	visTimeout time.Duration,
 	maxAttempts int,
-	queueConfigs map[string]int,
 ) *partitionManager {
 	ctx, cancel := context.WithCancel(ctx)
 	return &partitionManager{
-		store:        store,
-		lockStore:    lockStore,
-		selfAddr:     selfAddr,
-		leaseOwner:   leaseOwner,
-		resolver:     resolver,
-		visTimeout:   visTimeout,
-		maxAttempts:  maxAttempts,
-		partitions:   make(map[string]*partitionHandle),
-		queueConfigs: queueConfigs,
-		ctx:          ctx,
-		cancel:       cancel,
+		store:       store,
+		lockStore:   lockStore,
+		selfAddr:    selfAddr,
+		leaseOwner:  leaseOwner,
+		resolver:    resolver,
+		visTimeout:  visTimeout,
+		maxAttempts: maxAttempts,
+		partitions:  make(map[string]*partitionHandle),
+		configCache: make(map[string]partitionCounts),
+
+		resizeQuiesceDelay: defaultResizeQuiesceDelay,
+		resizeStablePeriod: defaultResizeStablePeriod,
+		resizeDrainTimeout: defaultResizeDrainTimeout,
+
+		ctx:    ctx,
+		cancel: cancel,
 	}
+}
+
+// resolvePartitions 读时取值某 queue 的 read/write 分区数，带短 TTL 缓存。
+// 缓存未命中或过期则查 store（override ?? 全局默认）。
+//
+// store 出错时的策略（缩容安全核心）：
+//   - 有缓存（哪怕已过 TTL）→ 继续用旧值（stale-while-error）。旧值是这个 queue 真实
+//     存在过的配置，不会凭空放大到从未配置过的分区号，因此不会把写放行到未知分区。
+//   - 无任何缓存 → 返回 ErrPartitionConfigUnavailable，让调用方拒绝服务。**不再**退回
+//     bootstrap 默认值：默认值可能大于真实配置，会往已缩容退役的分区写入并孤立数据
+//     （见 ErrPartitionConfigUnavailable）。
+func (pm *partitionManager) resolvePartitions(queueName string) (read, write int, err error) {
+	now := time.Now()
+	pm.configMu.Lock()
+	if c, ok := pm.configCache[queueName]; ok && now.Sub(c.at) < partitionConfigTTL {
+		pm.configMu.Unlock()
+		return c.read, c.write, nil
+	}
+	pm.configMu.Unlock()
+
+	r, w, resolveErr := pm.store.ResolvePartitions(pm.ctx, queueName)
+	if resolveErr != nil {
+		pm.configMu.Lock()
+		cached, ok := pm.configCache[queueName]
+		pm.configMu.Unlock()
+		if ok {
+			slog.Warn("matching resolve partitions failed, serving stale config",
+				"queue", queueName, "num_read", cached.read, "num_write", cached.write,
+				"stale_for", now.Sub(cached.at), "err", resolveErr)
+			return cached.read, cached.write, nil
+		}
+		slog.Error("matching resolve partitions failed with no cached config, refusing to serve",
+			"queue", queueName, "err", resolveErr)
+		return 0, 0, fmt.Errorf("%w: queue %q: %w", ErrPartitionConfigUnavailable, queueName, resolveErr)
+	}
+	pm.configMu.Lock()
+	pm.configCache[queueName] = partitionCounts{read: r, write: w, at: now}
+	pm.configMu.Unlock()
+	return r, w, nil
+}
+
+// resolveReadPartitions 返回 queue 的读分区数（Poll/Ack/Nack/reconcile 用）。
+func (pm *partitionManager) resolveReadPartitions(queueName string) (int, error) {
+	read, _, err := pm.resolvePartitions(queueName)
+	return read, err
+}
+
+// listKnownQueues 返回本轮 reconcile 应枚举的 queue 名集合：
+// 已物化分区的 queue（DISTINCT queue_name FROM queue_info）∪ 有 override 的 queue。
+// 带短 TTL 缓存，避免每 5s×N 节点全扫。store 出错且无缓存时返回 (nil,false)，reconcile 据此跳过本轮。
+func (pm *partitionManager) listKnownQueues() ([]string, bool) {
+	pm.queueListMu.Lock()
+	if pm.queueListCache != nil && time.Since(pm.queueListAt) < partitionConfigTTL {
+		names := pm.queueListCache
+		pm.queueListMu.Unlock()
+		return names, true
+	}
+	pm.queueListMu.Unlock()
+
+	names, err := pm.store.ListQueueNames(pm.ctx)
+	if err != nil {
+		slog.Error("matching list queue names failed", "err", err)
+		pm.queueListMu.Lock()
+		cached := pm.queueListCache
+		pm.queueListMu.Unlock()
+		return cached, cached != nil
+	}
+	set := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		set[n] = struct{}{}
+	}
+	// override 行是补充来源；查询失败不致命，用 queue_info 名单先行。
+	if overrides, err := pm.store.ListPartitionOverrides(pm.ctx); err != nil {
+		slog.Error("matching list partition overrides failed", "err", err)
+	} else {
+		for _, o := range overrides {
+			set[o.QueueName] = struct{}{}
+		}
+	}
+	result := make([]string, 0, len(set))
+	for n := range set {
+		result = append(result, n)
+	}
+	pm.queueListMu.Lock()
+	pm.queueListCache = result
+	pm.queueListAt = time.Now()
+	pm.queueListMu.Unlock()
+	return result, true
 }
 
 // isOwner 检查本节点是否拥有指定分区
@@ -380,20 +506,71 @@ func (pm *partitionManager) isOwner(queueName string, partitionID int) (bool, er
 	return host.GetAddress() == pm.selfAddr, nil
 }
 
-func (pm *partitionManager) validatePartition(queueName string, partitionID int) error {
-	numPartitions, ok := pm.queueConfigs[queueName]
-	if !ok {
-		return ErrUnknownQueue
+// validatePartition 按操作类型分裂校验 partitionID（读写闸门分裂，缩容安全核心）：
+//   - accessWrite（AddTask）：按 numWrite 硬拒绝 partID >= numWrite（返回 ErrPartitionNotWritable
+//     → FailedPrecondition）。缩容态下滞后 frontend 往高位分区的写被当场挡在 DB 外，避免孤立数据。
+//   - accessRead（Poll/PollQueue/Ack/Nack）：按 numRead 放行 [0, numRead)，否则高位待排空分区无法被消费。
+//
+// queue 未知不再报错——resolver fallback 到全局默认，不物化。
+//
+// 配置不可知（store 出错且无缓存）时返回 ErrPartitionConfigUnavailable → Unavailable，
+// 读写一律拒绝。绝不能因为读不到配置就用猜测值放行写入。
+func (pm *partitionManager) validatePartition(queueName string, partitionID int, access partitionAccess) error {
+	if partitionID < 0 {
+		return ErrInvalidPartition
 	}
-	if partitionID < 0 || partitionID >= numPartitions {
+	read, write, err := pm.resolvePartitions(queueName)
+	if err != nil {
+		return err
+	}
+	if access == accessWrite {
+		if partitionID >= write {
+			return ErrPartitionNotWritable
+		}
+		return nil
+	}
+	if partitionID >= read {
 		return ErrInvalidPartition
 	}
 	return nil
 }
 
+// maxHistoricalPartitionID 是「历史上可能存在过的分区号」的合理上界。
+// 超过它的 partID 不可能来自任何一次真实的分区配置，按非法处理。
+const maxHistoricalPartitionID = 1 << 16
+
+// isRetiredReadPartition 判断 partID 是否是「曾经在 read 范围内、已被缩容退役」的分区。
+//
+// 用途：缩容完成后，指向已弃分区的**迟到 Ack/Nack 重试**会撞上 accessRead 闸门
+// （partID >= numRead）拿到 InvalidArgument——而 InvalidArgument 不在 frontend 的重试
+// 白名单里，消费者会对一个其实早已成功 ack 的任务收到硬错误。
+//
+// 判定理由：缩容能推进到「减 read」这一步，前提是编排器已确认该分区完全排空
+// （ack_level == next_task_id-1，稳定跨过一个 GC 周期）。因此任何仍指向该分区的
+// Ack/Nack 必然是重复请求，语义上等价于已完成，返回幂等成功是正确的。
+//
+// 已知代价：无法区分「退役分区的迟到 ack」与「客户端凭空构造的越界 partID」，
+// 后者也会拿到幂等成功而非 InvalidArgument。这是刻意取舍——宁可放过一个伪造的
+// no-op ack，也不能让正常消费者在缩容后收到不可重试的硬错误。负数与超过
+// maxHistoricalPartitionID 的明显非法值仍然被拒。
+//
+// 配置不可知（store 出错且无缓存）时返回错误而非 true：不能在读不到 numRead 的情况下
+// 把一个可能仍在服务的分区上的 Ack 判成「退役分区幂等成功」——那会静默吞掉真实的 Ack。
+// 调用方应据此返回 Unavailable 让消费者重试。
+func (pm *partitionManager) isRetiredReadPartition(queueName string, partitionID int) (bool, error) {
+	if partitionID < 0 || partitionID >= maxHistoricalPartitionID {
+		return false, nil
+	}
+	read, err := pm.resolveReadPartitions(queueName)
+	if err != nil {
+		return false, err
+	}
+	return partitionID >= read, nil
+}
+
 // getOrLoadPartition 获取分区句柄，如果本节点拥有但尚未加载则延迟加载
-func (pm *partitionManager) getOrLoadPartition(ctx context.Context, queueName string, partitionID int) (*partitionHandle, error) {
-	if err := pm.validatePartition(queueName, partitionID); err != nil {
+func (pm *partitionManager) getOrLoadPartition(ctx context.Context, queueName string, partitionID int, access partitionAccess) (*partitionHandle, error) {
+	if err := pm.validatePartition(queueName, partitionID, access); err != nil {
 		return nil, err
 	}
 
@@ -503,10 +680,26 @@ type partitionID struct {
 
 // reconcile 对比哈希环分配结果，加载新分区、卸载失去的分区
 func (pm *partitionManager) reconcile() {
-	// 计算本节点应拥有的分区
+	// 枚举已知 queue（queue_info ∪ override），对每个按 numRead own [0, numRead)。
+	queueNames, ok := pm.listKnownQueues()
+	if !ok {
+		slog.Error("matching reconcile aborted: cannot list known queues")
+		return
+	}
+
+	// 计算本节点应拥有的分区。
+	// skipped 记录本轮 resolve 失败的 queue：它们的分区归属状态保持现状（既不卸载已加载的，
+	// 也不加载新的）。配置不可知时卸载分区会让在服务的分区失去 owner。
 	owned := make(map[string]partitionID)
-	for queueName, numParts := range pm.queueConfigs {
-		for i := range numParts {
+	skipped := make(map[string]struct{})
+	for _, queueName := range queueNames {
+		numRead, err := pm.resolveReadPartitions(queueName)
+		if err != nil {
+			slog.Error("matching reconcile skipping queue: partition config unavailable", "queue", queueName, "err", err)
+			skipped[queueName] = struct{}{}
+			continue
+		}
+		for i := range numRead {
 			isOwner, err := pm.isOwner(queueName, i)
 			if err != nil {
 				slog.Error("matching reconcile aborted: ownership lookup failed", "queue", queueName, "partition_id", i, "err", err)
@@ -521,13 +714,17 @@ func (pm *partitionManager) reconcile() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	// 卸载不再属于本节点的分区
+	// 卸载不再属于本节点的分区（本轮 resolve 失败的 queue 除外，保持现状）
 	for key, handle := range pm.partitions {
-		if _, ok := owned[key]; !ok {
-			slog.Info("matching unloading partition", "partition", key)
-			handle.close()
-			delete(pm.partitions, key)
+		if _, ok := owned[key]; ok {
+			continue
 		}
+		if _, ok := skipped[handle.queueName]; ok {
+			continue
+		}
+		slog.Info("matching unloading partition", "partition", key)
+		handle.close()
+		delete(pm.partitions, key)
 	}
 
 	// 加载新分配给本节点的分区
@@ -540,12 +737,6 @@ func (pm *partitionManager) reconcile() {
 		slog.Info("matching loaded partition", "partition", key)
 		pm.partitions[key] = handle
 	}
-}
-
-// getQueuePartitionCount 返回队列的分区数
-func (pm *partitionManager) getQueuePartitionCount(queueName string) (int, bool) {
-	n, ok := pm.queueConfigs[queueName]
-	return n, ok
 }
 
 // close 关闭所有分区

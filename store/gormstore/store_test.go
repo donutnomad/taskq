@@ -371,6 +371,250 @@ func TestSQLiteStoreMembershipRejectsIncompleteHeartbeats(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreEnsureDefaultPartitionsIdempotent(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+
+	if err := s.EnsureDefaultPartitions(ctx, 4, 4); err != nil {
+		t.Fatal(err)
+	}
+	// 重复调用不覆盖已有值。
+	if err := s.EnsureDefaultPartitions(ctx, 8, 6); err != nil {
+		t.Fatal(err)
+	}
+	read, write, err := s.ResolvePartitions(ctx, "any-queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 4 || write != 4 {
+		t.Fatalf("default partitions = read=%d write=%d, want 4/4 (EnsureDefaultPartitions must not overwrite)", read, write)
+	}
+}
+
+func TestSQLiteStoreResolvePartitionsMissingDefault(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	// _default_ 行不存在时（未 bootstrap），无 override 的 queue 解析必须报错，
+	// 而非静默返回 0（会导致下游 %0 panic）。
+	if _, _, err := s.ResolvePartitions(context.Background(), "unbootstrapped"); err == nil {
+		t.Fatal("expected error when default partition config is missing")
+	}
+}
+
+func TestSQLiteStoreResolvePartitionsOverrideAndFallback(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+	if err := s.EnsureDefaultPartitions(ctx, 4, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	// 无 override → fallback 全局默认。
+	read, write, err := s.ResolvePartitions(ctx, "plain-queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 4 || write != 4 {
+		t.Fatalf("fallback = read=%d write=%d, want 4/4", read, write)
+	}
+
+	// 有 override → 返回 override。
+	if err := s.SetPartitions(ctx, "hot-queue", 8, 6); err != nil {
+		t.Fatal(err)
+	}
+	read, write, err = s.ResolvePartitions(ctx, "hot-queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 8 || write != 6 {
+		t.Fatalf("override = read=%d write=%d, want 8/6", read, write)
+	}
+	// 其他 queue 仍走默认，不受 override 影响。
+	read, write, err = s.ResolvePartitions(ctx, "cold-queue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 4 || write != 4 {
+		t.Fatalf("unrelated queue = read=%d write=%d, want 4/4", read, write)
+	}
+}
+
+func TestSQLiteStoreSetPartitionsUpsertAndValidation(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+	if err := s.EnsureDefaultPartitions(ctx, 4, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetPartitions(ctx, "q", 6, 3); err != nil {
+		t.Fatal(err)
+	}
+	// upsert：再次调用更新既有行。
+	if err := s.SetPartitions(ctx, "q", 10, 10); err != nil {
+		t.Fatal(err)
+	}
+	read, write, err := s.ResolvePartitions(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 10 || write != 10 {
+		t.Fatalf("upserted override = read=%d write=%d, want 10/10", read, write)
+	}
+
+	// 校验 1<=write<=read：非法值必须返回错误。
+	for _, tc := range []struct {
+		name        string
+		read, write int
+	}{
+		{"write>read", 4, 5},
+		{"write<1", 4, 0},
+		{"negative", -1, -1},
+	} {
+		if err := s.SetPartitions(ctx, "q", tc.read, tc.write); err == nil {
+			t.Fatalf("%s: expected validation error for read=%d write=%d", tc.name, tc.read, tc.write)
+		}
+	}
+	// 非法写入被拒后，既有值保持不变。
+	read, write, err = s.ResolvePartitions(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 10 || write != 10 {
+		t.Fatalf("override after rejected writes = read=%d write=%d, want 10/10", read, write)
+	}
+}
+
+func TestSQLiteStoreSetDefaultPartitionsGrowOnly(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+	if err := s.EnsureDefaultPartitions(ctx, 4, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	// 增大成功。
+	if err := s.SetDefaultPartitions(ctx, 8, 6); err != nil {
+		t.Fatal(err)
+	}
+	read, write, err := s.ResolvePartitions(ctx, "any")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 8 || write != 6 {
+		t.Fatalf("grown default = read=%d write=%d, want 8/6", read, write)
+	}
+
+	// 任一维度缩小都被拒绝。
+	for _, tc := range []struct {
+		name        string
+		read, write int
+	}{
+		{"shrink read", 6, 6},
+		{"shrink write", 8, 4},
+		{"shrink both", 4, 4},
+	} {
+		if err := s.SetDefaultPartitions(ctx, tc.read, tc.write); err == nil {
+			t.Fatalf("%s: expected grow-only rejection for read=%d write=%d", tc.name, tc.read, tc.write)
+		}
+	}
+	// 不变式违反（write>read）也被拒绝。
+	if err := s.SetDefaultPartitions(ctx, 8, 9); err == nil {
+		t.Fatal("expected rejection for write>read")
+	}
+	// 被拒后默认值保持不变。
+	read, write, err = s.ResolvePartitions(ctx, "any")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 8 || write != 6 {
+		t.Fatalf("default after rejected shrinks = read=%d write=%d, want 8/6", read, write)
+	}
+}
+
+func TestSQLiteStoreSetDefaultPartitionsMissing(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	// _default_ 未初始化时，SetDefaultPartitions 必须报错而非静默创建
+	// （条件 UPDATE 命中 0 行，读回确认行不存在）。
+	if err := s.SetDefaultPartitions(context.Background(), 4, 4); err == nil {
+		t.Fatal("expected error when default partition config is missing")
+	}
+}
+
+func TestSQLiteStoreSetDefaultPartitionsEqualAndBoundary(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+	if err := s.EnsureDefaultPartitions(ctx, 4, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	// grow-only 边界：相等值允许（CAS 的 <= 相等成立），幂等成功。
+	if err := s.SetDefaultPartitions(ctx, 4, 4); err != nil {
+		t.Fatalf("equal values must be allowed (grow-only boundary, not shrink): %v", err)
+	}
+	// 仅增大 read、write 保持不变（write 维相等）：允许。
+	if err := s.SetDefaultPartitions(ctx, 8, 4); err != nil {
+		t.Fatal(err)
+	}
+	// 仅增大 write、read 保持不变（read 维相等）：允许。
+	if err := s.SetDefaultPartitions(ctx, 8, 6); err != nil {
+		t.Fatal(err)
+	}
+	read, write, err := s.ResolvePartitions(ctx, "any")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 8 || write != 6 {
+		t.Fatalf("grown default = read=%d write=%d, want 8/6", read, write)
+	}
+
+	// 缩小任一维（另一维不变）都被 CAS 条件挡下，且值保持不变。
+	if err := s.SetDefaultPartitions(ctx, 7, 6); err == nil {
+		t.Fatal("expected grow-only rejection when shrinking read")
+	}
+	if err := s.SetDefaultPartitions(ctx, 8, 5); err == nil {
+		t.Fatal("expected grow-only rejection when shrinking write")
+	}
+	read, write, err = s.ResolvePartitions(ctx, "any")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 8 || write != 6 {
+		t.Fatalf("default after rejected shrinks = read=%d write=%d, want 8/6", read, write)
+	}
+}
+
+func TestSQLiteStoreListPartitionOverridesExcludesDefault(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+	if err := s.EnsureDefaultPartitions(ctx, 4, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPartitions(ctx, "q-a", 6, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPartitions(ctx, "q-b", 8, 8); err != nil {
+		t.Fatal(err)
+	}
+
+	overrides, err := s.ListPartitionOverrides(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overrides) != 2 {
+		t.Fatalf("overrides = %+v, want 2 rows (no _default_)", overrides)
+	}
+	got := make(map[string]queue.QueuePartitionConfig, len(overrides))
+	for _, o := range overrides {
+		if o.QueueName == defaultPartitionScope {
+			t.Fatalf("ListPartitionOverrides must not return the default row: %+v", o)
+		}
+		got[o.QueueName] = o
+	}
+	if a := got["q-a"]; a.Read != 6 || a.Write != 4 {
+		t.Fatalf("q-a override = %+v, want read=6 write=4", a)
+	}
+	if b := got["q-b"]; b.Read != 8 || b.Write != 8 {
+		t.Fatalf("q-b override = %+v, want read=8 write=8", b)
+	}
+}
+
 func TestSQLiteStoreCreateAndGetQueue(t *testing.T) {
 	s := newSQLiteTestStore(t)
 	ctx := context.Background()

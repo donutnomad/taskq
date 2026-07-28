@@ -20,7 +20,7 @@ type matchingHandler struct {
 }
 
 func (h *matchingHandler) AddTask(ctx context.Context, req *AddTaskRequest) (*AddTaskResponse, error) {
-	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId))
+	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId), accessWrite)
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
@@ -37,7 +37,7 @@ func (h *matchingHandler) AddTask(ctx context.Context, req *AddTaskRequest) (*Ad
 }
 
 func (h *matchingHandler) PollTask(ctx context.Context, req *PollTaskRequest) (*PollTaskResponse, error) {
-	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId))
+	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId), accessRead)
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
@@ -138,8 +138,18 @@ func (h *matchingHandler) AckTask(ctx context.Context, req *AckTaskRequest) (*Ac
 	if partID != int(req.PartitionId) {
 		return nil, status.Errorf(codes.InvalidArgument, "token partition %d does not match request partition %d", partID, req.PartitionId)
 	}
+	// 缩容退役分区的迟到 Ack：该分区在减 read 之前已被确认排空，此 Ack 必为重复请求，
+	// 幂等成功，避免消费者收到不可重试的 InvalidArgument（见 isRetiredReadPartition）。
+	// 配置不可知时不做幂等判定，返回 Unavailable 让消费者重试。
+	retired, err := h.mgr.isRetiredReadPartition(req.QueueName, partID)
+	if err != nil {
+		return nil, toGRPCError(err)
+	}
+	if retired {
+		return &AckTaskResponse{}, nil
+	}
 
-	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId))
+	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId), accessRead)
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
@@ -160,8 +170,16 @@ func (h *matchingHandler) NackTask(ctx context.Context, req *NackTaskRequest) (*
 	if partID != int(req.PartitionId) {
 		return nil, status.Errorf(codes.InvalidArgument, "token partition %d does not match request partition %d", partID, req.PartitionId)
 	}
+	// 与 AckTask 同理：退役分区已确认排空，迟到的 Nack/归还只可能是重复请求，幂等成功。
+	retired, err := h.mgr.isRetiredReadPartition(req.QueueName, partID)
+	if err != nil {
+		return nil, toGRPCError(err)
+	}
+	if retired {
+		return &NackTaskResponse{}, nil
+	}
 
-	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId))
+	pq, err := h.mgr.getOrLoadPartition(ctx, req.QueueName, int(req.PartitionId), accessRead)
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
@@ -181,11 +199,19 @@ func (h *matchingHandler) NackTask(ctx context.Context, req *NackTaskRequest) (*
 }
 
 func (h *matchingHandler) GetQueueInfo(_ context.Context, req *GetQueueInfoRequest) (*GetQueueInfoResponse, error) {
-	n, ok := h.mgr.getQueuePartitionCount(req.QueueName)
-	if !ok {
-		return nil, status.Errorf(codes.NotFound, "queue %q not found", req.QueueName)
+	// 答案来自 DB 配置表（resolve：override ?? 全局默认，不物化），任何节点可读。
+	// num_partitions 保留为 read 供未改造的 frontend 继续工作。
+	// 配置不可知时返回 Unavailable：frontend 刷新失败会保留旧快照，好过拿到一个
+	// 可能被放大的猜测值去路由写入。
+	read, write, err := h.mgr.resolvePartitions(req.QueueName)
+	if err != nil {
+		return nil, toGRPCError(err)
 	}
-	return &GetQueueInfoResponse{NumPartitions: int32(n)}, nil
+	return &GetQueueInfoResponse{
+		NumPartitions:      int32(read),
+		NumReadPartitions:  int32(read),
+		NumWritePartitions: int32(write),
+	}, nil
 }
 
 // toGRPCError 将内部错误转换为 gRPC status error
@@ -196,8 +222,12 @@ func toGRPCError(err error) error {
 	if errors.Is(err, ErrNotOwner) {
 		return status.Error(codes.FailedPrecondition, err.Error())
 	}
-	if errors.Is(err, ErrUnknownQueue) {
-		return status.Error(codes.NotFound, err.Error())
+	if errors.Is(err, ErrPartitionNotWritable) {
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+	// 分区配置暂时不可知（DB 抖动且本节点无缓存）：暂时性故障，可重试。
+	if errors.Is(err, ErrPartitionConfigUnavailable) {
+		return status.Error(codes.Unavailable, err.Error())
 	}
 	if errors.Is(err, ErrInvalidPartition) {
 		return status.Error(codes.InvalidArgument, err.Error())

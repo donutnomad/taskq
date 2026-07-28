@@ -45,7 +45,6 @@ func TestMatchingStartRollsBackWhenListenerRegistrationFails(t *testing.T) {
 		Monitor:       &resolverMonitor{resolver: resolver},
 		ListenAddr:    listenAddr,
 		BroadcastAddr: listenAddr,
-		QueueConfigs:  map[string]int{"lifecycle-q": 1},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +71,6 @@ func TestMatchingStartRollsBackWhenListenFails(t *testing.T) {
 		Monitor:       &stubMonitor{resolver: resolver},
 		ListenAddr:    listenAddr,
 		BroadcastAddr: listenAddr,
-		QueueConfigs:  map[string]int{"lifecycle-q": 1},
 	})
 	if err != nil {
 		t.Fatal(err)

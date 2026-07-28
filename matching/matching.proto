@@ -76,5 +76,8 @@ message GetQueueInfoRequest {
     string queue_name = 1;
 }
 message GetQueueInfoResponse {
+    // num_partitions 向后兼容旧 frontend，等于 num_read_partitions。
     int32 num_partitions = 1;
+    int32 num_read_partitions = 2;
+    int32 num_write_partitions = 3;
 }

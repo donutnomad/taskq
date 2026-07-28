@@ -22,7 +22,6 @@ func TestMatchingStopLeavesStoreConnectionOwnedByCaller(t *testing.T) {
 		Store:         store,
 		Monitor:       &stubMonitor{resolver: resolver},
 		BroadcastAddr: "127.0.0.1:1",
-		QueueConfigs:  map[string]int{"store-contract-q": 1},
 	})
 	if err != nil {
 		t.Fatal(err)

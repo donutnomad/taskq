@@ -28,9 +28,21 @@ const (
 	defaultRetryBackoff  = 50 * time.Millisecond
 	defaultServiceName   = "matching"
 	pollWinnerDrainGrace = 2 * time.Millisecond
+	// partitionRefreshInterval 是周期性刷新 read/write 分区快照的间隔，
+	// 与 matching 的 partitionConfigTTL 对齐，保证运行时分区变更在一个周期内被 frontend 感知。
+	partitionRefreshInterval = 5 * time.Second
+	// minPartitions 是快照未就绪/异常时的安全下限，杜绝 `% 0` panic 或 `range 0` 不投递。
+	minPartitions = 1
 )
 
 var frontendListenerSeq atomic.Int64
+
+// partitionSnapshot 是 read/write 分区数的原子快照。Enqueue 的 `% write` 与
+// Dequeue 的 `range read` 必须来自同一快照读取，避免出现 write>read 的撕裂。
+type partitionSnapshot struct {
+	read  int
+	write int
+}
 
 // Config 前端路由配置
 type Config struct {
@@ -55,17 +67,17 @@ type Lease = queue.Lease
 
 // Frontend 是分布式队列的客户端路由器
 type Frontend struct {
-	cfg           Config
-	resolver      membership.ServiceResolver
-	pool          *connPool
-	changeCh      chan *membership.ChangedEvent
-	listenerName  string
-	numPartitions int
-	enqueueIdx    atomic.Int64
-	pollIdx       atomic.Int64
-	ctx           context.Context
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
+	cfg          Config
+	resolver     membership.ServiceResolver
+	pool         *connPool
+	changeCh     chan *membership.ChangedEvent
+	listenerName string
+	partitions   atomic.Pointer[partitionSnapshot]
+	enqueueIdx   atomic.Int64
+	pollIdx      atomic.Int64
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
 }
 
 // New creates a Frontend with an unbounded initialization context.
@@ -111,8 +123,8 @@ func NewWithContext(ctx context.Context, cfg Config) (*Frontend, error) {
 		cancel:       cancel,
 	}
 
-	// 通过 gRPC 查询分区数
-	numPartitions, err := f.fetchNumPartitions(ctx)
+	// 通过 gRPC 查询 read/write 分区数，存入原子快照
+	snapshot, err := f.fetchNumPartitions(ctx)
 	if err != nil {
 		cancel()
 		f.pool.close()
@@ -121,7 +133,7 @@ func NewWithContext(ctx context.Context, cfg Config) (*Frontend, error) {
 		}
 		return nil, err
 	}
-	f.numPartitions = numPartitions
+	f.partitions.Store(&snapshot)
 
 	// 监听成员变化，清理已离开节点的连接
 	f.changeCh = make(chan *membership.ChangedEvent, 10)
@@ -145,7 +157,8 @@ func (f *Frontend) EnqueueWithOptions(ctx context.Context, data []byte, opts Enq
 	if err := opts.Validate(); err != nil {
 		return err
 	}
-	partID := int(f.enqueueIdx.Add(1)) % f.numPartitions
+	// 写在 [0, write) 内 round-robin 选分区（write 来自原子快照，兜底下限 1）。
+	partID := int(f.enqueueIdx.Add(1)) % f.snapshot().write
 
 	for attempt := range defaultMaxRetries {
 		client, err := f.getPartitionClient(f.cfg.QueueName, partID)
@@ -175,6 +188,13 @@ func (f *Frontend) EnqueueWithOptions(ctx context.Context, data []byte, opts Enq
 		if !isRetryable(err) {
 			return fmt.Errorf("frontend: enqueue: %w", err)
 		}
+		// 缩容态下 frontend 快照滞后仍按旧 write 选到高位分区，matching 按 numWrite
+		// 硬拒 FailedPrecondition。重试前刷新快照并按新 write 重选分区，否则重试仍撞
+		// 同一高位分区。刷新失败保留旧快照（best-effort）。
+		if status.Code(err) == codes.FailedPrecondition {
+			_ = f.refreshPartitions(ctx)
+			partID = int(f.enqueueIdx.Add(1)) % f.snapshot().write
+		}
 		if attempt < defaultMaxRetries-1 {
 			if retryErr := f.waitRetry(ctx); retryErr != nil {
 				return fmt.Errorf("frontend: enqueue: %w", retryErr)
@@ -200,8 +220,11 @@ func (f *Frontend) DequeueWithOptions(ctx context.Context, opts PollOptions) (Le
 		return Lease{}, err
 	}
 	opts = normalized
-	startIdx := int(f.pollIdx.Add(1)) % f.numPartitions
-	groups, resolutionErrors := f.resolvePollGroups(startIdx)
+	// 读枚举 [0, read)，startIdx 与枚举必须用同一快照的 read（兜底下限 1），
+	// 保证不会因撕裂漏读或越界。
+	numRead := f.snapshot().read
+	startIdx := int(f.pollIdx.Add(1)) % numRead
+	groups, resolutionErrors := f.resolvePollGroups(startIdx, numRead)
 	if len(groups) == 0 {
 		if len(resolutionErrors) > 0 {
 			return Lease{}, errors.Join(resolutionErrors...)
@@ -275,12 +298,12 @@ type ownerPollResult struct {
 	err   error
 }
 
-func (f *Frontend) resolvePollGroups(startIdx int) ([]ownerPollGroup, []error) {
+func (f *Frontend) resolvePollGroups(startIdx, numRead int) ([]ownerPollGroup, []error) {
 	groupIndexes := make(map[string]int)
 	groups := make([]ownerPollGroup, 0)
 	var errs []error
-	for i := range f.numPartitions {
-		partitionID := (startIdx + i) % f.numPartitions
+	for i := range numRead {
+		partitionID := (startIdx + i) % numRead
 		host, err := f.resolver.Lookup(fmt.Sprintf("%s/%d", f.cfg.QueueName, partitionID))
 		if err != nil {
 			errs = append(errs, fmt.Errorf("frontend: dequeue partition %d: %w", partitionID, err))
@@ -632,10 +655,15 @@ func (f *Frontend) getPartitionClient(queueName string, partID int) (matching.Ma
 }
 
 func (f *Frontend) watchMembershipChanges() {
+	ticker := time.NewTicker(partitionRefreshInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-f.ctx.Done():
 			return
+		case <-ticker.C:
+			// 周期刷新 read/write 快照，规避"分区数启动后永不刷新"。
+			f.refreshPartitionsBackground()
 		case event, ok := <-f.changeCh:
 			if !ok {
 				return
@@ -643,28 +671,77 @@ func (f *Frontend) watchMembershipChanges() {
 			for _, host := range event.HostsRemoved {
 				f.pool.removeConn(host.GetAddress())
 			}
+			// 成员变更常伴随分区所有权变化，顺带刷新一次快照。
+			f.refreshPartitionsBackground()
 		}
 	}
 }
 
-// fetchNumPartitions 从 matching 服务查询队列的分区数
-func (f *Frontend) fetchNumPartitions(ctx context.Context) (int, error) {
+// refreshPartitionsBackground 用受生命周期约束的超时刷新分区快照；失败保留旧快照。
+func (f *Frontend) refreshPartitionsBackground() {
+	if f.ctx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(f.ctx, partitionRefreshInterval)
+	defer cancel()
+	_ = f.refreshPartitions(ctx)
+}
+
+// snapshot 读取当前 read/write 分区快照，并对未就绪/异常值兜底到安全下限，
+// 杜绝 Enqueue 的 `% 0` panic 与 Dequeue 的 `range 0` 不投递。
+func (f *Frontend) snapshot() partitionSnapshot {
+	p := f.partitions.Load()
+	if p == nil {
+		return partitionSnapshot{read: minPartitions, write: minPartitions}
+	}
+	snap := *p
+	if snap.read < minPartitions {
+		snap.read = minPartitions
+	}
+	if snap.write < minPartitions {
+		snap.write = minPartitions
+	}
+	return snap
+}
+
+// refreshPartitions 重新拉取 read/write 分区数并原子替换快照。RPC 失败时保留旧快照，不清零。
+func (f *Frontend) refreshPartitions(ctx context.Context) error {
+	snapshot, err := f.fetchNumPartitions(ctx)
+	if err != nil {
+		return err
+	}
+	f.partitions.Store(&snapshot)
+	return nil
+}
+
+// fetchNumPartitions 从 matching 服务查询队列的 read/write 分区数。
+// 老 matching 只填 num_partitions（= read，向后兼容），此时 fallback 到该值。
+func (f *Frontend) fetchNumPartitions(ctx context.Context) (partitionSnapshot, error) {
 	host, err := f.resolver.Lookup(f.cfg.QueueName)
 	if err != nil {
-		return 0, fmt.Errorf("frontend: lookup matching node: %w", err)
+		return partitionSnapshot{}, fmt.Errorf("frontend: lookup matching node: %w", err)
 	}
 	client, err := f.pool.getClient(host.GetAddress())
 	if err != nil {
-		return 0, fmt.Errorf("frontend: connect matching node: %w", err)
+		return partitionSnapshot{}, fmt.Errorf("frontend: connect matching node: %w", err)
 	}
 	resp, err := client.GetQueueInfo(ctx, &matching.GetQueueInfoRequest{QueueName: f.cfg.QueueName})
 	if err != nil {
-		return 0, fmt.Errorf("frontend: get queue info: %w", err)
+		return partitionSnapshot{}, fmt.Errorf("frontend: get queue info: %w", err)
 	}
-	if resp.NumPartitions <= 0 {
-		return 0, fmt.Errorf("frontend: invalid partition count %d for queue %q", resp.NumPartitions, f.cfg.QueueName)
+	read := int(resp.NumReadPartitions)
+	write := int(resp.NumWritePartitions)
+	// 老 matching 不填 read/write，两者为 0 时 fallback 到 num_partitions 保持兼容。
+	if read <= 0 {
+		read = int(resp.NumPartitions)
 	}
-	return int(resp.NumPartitions), nil
+	if write <= 0 {
+		write = int(resp.NumPartitions)
+	}
+	if read <= 0 || write <= 0 {
+		return partitionSnapshot{}, fmt.Errorf("frontend: invalid partition count read=%d write=%d for queue %q", read, write, f.cfg.QueueName)
+	}
+	return partitionSnapshot{read: read, write: write}, nil
 }
 
 // isRetryable 判断 gRPC 错误是否可重试（分区所有权转移）

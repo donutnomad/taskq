@@ -12,23 +12,21 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-func TestBugRepro_AddTaskRejectsUnknownQueue(t *testing.T) {
+// 自动分区改造后 queue 按需自动创建：向从未声明的 queue 发 AddTask 不再报 NotFound，
+// 而是 fallback 到全局默认分区数、自动物化分区并入队（对比改造前的 ErrUnknownQueue）。
+func TestBugRepro_AddTaskAutoCreatesUnknownQueue(t *testing.T) {
 	store := newTestSQLiteStore(t)
 	resolver := newStubResolver("127.0.0.1:9999")
 
 	_, addr := startTestServer(t, store, resolver, "127.0.0.1:9999", map[string]int{"known-q": 1})
 
 	client := newTestClient(t, addr)
-	_, err := client.AddTask(context.Background(), &AddTaskRequest{
+	if _, err := client.AddTask(context.Background(), &AddTaskRequest{
 		QueueName:   "unknown-q",
 		PartitionId: 0,
 		Data:        []byte("payload"),
-	})
-	if err == nil {
-		t.Fatal("expected unknown queue to be rejected")
-	}
-	if status.Code(err) != codes.NotFound {
-		t.Fatalf("expected NotFound for unknown queue, got %v", err)
+	}); err != nil {
+		t.Fatalf("expected unknown queue to be auto-created and accepted, got %v", err)
 	}
 }
 
@@ -45,10 +43,11 @@ func TestBugRepro_AddTaskRejectsOutOfRangePartition(t *testing.T) {
 		Data:        []byte("payload"),
 	})
 	if err == nil {
-		t.Fatal("expected out-of-range partition to be rejected")
+		t.Fatal("expected out-of-range write partition to be rejected")
 	}
-	if status.Code(err) != codes.InvalidArgument {
-		t.Fatalf("expected InvalidArgument for out-of-range partition, got %v", err)
+	// AddTask 按 numWrite 硬拒绝高位写分区（读写闸门分裂），返回 FailedPrecondition。
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("expected FailedPrecondition for out-of-range write partition, got %v", err)
 	}
 }
 
@@ -76,6 +75,9 @@ func (*ownershipFlipResolver) RemoveListener(string) error                      
 
 func TestBugRepro_SlowPartitionLoadRechecksOwnershipUnderLock(t *testing.T) {
 	store := newTestSQLiteStore(t)
+	if err := store.EnsureDefaultPartitions(context.Background(), 1, 1); err != nil {
+		t.Fatal(err)
+	}
 	resolver := &ownershipFlipResolver{
 		self:  membership.NewHostInfoFromAddress("127.0.0.1:9999"),
 		other: membership.NewHostInfoFromAddress("127.0.0.2:9999"),
@@ -89,11 +91,10 @@ func TestBugRepro_SlowPartitionLoadRechecksOwnershipUnderLock(t *testing.T) {
 		resolver,
 		time.Minute,
 		defaultMaxAttempts,
-		map[string]int{"known-q": 1},
 	)
 	t.Cleanup(pm.close)
 
-	if _, err := pm.getOrLoadPartition(context.Background(), "known-q", 0); !errors.Is(err, ErrNotOwner) {
+	if _, err := pm.getOrLoadPartition(context.Background(), "known-q", 0, accessRead); !errors.Is(err, ErrNotOwner) {
 		t.Fatalf("expected ownership change to abort partition load, got %v", err)
 	}
 	if len(pm.partitions) != 0 {
@@ -110,6 +111,9 @@ func (r *flakyLookupResolver) Lookup(key string) (membership.HostInfo, error) {
 
 func TestBugRepro_ReconcileKeepsLoadedPartitionsWhenOwnershipLookupFails(t *testing.T) {
 	store := newTestSQLiteStore(t)
+	if err := store.EnsureDefaultPartitions(context.Background(), 1, 1); err != nil {
+		t.Fatal(err)
+	}
 	resolver := &flakyLookupResolver{stubResolver: *newStubResolver("127.0.0.1:9999")}
 	pm := newPartitionManager(
 		context.Background(),
@@ -120,11 +124,10 @@ func TestBugRepro_ReconcileKeepsLoadedPartitionsWhenOwnershipLookupFails(t *test
 		resolver,
 		time.Minute,
 		defaultMaxAttempts,
-		map[string]int{"known-q": 1},
 	)
 	t.Cleanup(pm.close)
 
-	pq, err := pm.getOrLoadPartition(context.Background(), "known-q", 0)
+	pq, err := pm.getOrLoadPartition(context.Background(), "known-q", 0, accessRead)
 	if err != nil {
 		t.Fatalf("expected partition to load before reproducing reconcile issue: %v", err)
 	}
@@ -142,6 +145,9 @@ func TestBugRepro_ReconcileKeepsLoadedPartitionsWhenOwnershipLookupFails(t *test
 
 func TestBugRepro_LoadedPartitionRechecksOwnership(t *testing.T) {
 	store := newTestSQLiteStore(t)
+	if err := store.EnsureDefaultPartitions(context.Background(), 1, 1); err != nil {
+		t.Fatal(err)
+	}
 	resolver := newStubResolver("127.0.0.1:9999")
 	pm := newPartitionManager(
 		context.Background(),
@@ -152,17 +158,16 @@ func TestBugRepro_LoadedPartitionRechecksOwnership(t *testing.T) {
 		resolver,
 		time.Minute,
 		defaultMaxAttempts,
-		map[string]int{"known-q": 1},
 	)
 	t.Cleanup(pm.close)
 
-	handle, err := pm.getOrLoadPartition(context.Background(), "known-q", 0)
+	handle, err := pm.getOrLoadPartition(context.Background(), "known-q", 0, accessRead)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resolver.members = []membership.HostInfo{membership.NewHostInfoFromAddress("127.0.0.2:9999")}
 
-	if _, err := pm.getOrLoadPartition(context.Background(), "known-q", 0); !errors.Is(err, ErrNotOwner) {
+	if _, err := pm.getOrLoadPartition(context.Background(), "known-q", 0, accessRead); !errors.Is(err, ErrNotOwner) {
 		t.Fatalf("expected loaded partition to reject stale ownership, got %v", err)
 	}
 	if !handle.isClosed() {
@@ -172,6 +177,9 @@ func TestBugRepro_LoadedPartitionRechecksOwnership(t *testing.T) {
 
 func TestBugRepro_PeriodicReconcileConvergesAfterDroppedEvent(t *testing.T) {
 	store := newTestSQLiteStore(t)
+	if err := store.EnsureDefaultPartitions(context.Background(), 1, 1); err != nil {
+		t.Fatal(err)
+	}
 	resolver := newStubResolver("127.0.0.1:9999")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -184,11 +192,10 @@ func TestBugRepro_PeriodicReconcileConvergesAfterDroppedEvent(t *testing.T) {
 		resolver,
 		time.Minute,
 		defaultMaxAttempts,
-		map[string]int{"known-q": 1},
 	)
 	t.Cleanup(pm.close)
 
-	handle, err := pm.getOrLoadPartition(context.Background(), "known-q", 0)
+	handle, err := pm.getOrLoadPartition(context.Background(), "known-q", 0, accessRead)
 	if err != nil {
 		t.Fatal(err)
 	}
