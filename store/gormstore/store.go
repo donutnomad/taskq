@@ -72,7 +72,7 @@ func New(db DB, cfg Config) (*Store, error) {
 }
 
 func NewSQLite(dsn string, cfg Config) (*Store, error) {
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{TranslateError: true})
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
@@ -98,7 +98,7 @@ func NewSQLite(dsn string, cfg Config) (*Store, error) {
 }
 
 func NewMySQL(dsn string, cfg Config) (*Store, error) {
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{TranslateError: true})
 	if err != nil {
 		return nil, fmt.Errorf("open mysql: %w", err)
 	}
@@ -367,6 +367,14 @@ func (s *Store) ResolvePartitions(ctx context.Context, queueName string) (int, i
 	return row.NumRead, row.NumWrite, nil
 }
 
+// SetPartitions 无条件 upsert override 行，允许缩容。
+//
+// 缩容会孤立高位分区里的在途任务，因此该方法**只应由 matching 的 ResizePartitions
+// 编排器调用**——只有它在静默期 + drain 确认后才减 read（见 matching/resize.go）。
+// 编排器同时依赖本方法的「无条件」语义：drain 结束后的第 4 步就是把 read 减到 target，
+// 任何 grow-only 拦截都会让合法缩容失败。
+//
+// 外部调用方（管理接口、启动期落配置）请用 GrowPartitions。
 func (s *Store) SetPartitions(ctx context.Context, queueName string, read, write int) error {
 	if queueName == "" || queueName == defaultPartitionScope {
 		return fmt.Errorf("gormstore: %q is not a valid override queue name", queueName)
@@ -379,6 +387,64 @@ func (s *Store) SetPartitions(ctx context.Context, queueName string, read, write
 		Columns:   []clause.Column{{Name: "scope"}},
 		DoUpdates: clause.AssignmentColumns([]string{"num_read", "num_write", "updated_at"}),
 	}).Create(&row).Error
+}
+
+// ErrPartitionShrinkRejected 表示 GrowPartitions 因目标小于当前值而拒绝写入。
+var ErrPartitionShrinkRejected = errors.New("gormstore: partitions are grow-only")
+
+// GrowPartitions 是 SetPartitions 的 grow-only 变体，供编排器**之外**的调用方使用
+// （管理端点、进程启动时落配置）：仅当新值两个维度都不小于当前值时才写入。
+//
+// 与 SetDefaultPartitions 同样用单条条件 UPDATE 做 CAS，而非 read-compare-write 三步：
+// 后者在 MySQL REPEATABLE READ 下会 lost update——并发的两次调用都基于旧快照判定通过，
+// 较小的那个覆盖较大的已提交值，grow-only 形同虚设。
+//
+// 与 SetDefaultPartitions 的唯一差异：override 行「不存在」是常态（queue 首次显式配置），
+// 此时插入新行而不是报错。
+func (s *Store) GrowPartitions(ctx context.Context, queueName string, read, write int) error {
+	if queueName == "" || queueName == defaultPartitionScope {
+		return fmt.Errorf("gormstore: %q is not a valid override queue name", queueName)
+	}
+	if err := validatePartitionCounts(read, write); err != nil {
+		return err
+	}
+
+	result := s.db.WithContext(ctx).Model(&partitionConfigRow{}).
+		Where("scope = ? AND num_read <= ? AND num_write <= ?", queueName, read, write).
+		Updates(map[string]any{"num_read": read, "num_write": write, "updated_at": time.Now().UTC()})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 1 {
+		return nil
+	}
+
+	// RowsAffected == 0：行不存在、违反 grow-only、或值未变（MySQL 下匹配但未改）。
+	// 读回当前行区分三者。
+	var cur partitionConfigRow
+	err := s.db.WithContext(ctx).Where("scope = ?", queueName).First(&cur).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		// 首次配置该 queue：插入。并发下另一个调用者可能抢先插入，DoNothing 让本次
+		// 退化为 no-op，再递归一次按 grow-only 规则与已落地的值比较。
+		row := partitionConfigRow{Scope: queueName, NumRead: read, NumWrite: write, UpdatedAt: time.Now().UTC()}
+		insert := s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&row)
+		if insert.Error != nil {
+			return insert.Error
+		}
+		if insert.RowsAffected == 1 {
+			return nil
+		}
+		return s.GrowPartitions(ctx, queueName, read, write)
+	}
+	if err != nil {
+		return err
+	}
+	if cur.NumRead > read || cur.NumWrite > write {
+		return fmt.Errorf("%w: cannot shrink queue %q from read=%d write=%d to read=%d write=%d (scale down via matching ResizePartitions)",
+			ErrPartitionShrinkRejected, queueName, cur.NumRead, cur.NumWrite, read, write)
+	}
+	// 当前各维 <= 新值但 UPDATE 未命中 → 值完全相同，幂等 no-op。
+	return nil
 }
 
 func (s *Store) SetDefaultPartitions(ctx context.Context, read, write int) error {

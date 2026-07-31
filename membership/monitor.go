@@ -290,9 +290,15 @@ func (m *monitor) pollLoop() {
 		case <-m.lifecycleCtx.Done():
 			return
 		case <-ticker.C:
+			// poll 失败不停机：沿用上一次的 ring 快照继续服务（stale-while-error，与
+			// matching resolvePartitions 同思路）。读不到成员表只说明「看不见别人」，
+			// 而上一次快照是真实存在过的成员视图——继续用它远好于清空 ring 让本节点
+			// 所有 Lookup 返回 ErrInsufficientHosts。下一个 tick 自动重试，DB 恢复即自愈。
 			if err := m.retryMembershipOp("sync members", m.syncMembers); err != nil {
-				m.fail(fmt.Errorf("sync members failed after retries: %w", err))
-				return
+				if m.lifecycleCtx.Err() != nil {
+					return
+				}
+				slog.Error("membership sync members failed after retries, serving stale ring", "err", err)
 			}
 		}
 	}
@@ -384,9 +390,15 @@ func (m *monitor) heartbeatLoop() {
 			return
 		case <-timer.C:
 		}
+		// 心跳写失败同样不停机。写不进去只影响「别人看不见我」——他们会按
+		// healthyHostLastHeartbeatCutoff 自然把本节点判死并把流量切走，这本就是设计好的
+		// 降级路径。本节点自杀既救不回这条记录，还会连带毁掉它对其他节点的路由视图。
+		// 下一个心跳周期继续重试，DB 恢复后记录自动复活。
 		if err := m.retryMembershipOp("write membership heartbeats", m.writeHeartbeats); err != nil {
-			m.fail(fmt.Errorf("write membership heartbeats failed after retries: %w", err))
-			return
+			if m.lifecycleCtx.Err() != nil {
+				return
+			}
+			slog.Error("membership write heartbeats failed after retries, will retry next interval", "err", err)
 		}
 	}
 }

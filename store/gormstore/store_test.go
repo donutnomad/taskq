@@ -1048,3 +1048,116 @@ func TestSQLiteStoreMemberLifecycle(t *testing.T) {
 		t.Fatalf("expected one stale member purged, got %d", removed)
 	}
 }
+
+// GrowPartitions 是外部调用方（管理端点、启动落配置）的入口：首次写入插入行，
+// 之后只允许增大。缩容必须走 matching 的 ResizePartitions 编排。
+func TestSQLiteStoreGrowPartitionsIsGrowOnly(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+
+	// override 行不存在 → 首次写入直接插入（不依赖 `_default_` 是否 bootstrap）。
+	if err := s.GrowPartitions(ctx, "q", 4, 4); err != nil {
+		t.Fatal(err)
+	}
+	read, write, err := s.ResolvePartitions(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 4 || write != 4 {
+		t.Fatalf("first write = read=%d write=%d, want 4/4", read, write)
+	}
+
+	// 增大成功。
+	if err := s.GrowPartitions(ctx, "q", 8, 6); err != nil {
+		t.Fatal(err)
+	}
+	// 相等是幂等 no-op，不报错。
+	if err := s.GrowPartitions(ctx, "q", 8, 6); err != nil {
+		t.Fatalf("idempotent rewrite rejected: %v", err)
+	}
+
+	// 任一维度缩小都被拒，且既有值不变。
+	for _, tc := range []struct {
+		name        string
+		read, write int
+	}{
+		{"shrink read", 6, 6},
+		{"shrink write", 8, 4},
+		{"shrink both", 4, 4},
+	} {
+		err := s.GrowPartitions(ctx, "q", tc.read, tc.write)
+		if !errors.Is(err, ErrPartitionShrinkRejected) {
+			t.Fatalf("%s: err = %v, want ErrPartitionShrinkRejected", tc.name, err)
+		}
+	}
+	read, write, err = s.ResolvePartitions(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 8 || write != 6 {
+		t.Fatalf("after rejected shrinks = read=%d write=%d, want 8/6", read, write)
+	}
+
+	// 不变式 1<=write<=read 仍然强校验。
+	if err := s.GrowPartitions(ctx, "q", 8, 9); err == nil {
+		t.Fatal("expected rejection for write>read")
+	}
+	// 保留 scope 名不可用作 queue 名。
+	if err := s.GrowPartitions(ctx, defaultPartitionScope, 8, 8); err == nil {
+		t.Fatal("expected rejection for reserved scope name")
+	}
+}
+
+// SetPartitions 必须保持无条件语义：matching 的 shrinkPartitions 第 4 步依赖它减小 read。
+// 给它加 grow-only 会破坏合法缩容，这里把该契约钉死。
+func TestSQLiteStoreSetPartitionsStaysUnconditionalForResize(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+
+	if err := s.SetPartitions(ctx, "q", 8, 8); err != nil {
+		t.Fatal(err)
+	}
+	// 编排器第 1 步：只减 write。
+	if err := s.SetPartitions(ctx, "q", 8, 2); err != nil {
+		t.Fatalf("resize step 1 (shrink write) rejected: %v", err)
+	}
+	// 编排器第 4 步：drain 确认后减 read。
+	if err := s.SetPartitions(ctx, "q", 2, 2); err != nil {
+		t.Fatalf("resize step 4 (shrink read) rejected: %v", err)
+	}
+	read, write, err := s.ResolvePartitions(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 2 || write != 2 {
+		t.Fatalf("after orchestrated shrink = read=%d write=%d, want 2/2", read, write)
+	}
+}
+
+// 并发 GrowPartitions 不得丢更新：单条条件 UPDATE 做 CAS，最终值必须是最大的那个，
+// 而不是最后一个写入者的值。
+func TestSQLiteStoreGrowPartitionsConcurrentKeepsMax(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+	if err := s.GrowPartitions(ctx, "q", 2, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	targets := []int{4, 16, 8, 32, 6}
+	var wg sync.WaitGroup
+	for _, n := range targets {
+		wg.Go(func() {
+			// 缩容请求被拒是预期结果，这里只关心最终值不被回退。
+			_ = s.GrowPartitions(ctx, "q", n, n)
+		})
+	}
+	wg.Wait()
+
+	read, write, err := s.ResolvePartitions(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != 32 || write != 32 {
+		t.Fatalf("concurrent grow settled at read=%d write=%d, want 32/32 (lost update)", read, write)
+	}
+}

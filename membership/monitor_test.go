@@ -503,6 +503,204 @@ func TestMonitorBuildUpsertRequestPreservesFutureJoinTime(t *testing.T) {
 	}
 }
 
+// flakyStore 是可在运行时切换故障的 stubStore：用于验证 DB 抖动期间 Monitor 不停机。
+// 故意复用内嵌 stubStore 的 mu（不另开锁），使 members/upserts 与 failing/getCalls
+// 处于同一把锁下，避免测试自身产生数据竞争。
+type flakyStore struct {
+	stubStore
+
+	failing  bool
+	getCalls int
+}
+
+func (s *flakyStore) setFailing(failing bool) {
+	s.mu.Lock()
+	s.failing = failing
+	s.mu.Unlock()
+}
+
+func (s *flakyStore) calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getCalls
+}
+
+// isFailing 读故障标志。注意不能在持锁期间调用 stubStore 的方法——它们会再次取同一把锁。
+func (s *flakyStore) isFailing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failing
+}
+
+func (s *flakyStore) GetActiveMembers(ctx context.Context, within time.Duration) ([]MemberRecord, error) {
+	s.mu.Lock()
+	s.getCalls++
+	failing := s.failing
+	s.mu.Unlock()
+	if failing {
+		return nil, errors.New("db unavailable")
+	}
+	return s.stubStore.GetActiveMembers(ctx, within)
+}
+
+func (s *flakyStore) UpsertMember(ctx context.Context, req UpsertMemberRequest) error {
+	if s.isFailing() {
+		return errors.New("db unavailable")
+	}
+	return s.stubStore.UpsertMember(ctx, req)
+}
+
+// DB 抖动持续到超出重试预算后，Monitor 必须保留上一次的 ring 快照继续服务，
+// 而不是停机把 ring 清空让所有 Lookup 返回 ErrInsufficientHosts；DB 恢复后自愈。
+func TestMonitorServesStaleRingWhilePollFails(t *testing.T) {
+	store := &flakyStore{}
+	store.members = []MemberRecord{
+		{RPCAddress: net.ParseIP("10.0.0.1"), RPCPort: 7235, ServiceName: "matching"},
+	}
+
+	// 压缩重试参数，让「重试预算耗尽」在测试时限内发生。
+	restore := shrinkRetryParamsForTest(t)
+	defer restore()
+
+	m := NewMonitor(
+		[]string{"matching"},
+		store,
+		netip.MustParseAddrPort("10.0.0.1:7235"),
+		20*time.Millisecond,
+		time.Second,
+		time.Time{},
+		200,
+	)
+	m.Start()
+	defer m.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.WaitUntilInitialized(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := m.GetResolver("matching")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 进入故障态，等待若干个 poll 周期把重试预算耗尽。
+	store.setFailing(true)
+	before := store.calls()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.calls() < before+8 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 关键断言：ring 仍然可用，Lookup 不返回 ErrInsufficientHosts。
+	host, err := resolver.Lookup("workflow-tasks/0")
+	if err != nil {
+		t.Fatalf("lookup during db outage = %v, want stale ring to keep serving", err)
+	}
+	if host.GetAddress() != "10.0.0.1:7235" {
+		t.Fatalf("stale host = %q, want 10.0.0.1:7235", host.GetAddress())
+	}
+
+	// DB 恢复后必须自愈：新成员能被后续 poll 同步进来。
+	store.mu.Lock()
+	store.members = append(store.members, MemberRecord{
+		RPCAddress: net.ParseIP("10.0.0.2"), RPCPort: 7235, ServiceName: "matching",
+	})
+	store.mu.Unlock()
+	store.setFailing(false)
+
+	observable := resolver.(interface{ MemberCount() int })
+	deadline = time.Now().Add(2 * time.Second)
+	for observable.MemberCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if observable.MemberCount() != 2 {
+		t.Fatalf("member count after recovery = %d, want 2 (monitor did not self-heal)", observable.MemberCount())
+	}
+}
+
+// 心跳写失败同样不得停机：写不进去只影响别人看见我，本节点对其它节点的路由视图必须完好，
+// 且 DB 恢复后心跳自动继续。
+func TestMonitorSurvivesHeartbeatFailure(t *testing.T) {
+	store := &flakyStore{}
+	store.members = []MemberRecord{
+		{RPCAddress: net.ParseIP("10.0.0.9"), RPCPort: 7235, ServiceName: "matching"},
+	}
+
+	restore := shrinkRetryParamsForTest(t)
+	defer restore()
+
+	m := NewMonitor(
+		[]string{"matching"},
+		store,
+		netip.MustParseAddrPort("10.0.0.1:7235"),
+		20*time.Millisecond,
+		time.Second,
+		time.Time{},
+		200,
+	)
+	m.Start()
+	defer m.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.WaitUntilInitialized(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	store.setFailing(true)
+	before := store.calls()
+	deadline := time.Now().Add(2 * time.Second)
+	for store.calls() < before+8 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	store.setFailing(false)
+
+	// Monitor 未停机：lifecycle 仍存活，poll 循环仍在推进。
+	if err := m.WaitUntilInitialized(context.Background()); err != nil {
+		t.Fatalf("monitor stopped after heartbeat failures: %v", err)
+	}
+	resolver, err := m.GetResolver("matching")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Lookup("workflow-tasks/0"); err != nil {
+		t.Fatalf("lookup after heartbeat outage = %v, want ring intact", err)
+	}
+
+	// 恢复后心跳继续写入。
+	store.mu.Lock()
+	store.upserts = nil
+	store.mu.Unlock()
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		store.mu.Lock()
+		n := len(store.upserts)
+		store.mu.Unlock()
+		if n > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("heartbeats did not resume after db recovery")
+}
+
+// shrinkRetryParamsForTest 压缩重试/心跳参数，让故障路径在测试时限内触发。
+func shrinkRetryParamsForTest(t *testing.T) func() {
+	t.Helper()
+	prevAttempts, prevBase, prevMax := membershipRetryMaxAttempts, membershipRetryBaseDelay, membershipRetryMaxDelay
+	prevInterval, prevJitter := membershipHeartbeatInterval, membershipHeartbeatJitterMax
+	membershipRetryMaxAttempts = 2
+	membershipRetryBaseDelay = time.Millisecond
+	membershipRetryMaxDelay = 2 * time.Millisecond
+	membershipHeartbeatInterval = 20 * time.Millisecond
+	membershipHeartbeatJitterMax = 0
+	return func() {
+		membershipRetryMaxAttempts, membershipRetryBaseDelay, membershipRetryMaxDelay = prevAttempts, prevBase, prevMax
+		membershipHeartbeatInterval, membershipHeartbeatJitterMax = prevInterval, prevJitter
+	}
+}
+
 func TestMonitorFiltersMembersOutsideSchedulingWindow(t *testing.T) {
 	now := time.Now()
 	store := &stubStore{members: []MemberRecord{

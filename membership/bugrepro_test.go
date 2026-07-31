@@ -203,7 +203,15 @@ func TestBugRepro_StartShouldRetryTransientMembershipStoreFailures(t *testing.T)
 	}
 }
 
-func TestBugRepro_RuntimeSyncFailuresShouldEventuallyStopMonitor(t *testing.T) {
+// 运行期 sync 失败耗尽重试后，Monitor 必须继续存活并沿用上一次 ring 快照。
+//
+// 本用例此前断言的是相反行为（失败即停机）。停机的代价与收益不对等：DB 抖动约 8 秒
+// 就让节点所有 Lookup 永久返回 ErrInsufficientHosts，且 Start() 拒绝重启（status != 0），
+// 无自愈路径。读不到成员表只意味着「看不见别人」，上一次快照仍是真实存在过的成员视图，
+// 继续用它是 matching resolvePartitions 已经确立的 stale-while-error 策略。
+// 启动期失败仍然 fatal（见 TestBugRepro_StartShouldRetryTransientMembershipStoreFailures），
+// 因为那时没有任何可用快照可退化。
+func TestBugRepro_RuntimeSyncFailuresKeepMonitorAlive(t *testing.T) {
 	setMonitorRetryPolicyForTest(t, 3, 5*time.Millisecond, 20*time.Millisecond, time.Hour, 0)
 
 	store := &retryingMemberStore{
@@ -236,20 +244,33 @@ func TestBugRepro_RuntimeSyncFailuresShouldEventuallyStopMonitor(t *testing.T) {
 		t.Fatalf("expected monitor to initialize before runtime sync failure test, got %v", err)
 	}
 
-	deadline := time.After(time.Second)
-	for {
-		if m.(*monitor).lifecycleCtx.Err() != nil {
-			return
+	// 等注入的错误全部被消费掉（重试预算已耗尽至少一轮）。
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		store.mu.Lock()
+		remaining := len(store.getErrors)
+		store.mu.Unlock()
+		if remaining == 0 {
+			break
 		}
-		select {
-		case <-deadline:
-			t.Fatal("expected monitor to stop after repeated runtime sync failures")
-		case <-time.After(10 * time.Millisecond):
-		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if m.(*monitor).lifecycleCtx.Err() != nil {
+		t.Fatal("monitor stopped after runtime sync failures; expected it to serve the stale ring")
+	}
+	resolver, err := m.GetResolver("matching")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Lookup("workflow-tasks/0"); err != nil {
+		t.Fatalf("lookup after sync failures = %v, want stale ring to keep serving", err)
 	}
 }
 
-func TestBugRepro_RuntimeHeartbeatFailuresShouldEventuallyStopMonitor(t *testing.T) {
+// 运行期心跳写失败同样不得停机：写不进去只影响别人看见我，他们会按心跳超时把流量切走；
+// 自杀反而连带毁掉本节点对其它节点的路由视图。
+func TestBugRepro_RuntimeHeartbeatFailuresKeepMonitorAlive(t *testing.T) {
 	setMonitorRetryPolicyForTest(t, 3, 5*time.Millisecond, 20*time.Millisecond, 10*time.Millisecond, 0)
 
 	store := &retryingMemberStore{
@@ -282,15 +303,25 @@ func TestBugRepro_RuntimeHeartbeatFailuresShouldEventuallyStopMonitor(t *testing
 		t.Fatalf("expected monitor to initialize before runtime heartbeat failure test, got %v", err)
 	}
 
-	deadline := time.After(time.Second)
-	for {
-		if m.(*monitor).lifecycleCtx.Err() != nil {
-			return
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		store.mu.Lock()
+		remaining := len(store.upsertErrors)
+		store.mu.Unlock()
+		if remaining == 0 {
+			break
 		}
-		select {
-		case <-deadline:
-			t.Fatal("expected monitor to stop after repeated heartbeat failures")
-		case <-time.After(10 * time.Millisecond):
-		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if m.(*monitor).lifecycleCtx.Err() != nil {
+		t.Fatal("monitor stopped after heartbeat failures; expected it to keep serving and retry")
+	}
+	resolver, err := m.GetResolver("matching")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolver.Lookup("workflow-tasks/0"); err != nil {
+		t.Fatalf("lookup after heartbeat failures = %v, want ring intact", err)
 	}
 }
