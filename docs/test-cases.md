@@ -175,8 +175,8 @@ go test -race ./...
 | 计划未来下线时，不能立刻进入 draining | 到达下线时间之前，最后一次 upsert 仍应保持可服务 | `TestBugRepro_EvictSelfAtDoesNotDrainImmediatelyForFutureDeadline` |
 | 可达成员列表必须去重 | 同地址多 service 只返回一条 | `TestBugRepro_GetReachableMembersDeduplicatesAddresses` |
 | 启动阶段遇到短暂存储失败时必须重试恢复 | 在有限次瞬时失败后仍能成功初始化 | `TestBugRepro_StartShouldRetryTransientMembershipStoreFailures` |
-| 运行中成员同步持续失败时必须退出 | 超过重试次数后 monitor 停止运行 | `TestBugRepro_RuntimeSyncFailuresShouldEventuallyStopMonitor` |
-| 运行中心跳持续失败时必须退出 | 超过重试次数后 monitor 停止运行 | `TestBugRepro_RuntimeHeartbeatFailuresShouldEventuallyStopMonitor` |
+| 运行中成员同步持续失败时必须保活 | 超过重试次数后不停机，沿用上一次 ring 快照继续服务并后台重试 | `TestBugRepro_RuntimeSyncFailuresKeepMonitorAlive` |
+| 运行中心跳持续失败时必须保活 | 超过重试次数后不停机；写不进去只影响「别人看不见我」，对等节点按心跳超时切走流量 | `TestBugRepro_RuntimeHeartbeatFailuresKeepMonitorAlive` |
 
 ## 六、当前没有自动化用例、但必须满足的行为
 
