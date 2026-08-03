@@ -234,8 +234,21 @@ func (h *partitionHandle) close() {
 	h.clearActive()
 }
 
+// setActive 发布已就绪的 PhysicalQueue。与 clearActive 对称地检查 closed:
+// close() 先置 closed 并把 stateCh 置 nil，再走 Offline/Stop/clearActive。若此时
+// leader task 恰好完成启动并调用本函数，无守卫会 (a) 重新 make 一个 stateCh，而
+// 随后的 clearActive 因 closed 为真跳过通知，该 channel 永不被 close；(b) 把 pq
+// 挂到已关停的 handle 上，而 clearActive 早已执行过，pq 及其 writer/GC/visibility
+// goroutine 全部泄漏。故已关停时不接管 pq，就地 Close。
 func (h *partitionHandle) setActive(pq *queue.PhysicalQueue) {
 	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		if pq != nil {
+			pq.Close()
+		}
+		return
+	}
 	h.active = pq
 	h.notifyStateChangeLocked(true)
 	h.mu.Unlock()
