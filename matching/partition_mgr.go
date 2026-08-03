@@ -712,9 +712,12 @@ func (pm *partitionManager) reconcile() {
 	}
 
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
 
-	// 卸载不再属于本节点的分区（本轮 resolve 失败的 queue 除外，保持现状）
+	// 卸载不再属于本节点的分区（本轮 resolve 失败的 queue 除外，保持现状）。
+	// 锁内只做摘除，close() 留到锁外：close() 会同步走 Offline()（DB Release，有秒级
+	// 超时）再 Stop()（排空分区 goroutine），持锁串行执行会让所有 RPC 阻塞在
+	// pm.mu 上整整数十秒，进而 Ack 超时、任务被判未确认而重复投递。
+	var unloading []*partitionHandle
 	for key, handle := range pm.partitions {
 		if _, ok := owned[key]; ok {
 			continue
@@ -723,7 +726,7 @@ func (pm *partitionManager) reconcile() {
 			continue
 		}
 		slog.Info("matching unloading partition", "partition", key)
-		handle.close()
+		unloading = append(unloading, handle)
 		delete(pm.partitions, key)
 	}
 
@@ -737,15 +740,33 @@ func (pm *partitionManager) reconcile() {
 		slog.Info("matching loaded partition", "partition", key)
 		pm.partitions[key] = handle
 	}
+	pm.mu.Unlock()
+
+	// 已从 map 摘除的 handle 不会再被 getOrLoadPartition 取到（并发重建的是另一个
+	// handle 实例），因此这里关的一定是自己摘下来的那个，无需再做身份比对。
+	// 并发关闭多个分区，避免逐个 Offline 超时串行累加。
+	var wg sync.WaitGroup
+	for _, handle := range unloading {
+		wg.Go(handle.close)
+	}
+	wg.Wait()
 }
 
-// close 关闭所有分区
+// close 关闭所有分区。返回前保证全部分区已关完（整体关停语义），但不持 pm.mu 等待：
+// 锁内摘除、锁外并发 close，避免关停期间把所有 RPC 堵在 pm.mu 上。
 func (pm *partitionManager) close() {
 	pm.cancel()
 	pm.mu.Lock()
-	defer pm.mu.Unlock()
+	handles := make([]*partitionHandle, 0, len(pm.partitions))
 	for key, handle := range pm.partitions {
-		handle.close()
+		handles = append(handles, handle)
 		delete(pm.partitions, key)
 	}
+	pm.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for _, handle := range handles {
+		wg.Go(handle.close)
+	}
+	wg.Wait()
 }

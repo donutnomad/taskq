@@ -2,6 +2,48 @@
 
 本文件记录 TaskQ 的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 2026-08-02
+
+修复 matching 层「reconcile 持写锁跨阻塞式关停冻结全节点」的 HIGH 级缺陷，并为
+「ackLevel 长期停滞导致 GC 停摆」补上可观测性。
+
+### 修复
+
+- **reconcile 持 `pm.mu` 写锁跨分区关停，冻结整个节点并触发重复投递**：
+  `partitionManager.reconcile` 原在写锁内逐个 `handle.close()`，而 `close()` 会同步执行
+  `manager.Offline()`（DB `Release`，dbleader 侧 2s 超时）再 `manager.Stop()`（排空分区
+  goroutine）。ring 重排时若有 N 个分区待卸载且恰逢 DB 抖动，写锁被持有约 N×2s，期间所有
+  `AddTask` / `PollTask` / `AckTask` 阻塞在 `pm.mu.RLock()` 上 → 整节点冻结 → `AckTask`
+  超时 → 任务被判未确认而**重复投递**。修复为「锁内收集待关 handle 并从 map 摘除、锁外并发
+  close」，与同文件既有的 `unloadPartition` 对齐。摘除后并发 `getOrLoadPartition` 重建的是
+  另一个 handle 实例，因此不会误关新建句柄。（`matching/partition_mgr.go`）
+- **`partitionManager.close()` 同形问题**：整体关停同样持锁串行。改为锁内摘除、锁外用
+  `WaitGroup` 并发关闭，保留「返回前全部分区已关完」的关停语义，但不再让关停期间的 RPC 堵在
+  `pm.mu` 上。（`matching/partition_mgr.go`）
+
+### 新增
+
+- **ackLevel 停滞可观测性**：`ackLevel` 被一条长期无人消费的任务钉住时，GC 无法回收任何行
+  （GC 只删 `task_id <= ackLevel`），`tasks` 表无界增长，缩容 drain 判定
+  （`ack_level == next_task_id-1`）也永不满足 —— 此前该状态**完全静默**。现由 GC 侧检测水位
+  停滞超过 1 分钟后告警一次，报告挡路任务的 `task_id`、所处状态
+  （`outstanding` / `respooling` / `redelivery` / `unconsumed`）、`routing_key` 与滞留时长。
+  （`queue/gc.go`、`queue/delivery_state.go`）
+
+  **未改变投递语义**：定位后确认「redelivery 项钉住 ackLevel」并非根因 —— 一条带 routing key
+  且从未被任何 poller 取走的任务同样把水位钉死（此时 `redelivery` 为空），因此丢弃或重写
+  redelivery 项并不能解除钉住，反而会破坏 F3 铁律（新行未落库前绝不 ack 老行）。零值
+  `RoutingDeadline` 表示**永久**按 routing key 定向是既有设计（见 README），未订阅该 key 属于
+  使用方配置问题，正解是设置 `RoutingDeadline` 使其到期回落为普通任务。
+
+### 测试
+
+- `matching/reconcile_unload_blocking_test.go`：注入慢 `Release` 的 LockStore 复现 DB 抖动，
+  断言 reconcile 卸载 6 个慢分区期间并发 RPC 不被 `pm.mu` 长时间阻塞（修复前实测阻塞
+  1.66s，修复后 375ns），并断言 `close()` 并发关停且返回前全部分区已关闭。
+- `queue/ack_level_stall_test.go`：断言 redelivery 滞留项、从未被消费的 keyed 任务都能被
+  定位到，正常推进时不误报，以及 GC 停滞检测仅在超过阈值后告警一次。
+
 ## [Unreleased] — 2026-07-23
 
 引入 **respool 投递重试机制**：任务投递失败时以新 `taskID` 重写一条新任务再确认老行，

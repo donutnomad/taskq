@@ -193,6 +193,43 @@ func (s *deliveryState) ackLevelValue() int64 {
 	return s.ackLevel
 }
 
+// blockerStats 描述当前挡住 ackLevel 推进的那条任务（ackLevel+1）的状态，
+// 供 GC 侧发现「ackLevel 长期不前进」时报告成因。
+type blockerStats struct {
+	taskID      int64
+	state       string // outstanding / respooling / redelivery / unconsumed
+	routingKey  string
+	dispatchAge time.Duration
+}
+
+// ackLevelBlocker 返回挡住 ackLevel 的任务及其状态。
+//
+// 注意：ackLevel 是连续水位，任何一条未 ack 的任务都会挡住它 —— 不只是 redelivery 里的。
+// 一条带 routing key、从未被任何 poller 取走的任务同样会一直挡住（这是定向投递的固有语义，
+// 见 README「零值 deadline 表示永久按 routing key 定向」），因此 state 用 unconsumed 表示
+// 「不在本进程任何投递集合里，仍等待匹配的 poller」。
+func (s *deliveryState) ackLevelBlocker(now time.Time) blockerStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	next := s.ackLevel + 1
+	if next > s.maxReadLevel {
+		return blockerStats{}
+	}
+	if ot, ok := s.outstanding[next]; ok {
+		return blockerStats{next, "outstanding", ot.row.RoutingKey, now.Sub(ot.dispatchAt)}
+	}
+	if ot, ok := s.respooling[next]; ok {
+		return blockerStats{next, "respooling", ot.row.RoutingKey, now.Sub(ot.dispatchAt)}
+	}
+	for _, row := range s.redelivery {
+		if row.TaskID == next {
+			return blockerStats{next, "redelivery", row.RoutingKey, now.Sub(taskDispatchTime(row))}
+		}
+	}
+	return blockerStats{taskID: next, state: "unconsumed"}
+}
+
 func (s *deliveryState) advanceAckLevelLocked() {
 	for {
 		next := s.ackLevel + 1
