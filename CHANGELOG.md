@@ -2,6 +2,45 @@
 
 本文件记录 TaskQ 的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 2026-08-03 表名统一加 `taskq_` 前缀
+
+### 破坏性变更
+
+TaskQ 的三张表加上 `taskq_` 前缀，与已有的 `taskq_partition_lock` /
+`taskq_partition_lock_members` / `taskq_membership_members` 命名对齐，避免与宿主库中的
+同名表（尤其是极易撞名的 `tasks`）冲突。
+
+| 旧表名 | 新表名 |
+| --- | --- |
+| `queue_info` | `taskq_queue_info` |
+| `partition_config` | `taskq_partition_config` |
+| `tasks` | `taskq_tasks` |
+
+`taskq_partition_lock`、`taskq_partition_lock_members`、`taskq_membership_members`
+三张表本就带前缀，**未改动**；`gormstore.Config` 的 `LockTable` / `MemberTable` /
+`MembershipTable` 仍可配，默认值不变。
+
+### 升级步骤
+
+TaskQ 没有内置 migration 机制（建表走 GORM `AutoMigrate`），存量库需**手工执行**改名。
+停写后执行：
+
+```sql
+RENAME TABLE
+  `queue_info`       TO `taskq_queue_info`,
+  `partition_config` TO `taskq_partition_config`,
+  `tasks`            TO `taskq_tasks`;
+```
+
+注意事项：
+
+- `RENAME TABLE` 会保留数据、索引与自增值，是原子操作，但**不向后兼容**：旧版本进程连上
+  改名后的库会因找不到 `tasks` 等表而失败。请先停掉全部 TaskQ 进程再改名，避免新旧版本
+  混跑。
+- 若依赖 `AutoMigrate`，**不要**跳过改名直接启动新版本 —— 那会建出一套空的
+  `taskq_*` 表，旧数据留在原表里成为孤儿。
+- 回滚即反向 `RENAME TABLE`。
+
 ## 2026-08-02
 
 修复 matching 层「reconcile 持写锁跨阻塞式关停冻结全节点」的 HIGH 级缺陷，并为

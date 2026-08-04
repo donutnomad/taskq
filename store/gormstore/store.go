@@ -155,7 +155,7 @@ type queueInfoRow struct {
 	NextTaskID  int64  `gorm:"column:next_task_id;not null;default:1"`
 }
 
-func (queueInfoRow) TableName() string { return "queue_info" }
+func (queueInfoRow) TableName() string { return "taskq_queue_info" }
 
 // partitionConfigRow 持久化 queue 分区数（读时取值，全局默认 + per-queue override）。
 // scope 为 defaultPartitionScope 时是全局默认行，否则是某 queue 的显式 override 行。
@@ -166,7 +166,7 @@ type partitionConfigRow struct {
 	UpdatedAt time.Time `gorm:"column:updated_at;not null"`
 }
 
-func (partitionConfigRow) TableName() string { return "partition_config" }
+func (partitionConfigRow) TableName() string { return "taskq_partition_config" }
 
 type taskRow struct {
 	QueueName       string     `gorm:"column:queue_name;primaryKey;size:191;index:idx_tasks_visibility,priority:1;index:idx_tasks_routing_deadline,priority:1"`
@@ -180,7 +180,7 @@ type taskRow struct {
 	DispatchedAt    *time.Time `gorm:"column:dispatched_at;index:idx_tasks_visibility,priority:3;index:idx_tasks_routing_deadline,priority:3"`
 }
 
-func (taskRow) TableName() string { return "tasks" }
+func (taskRow) TableName() string { return "taskq_tasks" }
 
 type lockRow struct {
 	LockName   string `gorm:"column:lock_name;primaryKey;size:191"`

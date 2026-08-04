@@ -721,7 +721,7 @@ func TestSQLiteStoreAdvanceAckLevelAndDeleteTasksAtomic(t *testing.T) {
 	}
 	if err := s.DB().Exec(`
 		CREATE TRIGGER fail_task_delete
-		BEFORE DELETE ON tasks
+		BEFORE DELETE ON taskq_tasks
 		BEGIN
 			SELECT RAISE(ABORT, 'delete blocked');
 		END;
