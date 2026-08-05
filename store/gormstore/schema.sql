@@ -108,6 +108,10 @@ CREATE TABLE `taskq_membership_members` (
   `stop_at`        BIGINT           NOT NULL DEFAULT 0 COMMENT '分片区间终点',
   -- 复合主键字节数 = 191×4 + 45×4 + 2 = 764 + 180 + 2 = 946 ≤ 3072。
   PRIMARY KEY (`service_name`, `rpc_address`, `rpc_port`),
+  -- idx_membership_heartbeat 覆盖 GetActiveMembers 的
+  --   WHERE heartbeat_at >= ? AND expires_at > ?
+  -- 该查询不带 service_name,故 idx_membership_active 的前缀列用不上。
+  KEY `idx_membership_heartbeat` (`heartbeat_at`, `expires_at`),
   KEY `idx_membership_active` (`service_name`, `heartbeat_at`, `expires_at`),
   KEY `idx_membership_expires` (`expires_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

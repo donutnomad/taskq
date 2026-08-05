@@ -28,8 +28,8 @@ type membershipMemberRow struct {
 	RPCPort      uint16    `gorm:"column:rpc_port;primaryKey"`
 	HostID       []byte    `gorm:"column:host_id;not null;size:64"`
 	SessionStart time.Time `gorm:"column:session_start;not null"`
-	HeartbeatAt  time.Time `gorm:"column:heartbeat_at;not null;index:idx_membership_active,priority:2"`
-	ExpiresAt    time.Time `gorm:"column:expires_at;not null;index:idx_membership_expires;index:idx_membership_active,priority:3"`
+	HeartbeatAt  time.Time `gorm:"column:heartbeat_at;not null;index:idx_membership_active,priority:2;index:idx_membership_heartbeat,priority:1"`
+	ExpiresAt    time.Time `gorm:"column:expires_at;not null;index:idx_membership_expires;index:idx_membership_active,priority:3;index:idx_membership_heartbeat,priority:2"`
 	Draining     bool      `gorm:"column:draining;not null;default:false"`
 	StartAt      int64     `gorm:"column:start_at;not null;default:0"`
 	StopAt       int64     `gorm:"column:stop_at;not null;default:0"`

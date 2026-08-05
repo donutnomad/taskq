@@ -2,6 +2,30 @@
 
 本文件记录 TaskQ 的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 2026-08-04 为 `GetActiveMembers` 补索引
+
+SQL 审查用 EXPLAIN ANALYZE 实测发现服务发现的高频查询走全表扫描。
+
+`MembershipStore.GetActiveMembers`（`membership.go:90`）的条件是
+`WHERE heartbeat_at >= ? AND expires_at > ?` —— **不带 `service_name`**，
+而既有 `idx_membership_active (service_name, heartbeat_at, expires_at)`
+的前缀列正是 `service_name`，因此用不上；`idx_membership_expires
+(expires_at)` 单列只覆盖一半条件。实测 5000 行的表扫满 5000 行才返回
+128 行，随实例数线性劣化。
+
+新增 `idx_membership_heartbeat (heartbeat_at, expires_at)` 覆盖该查询的
+两个范围条件。审查实测扫描行数从 5000 降到 271。
+
+存量库（本仓无 migration 机制）请手工执行：
+
+```sql
+ALTER TABLE `taskq_membership_members`
+  ADD INDEX `idx_membership_heartbeat` (`heartbeat_at`, `expires_at`);
+```
+
+`idx_membership_active` 暂予保留：审查实测它从未被优化器选中，但删除属于
+独立的清理决策，需确认无其他查询依赖后再做，本次不动。
+
 ## 2026-08-04 新增 `schema.sql` 建库脚本
 
 ### 新增
