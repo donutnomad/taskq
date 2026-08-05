@@ -662,7 +662,25 @@ go run ./internal/example/
 
 ### 生产装配
 
-生产环境先通过发布系统迁移 `queue_info`、`tasks`、`partition_config`、`taskq_partition_lock`、`taskq_partition_lock_members` 和 `taskq_membership_members` 六张表，再以 `AutoMigrate: false` 启动进程：
+生产环境先通过发布系统迁移 `taskq_queue_info`、`taskq_tasks`、`taskq_partition_config`、`taskq_partition_lock`、`taskq_partition_lock_members` 和 `taskq_membership_members` 六张表，再以 `AutoMigrate: false` 启动进程：
+
+六张表的完整建表语句见 **[`store/gormstore/schema.sql`](store/gormstore/schema.sql)**。该脚本与
+`AutoMigrate` **并存**，是同一份 schema 的两条路径：
+
+| | 建表方式 | 适用场景 |
+| --- | --- | --- |
+| `schema.sql` | DBA 执行脚本 | 生产受控建库，schema 变更纳入发布流程 |
+| `AutoMigrate` | `Config{AutoMigrate: true}` | 本地开发、测试、示例 |
+
+脚本内容不是照抄 GORM tag，而是对真实 MySQL 8 跑一遍 `AutoMigrate` 后
+`SHOW CREATE TABLE` 导出的真值（照抄 tag 会在列类型和索引名上出错）。按它建库后再跑
+`AutoMigrate` 是无操作，不会补出重复索引。
+
+`schema.sql` 用三张可配表的**默认表名**；若通过 `Config` 的 `LockTable` / `MemberTable` /
+`MembershipTable` 改名，需相应修改脚本中对应的表名。
+
+`store/gormstore/schema_guard_test.go` 会机械比对「模型」与「`schema.sql`」的表与列，
+任一方向漂移即测试失败——避免出现「测试环境靠 AutoMigrate 自动补列全绿、生产按脚本建库缺列必炸」。
 
 从 routed delivery 之前的版本升级时，MySQL 使用以下兼容迁移：
 

@@ -2,6 +2,30 @@
 
 本文件记录 TaskQ 的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 2026-08-04 新增 `schema.sql` 建库脚本
+
+### 新增
+
+`store/gormstore/schema.sql`：6 张表（`taskq_queue_info`、`taskq_tasks`、
+`taskq_partition_config`、`taskq_partition_lock`、`taskq_partition_lock_members`、
+`taskq_membership_members`）的完整 `CREATE TABLE` 语句，供生产受控建库使用。
+
+此前仓库没有任何 SQL 文件，建表只能靠 `AutoMigrate`，生产环境无法把 schema 变更纳入
+受控发布流程。
+
+**与 `AutoMigrate` 的关系是并存而非替代**：测试与示例继续走 `Config{AutoMigrate: true}`，
+生产建议 `AutoMigrate: false` 并由 DBA 执行脚本。
+
+脚本内容对真实 MySQL 8 跑 `AutoMigrate` 后 `SHOW CREATE TABLE` 导出，与 `AutoMigrate`
+建出的 DDL 逐列逐索引一致（含索引名），故按脚本建库后再跑 `AutoMigrate` 不会补出
+重复索引。三张可配表用默认表名，经 `Config` 改名时需同步修改脚本。
+
+### 测试
+
+新增 `store/gormstore/schema_guard_test.go`：用 GORM `schema.Parse` 反射模型列，
+与解析 `schema.sql` 得到的列做**表级 + 列级双向比对**，任一方向漂移即失败。
+不依赖数据库，随默认 `go test` 运行。
+
 ## 2026-08-03 表名统一加 `taskq_` 前缀
 
 ### 破坏性变更
