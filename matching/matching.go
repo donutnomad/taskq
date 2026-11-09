@@ -6,6 +6,7 @@ package matching
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -84,6 +85,10 @@ type Server struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	stopOnce   sync.Once
+	// serveDone 在 Serve 返回时关闭；serveExit 随后收到 Serve 的错误（主动 Stop 时为 nil）。
+	// 主动 Stop 也会触发关闭，调用方判断「意外退出」时要结合自身的关闭标志。
+	serveDone chan struct{}
+	serveExit chan error
 }
 
 // NewServer 创建 matching 服务实例
@@ -119,6 +124,8 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	serveDone := make(chan struct{})
+	serveExit := make(chan error, 1)
 
 	// bootstrap 全局默认行（幂等，已存在不覆盖）：分区数纯 dynamic，各节点读同一行。
 	if err := cfg.Store.EnsureDefaultPartitions(ctx, cfg.DefaultPartitions, cfg.DefaultPartitions); err != nil {
@@ -140,6 +147,8 @@ func NewServer(cfg Config) (*Server, error) {
 		listener:   fmt.Sprintf("matching-server-%d", matchingListenerSeq.Add(1)),
 		ctx:        ctx,
 		cancel:     cancel,
+		serveDone:  serveDone,
+		serveExit:  serveExit,
 	}, nil
 }
 
@@ -167,10 +176,14 @@ func (s *Server) Start() (err error) {
 	// Reconcile starts partition leaders only after socket and listener setup.
 	s.mgr.reconcile()
 	s.wg.Go(s.watchMembershipChanges)
+	serveDone, serveExit := s.serveDone, s.serveExit
 	s.wg.Go(func() {
-		if err := s.grpcServer.Serve(lis); err != nil {
+		err := s.grpcServer.Serve(lis)
+		if err != nil {
 			slog.Error("matching gRPC server stopped", "listen_addr", s.cfg.ListenAddr, "err", err)
 		}
+		serveExit <- err
+		close(serveDone)
 	})
 
 	started = true
@@ -181,6 +194,30 @@ func (s *Server) Start() (err error) {
 func (s *Server) Stop() {
 	s.stop()
 }
+
+// Wait 阻塞到 gRPC 服务端退出，返回 Serve 的错误；正常停止（Serve 返回
+// grpc.ErrServerStopped）时为 nil。从未成功 Start 的实例立即返回 nil。
+func (s *Server) Wait() error {
+	select {
+	case <-s.serveDone:
+		select {
+		case err := <-s.serveExit:
+			if errors.Is(err, grpc.ErrServerStopped) {
+				return nil
+			}
+			return err
+		default:
+		}
+		return nil
+	default:
+	}
+	return errors.New("matching: Wait called before the gRPC server started")
+}
+
+// Exited 返回一个在 gRPC 服务端退出时关闭的 channel，供调用方在 select 中等待，
+// 无需占用 goroutine。Start 未成功时它与 Stop 之后同样保持未关闭，调用方应结合
+// 自身的启动/关闭状态判断。
+func (s *Server) Exited() <-chan struct{} { return s.serveDone }
 
 func (s *Server) stop() {
 	s.stopOnce.Do(func() {
