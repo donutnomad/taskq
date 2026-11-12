@@ -2,6 +2,20 @@
 
 本文件记录 TaskQ 的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 2026-11-12 MySQL DSN 建议客户端插值
+
+Tenuto 在三副本 MySQL 集群上的 CPU profile 里 `database/sql.ctxDriverPrepare` 占 8.6%：DSN 没有
+`interpolateParams=true`，每条带参数的语句都是 prepare、execute、close 三步。TaskQ 的每任务语句（入队事务的
+`UPDATE taskq_queue_info` 与 `INSERT taskq_tasks`、投递的 `UPDATE taskq_tasks`、ack level 推进）都带参数。
+
+### 变更
+
+- README「生产装配」写明建议的 DSN 参数 `parseTime=true&loc=UTC&interpolateParams=true` 及字符集要求；TaskQ 的表
+  没有 JSON 列，`data`（LONGBLOB）在插值下以 `_binary'...'` 写入，行为不变。
+- `store/gormstore` 的 MySQL 集成测试（`-tags integration`）的 DSN 带 `interpolateParams=true`，与生产连接一致。
+- 每任务的语句没有合并：入队事务的 range CAS 与批量 INSERT、投递 UPDATE 各自承担 fencing，合并需要多语句或改
+  CAS 语义，收益只是每批一次往返。
+
 ## 2026-11-12 数据库变慢时短期限 poll 领不到任务
 
 Tenuto 的 `TestTaskQShortDeadlinePollsLoseNoDelivery`（MySQL，8 个消费者以 5–26ms 的期限反复 poll，300 个任务）单独运行

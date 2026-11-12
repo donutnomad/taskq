@@ -780,6 +780,8 @@ VALUES ('_default_', 4, 4, CURRENT_TIMESTAMP);
 
 已经部署 Slice D routing key 的环境保留现有 `routing_key` 与 `idx_tasks_visibility`，只执行 deadline 列和 deadline 索引语句。上线顺序为先创建列与索引，再部署读写 routing 字段的 TaskQ 二进制。零值 deadline 持久化为 `NULL`，表示永久按 routing key 定向；非空 deadline 到期后由原任务行直接参与普通 poll，原任务行、TaskID 和 AckLevel 保持连续。每次 delivery 生成新的 token；旧 attempt token 无法 Ack 或 Nack 后续 delivery。
 
+MySQL DSN 建议带 `parseTime=true&loc=UTC&interpolateParams=true`。`interpolateParams=true` 让驱动在客户端把参数插进 SQL 文本，每条带参数的语句（投递 UPDATE、入队 INSERT、ack level CAS 等）一次往返；不插值时 `database/sql` 对每条带参数的语句依次发 prepare、execute、close。TaskQ 的表没有 JSON 列，`data` 是 LONGBLOB，插值后以 `_binary'...'` 写入。连接字符集用 `utf8mb4`：GBK、Big5、SJIS 等字符集不能与插值同用，驱动拒绝这种 DSN。
+
 ```go
 store, err := gormstore.NewMySQL(os.Getenv("TASKQ_MYSQL_DSN"), gormstore.Config{
     AutoMigrate: false,

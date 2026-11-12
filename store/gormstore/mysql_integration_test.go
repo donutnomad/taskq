@@ -33,7 +33,7 @@ func newMySQLTestStore(t *testing.T) *Store {
 		}
 	})
 
-	dsn, err := container.ConnectionString(ctx, "parseTime=true", "loc=UTC")
+	dsn, err := container.ConnectionString(ctx, "parseTime=true", "loc=UTC", "interpolateParams=true")
 	if err != nil {
 		t.Fatal(err)
 	}
