@@ -285,7 +285,7 @@ func (f *Frontend) DequeueWithOptions(ctx context.Context, opts PollOptions) (Le
 			return Lease{}, fmt.Errorf("frontend: dequeue: %w", err)
 		}
 		rpcCtx, cancel := f.pollRPCContext(ctx, 0)
-		lease, ok, err := f.pollOwner(rpcCtx, group, 0, opts, "")
+		lease, ok, err := f.pollOwner(rpcCtx, group, 0, callerTimeoutMs(ctx), opts, "")
 		cancel()
 		ownerErrors[i] = err
 		if err == nil && ok {
@@ -367,7 +367,7 @@ func (f *Frontend) startOwnerPoll(ctx context.Context, index int, group ownerPol
 	poll := &ownerPoll{group: group, pollID: f.nextPollID(), cancel: cancel}
 	go func() {
 		defer cancel()
-		lease, found, err := f.pollOwner(rpcCtx, group, timeout, opts, poll.pollID)
+		lease, found, err := f.pollOwner(rpcCtx, group, timeout, callerTimeoutMs(ctx), opts, poll.pollID)
 		results <- ownerPollResult{index: index, group: group, lease: lease, found: found, err: err}
 	}()
 	return poll
@@ -472,7 +472,17 @@ func (f *Frontend) resolvePollGroups(startIdx, numRead int) ([]ownerPollGroup, [
 	return groups, errs
 }
 
-func (f *Frontend) pollOwner(ctx context.Context, group ownerPollGroup, timeout time.Duration, opts PollOptions, pollID string) (Lease, bool, error) {
+// callerTimeoutMs 返回 ctx 剩余的毫秒数（不足 1ms 记 1），ctx 没有期限时为 0。poll RPC 不随 ctx 结束，owner 靠它
+// 知道调用方何时离开，见 matching.PollQueueRequest.CallerTimeoutMs。
+func callerTimeoutMs(ctx context.Context) int64 {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	return max(time.Until(deadline).Milliseconds(), 1)
+}
+
+func (f *Frontend) pollOwner(ctx context.Context, group ownerPollGroup, timeout time.Duration, callerTimeoutMs int64, opts PollOptions, pollID string) (Lease, bool, error) {
 	client, err := f.pool.getClient(group.address)
 	if err != nil {
 		return Lease{}, false, fmt.Errorf("frontend: dequeue owner %q partitions %v: %w", group.address, group.partitionIDs, err)
@@ -483,6 +493,7 @@ func (f *Frontend) pollOwner(ctx context.Context, group ownerPollGroup, timeout 
 		PollTimeoutMs:       timeout.Milliseconds(),
 		AcceptedRoutingKeys: opts.AcceptedRoutingKeys,
 		PollId:              pollID,
+		CallerTimeoutMs:     callerTimeoutMs,
 	})
 	if status.Code(err) == codes.Unimplemented {
 		return f.pollPartitions(ctx, client, group.partitionIDs, timeout, opts)

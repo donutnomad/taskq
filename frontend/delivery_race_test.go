@@ -152,3 +152,54 @@ func TestFrontend_EnqueueFailsOverToAnotherOwner(t *testing.T) {
 		t.Fatalf("written partitions = %v, want only the live owner's partition 0", live.added)
 	}
 }
+
+// callerTimeoutServer 记录每次 PollQueue 携带的 caller_timeout_ms，始终应答为空。
+type callerTimeoutServer struct {
+	matching.UnimplementedMatchingServiceServer
+	timeouts chan int64
+}
+
+func (s *callerTimeoutServer) GetQueueInfo(context.Context, *matching.GetQueueInfoRequest) (*matching.GetQueueInfoResponse, error) {
+	return &matching.GetQueueInfoResponse{NumPartitions: 1}, nil
+}
+
+func (s *callerTimeoutServer) PollQueue(_ context.Context, request *matching.PollQueueRequest) (*matching.PollQueueResponse, error) {
+	s.timeouts <- request.CallerTimeoutMs
+	return &matching.PollQueueResponse{Empty: true}, nil
+}
+
+// poll RPC 不随调用方的 ctx 结束，扫描与长轮询都要把调用方剩余的时间带给 owner，owner 据此不为已离开的调用方
+// 投递；没有期限的调用方带 0。
+func TestFrontend_PollsCarryCallerTimeout(t *testing.T) {
+	server := &callerTimeoutServer{timeouts: make(chan int64, 8)}
+	frontend, err := New(Config{
+		Monitor:     &stubMonitor{resolver: newStubResolver(startFrontendPollServer(t, server))},
+		QueueName:   "caller-timeout-q",
+		DialOpts:    []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		PollTimeout: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(frontend.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := frontend.DequeueWithOptions(ctx, PollOptions{}); !errors.Is(err, ErrNoTask) {
+		t.Fatalf("dequeue error = %v, want ErrNoTask", err)
+	}
+	for _, phase := range []string{"scan", "long poll"} {
+		if got := <-server.timeouts; got <= 1000 || got > 2000 {
+			t.Fatalf("%s caller_timeout_ms = %d, want the caller's remaining ~2000ms", phase, got)
+		}
+	}
+
+	if _, err := frontend.DequeueWithOptions(context.Background(), PollOptions{}); !errors.Is(err, ErrNoTask) {
+		t.Fatalf("dequeue error = %v, want ErrNoTask", err)
+	}
+	for _, phase := range []string{"scan", "long poll"} {
+		if got := <-server.timeouts; got != 0 {
+			t.Fatalf("%s caller_timeout_ms = %d without a deadline, want 0", phase, got)
+		}
+	}
+}

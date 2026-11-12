@@ -309,11 +309,12 @@ sequenceDiagram
 poll RPC 不随调用方的 ctx 取消。owner 只能在应答之前检查调用方是否还在：检查通过之后、应答到达之前取消 RPC，gRPC 会丢掉应答，应答里的 lease 在 owner 那里已是已投递，要等 visibility timeout 才重新出现。因此 Frontend：
 
 - 长轮询的 `PollTimeoutMs` 不超过 ctx 的剩余时间，owner 按时自己结束轮询并应答；RPC 的期限是等待时长加 5s，只在 owner 失联时用到。
+- 扫描与长轮询都带 `caller_timeout_ms`（ctx 剩余的毫秒数，没有期限时为 0）。owner 从收到请求起按它计时，到期后扫描不再投递：数据库变慢时，排在分区状态转换锁上的投递轮到时调用方往往已经离开，这样的租约只能再花一次 UPDATE 归还；作废的投递与归还占满这把锁后，后来的 poll 也全部错过期限，分区上的任务一个都领不到。
 - 已有 owner 胜出或 ctx 被取消时，用 `CancelPoll` 请其余 owner 结束轮询，owner 把已领取的 lease 原地归还；在这之前已发出的应答照常读回。
 - 读回的 lease 已无人要（调用方已离开、竞速败者）时立即以 `NackTask(undelivered=true)` 归还，不消耗 attempt。
 - Owner 不支持 `CancelPoll`（旧 Matching）时退回取消 RPC。
 
-Matching 侧 `DispatchTask` 不随 poll 的 ctx 取消：驱动可能在 UPDATE 已提交之后才报告取消，此时行已隐藏而内存不知道这次投递。
+Matching 侧 `DispatchTask` 不随 poll 的 ctx 取消：驱动可能在 UPDATE 已提交之后才报告取消，此时行已隐藏而内存不知道这次投递。poll 的 ctx 在拿到状态转换锁时已结束则不发出 UPDATE，行保持可见。归还 lease 的 `UnDispatchTask` 同样不随调用方的 ctx 取消：归还方排队拿锁期间可能已经到期（一秒清理上下文），取消掉的 UPDATE 让任务留在 outstanding，而持有 lease 的一方已经放弃它。
 
 Frontend 兼容仅实现旧契约的 Matching 节点：`PollQueue` 返回 `Unimplemented` 时，同一 owner 内回退为并发 `PollTask`，这条路径仍以取消 RPC 结束败者。Matching 和 Frontend 都使用独立的一秒清理上下文回收 loser lease；调用方取消与 delivery 同时发生时，Matching 先归还已领取的 lease，再返回 `Canceled`。
 

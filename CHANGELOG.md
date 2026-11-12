@@ -2,6 +2,35 @@
 
 本文件记录 TaskQ 的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 2026-11-12 数据库变慢时短期限 poll 领不到任务
+
+Tenuto 的 `TestTaskQShortDeadlinePollsLoseNoDelivery`（MySQL，8 个消费者以 5–26ms 的期限反复 poll，300 个任务）单独运行
+通过，与其他包并行、机器满载时 15s 内只领到 299 个。SQLite 上复现（`frontend/delivery_stress_test.go`，投递与归还的
+UPDATE 前随机停顿至多 10ms）：一个分区上的任务一个都领不到，没领到的行全部可见、没有一个租约丢失；每个任务被反复
+投递、归还上百次。
+
+### 修复
+
+- 投递作废的循环：同一分区的投递与归还在状态转换锁上串行，Frontend 的扫描 RPC 不随调用方取消（期限是 5s 宽限），
+  owner 不知道调用方何时离开。数据库变慢时扫描排队拿锁，轮到它时调用方已经到期，租约到达 Frontend 后再以
+  `undelivered` 归还，又是一次排队的 UPDATE；排队越长作废越多，分区陷入只投递、归还而没有交付的状态。
+  `PollQueueRequest` 新增 `caller_timeout_ms`（Frontend 填 ctx 剩余的毫秒数），`PollQueue` 的扫描按它限时；
+  `dispatchTask` 拿到锁后 ctx 已结束就不发出 UPDATE，行保持可见（`queue/task_runtime.go`、`matching/poll_queue.go`、
+  `frontend/frontend.go`）。不带该字段的旧 Frontend 行为不变。
+- 归还被取消：`returnTask` 的 `UnDispatchTask` 不再随调用方的 ctx 取消。归还 lease 的 RPC 只等 1s，归还方在锁上排队
+  超过这个时间时 UPDATE 以 ctx 错误失败，任务留在 outstanding，而 Frontend 已经放弃这个 lease，任务要等 visibility
+  timeout 才重新出现。这条路径在上面的复现里没有出现，是同一排队条件下的租约丢失。
+
+### 测试
+
+- `queue/late_poller_test.go`：poller 在锁上排队期间到期时不投递、下一次 poll 领到该行；归还方在锁上排队期间到期时归还
+  照常完成。修复前分别以领到 `"late"` 与 `undispatch task 1: context deadline exceeded` 失败。
+- `matching/caller_timeout_test.go`：扫描读到行时 `caller_timeout_ms` 已到期，应答为空、行原样留给下一次 poll；修复前
+  应答带着该任务。
+- `frontend/delivery_race_test.go` 的 `TestFrontend_PollsCarryCallerTimeout`：扫描与长轮询都带调用方剩余时间，无期限时为 0。
+- `frontend/delivery_stress_test.go`（默认跳过，`TASKQ_STRESS=1` 运行）：20 轮、每轮 300 个任务全部在 15s 内领到；
+  修复前第一轮只领到 151 个。失败信息区分「已投递但无人持有」与「可见但没被领到」。
+
 ## 2026-11-12 内存状态能证明没有可见行时不读库
 
 Tenuto 的压测（3 个 matching 副本、闭环并发 10）里每秒约六千条 SELECT，大部分来自 poll：一次 `PollQueue` 长轮询对每个

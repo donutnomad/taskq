@@ -293,9 +293,12 @@ type PollQueueRequest struct {
 	PollTimeoutMs       int64                  `protobuf:"varint,3,opt,name=poll_timeout_ms,json=pollTimeoutMs,proto3" json:"poll_timeout_ms,omitempty"`
 	AcceptedRoutingKeys []string               `protobuf:"bytes,4,rep,name=accepted_routing_keys,json=acceptedRoutingKeys,proto3" json:"accepted_routing_keys,omitempty"`
 	// poll_id 由调用方生成、在一个 owner 上唯一；非空时这次轮询可被 CancelPoll 结束。
-	PollId        string `protobuf:"bytes,5,opt,name=poll_id,json=pollId,proto3" json:"poll_id,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PollId string `protobuf:"bytes,5,opt,name=poll_id,json=pollId,proto3" json:"poll_id,omitempty"`
+	// caller_timeout_ms 是发出请求时调用方剩余的等待时间，0 表示调用方不设期限。owner 从收到请求起按它计时，
+	// 到期后不再为这次轮询投递任务：调用方已经离开，投递出的租约只会被归还。
+	CallerTimeoutMs int64 `protobuf:"varint,6,opt,name=caller_timeout_ms,json=callerTimeoutMs,proto3" json:"caller_timeout_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *PollQueueRequest) Reset() {
@@ -361,6 +364,13 @@ func (x *PollQueueRequest) GetPollId() string {
 		return x.PollId
 	}
 	return ""
+}
+
+func (x *PollQueueRequest) GetCallerTimeoutMs() int64 {
+	if x != nil {
+		return x.CallerTimeoutMs
+	}
+	return 0
 }
 
 type PollQueueResponse struct {
@@ -869,14 +879,15 @@ const file_matching_matching_proto_rawDesc = "" +
 	"\vrouting_key\x18\x04 \x01(\tR\n" +
 	"routingKey\x12E\n" +
 	"\x10routing_deadline\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\x0froutingDeadline\x12)\n" +
-	"\x10routing_fallback\x18\x06 \x01(\bR\x0froutingFallback\"\xcb\x01\n" +
+	"\x10routing_fallback\x18\x06 \x01(\bR\x0froutingFallback\"\xf7\x01\n" +
 	"\x10PollQueueRequest\x12\x1d\n" +
 	"\n" +
 	"queue_name\x18\x01 \x01(\tR\tqueueName\x12#\n" +
 	"\rpartition_ids\x18\x02 \x03(\x05R\fpartitionIds\x12&\n" +
 	"\x0fpoll_timeout_ms\x18\x03 \x01(\x03R\rpollTimeoutMs\x122\n" +
 	"\x15accepted_routing_keys\x18\x04 \x03(\tR\x13acceptedRoutingKeys\x12\x17\n" +
-	"\apoll_id\x18\x05 \x01(\tR\x06pollId\"\x89\x02\n" +
+	"\apoll_id\x18\x05 \x01(\tR\x06pollId\x12*\n" +
+	"\x11caller_timeout_ms\x18\x06 \x01(\x03R\x0fcallerTimeoutMs\"\x89\x02\n" +
 	"\x11PollQueueResponse\x12\x14\n" +
 	"\x05empty\x18\x01 \x01(\bR\x05empty\x12!\n" +
 	"\fpartition_id\x18\x02 \x01(\x05R\vpartitionId\x12\x12\n" +

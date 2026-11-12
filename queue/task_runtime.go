@@ -69,6 +69,11 @@ func (rt *taskRuntime) dispatchTask(ctx context.Context, row *TaskRow) (*TaskRow
 	rt.transitionMu.Lock()
 	defer rt.transitionMu.Unlock()
 
+	// 排在别的状态转换之后拿到锁时 poller 可能已经离开：不再投递，行保持可见。否则租约注定作废，还要再花一次
+	// 归还的 UPDATE；数据库变慢时这类作废的投递与归还排满这把锁，后来的 poll 也错过期限，分区上的任务一个都领不到。
+	if err := ctx.Err(); err != nil {
+		return nil, "", fmt.Errorf("dispatch task %d: %w", row.TaskID, err)
+	}
 	dispatchAt := time.Now()
 	// 不随 poll 的 ctx 取消：取消可能在 UPDATE 已提交后才被驱动报告，此时行在库里已隐藏而内存不知道
 	// 这次投递，任务要等可见性超时才重新出现。投递完成后由调用方按 ctx 决定交付还是归还租约。
@@ -134,7 +139,9 @@ func (rt *taskRuntime) returnTask(ctx context.Context, taskID, deliveryID int64)
 		return err
 	}
 
-	if err := rt.pq.store.UnDispatchTask(ctx, rt.pq.queueName, rt.pq.partitionID, taskID); err != nil {
+	// 不随调用方的 ctx 取消：归还方排队拿锁期间可能已经到期（归还租约的 RPC 只等 1s），取消掉的 UPDATE 让任务
+	// 留在 outstanding，而唯一持有租约的一方已经放弃它，任务要等可见性超时才重新出现。
+	if err := rt.pq.store.UnDispatchTask(context.WithoutCancel(ctx), rt.pq.queueName, rt.pq.partitionID, taskID); err != nil {
 		rt.state.restoreOutstanding(taskID, ot)
 		return fmt.Errorf("undispatch task %d: %w", taskID, err)
 	}

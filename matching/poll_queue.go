@@ -141,7 +141,14 @@ func (h *matchingHandler) PollQueue(ctx context.Context, request *PollQueueReque
 		}
 	}
 
-	candidate, scanErrors := scanQueuePollTargets(ctx, targets, opts)
+	// 调用方期限到期之后扫描不再投递；RPC 的 ctx 比调用方的期限长（见 frontend 的 pollRPCContext），不能代替它。
+	scanCtx := ctx
+	if request.CallerTimeoutMs > 0 {
+		var cancel context.CancelFunc
+		scanCtx, cancel = context.WithTimeout(ctx, time.Duration(request.CallerTimeoutMs)*time.Millisecond)
+		defer cancel()
+	}
+	candidate, scanErrors := scanQueuePollTargets(scanCtx, targets, opts)
 	diagnostics = append(diagnostics, scanErrors...)
 	if candidate != nil {
 		return finishQueuePoll(ctx, stop, []queuePollCandidate{*candidate})
@@ -218,6 +225,10 @@ func scanQueuePollTargets(
 		target := targets[i]
 		lease, ok, mark, err := target.handle.TryPollAfterMark(ctx, opts)
 		targets[i].mark = mark
+		if err != nil && ctx.Err() != nil {
+			// 调用方已经离开：其余分区也不再扫描，这不是分区的故障。
+			return nil, diagnostics
+		}
 		if err != nil {
 			diagnostics = append(diagnostics, fmt.Errorf("partition %d: %w", target.partitionID, err))
 			continue

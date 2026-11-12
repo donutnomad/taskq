@@ -49,6 +49,9 @@ message PollQueueRequest {
     repeated string accepted_routing_keys = 4;
     // poll_id 由调用方生成、在一个 owner 上唯一；非空时这次轮询可被 CancelPoll 结束。
     string poll_id = 5;
+    // caller_timeout_ms 是发出请求时调用方剩余的等待时间，0 表示调用方不设期限。owner 从收到请求起按它计时，
+    // 到期后不再为这次轮询投递任务：调用方已经离开，投递出的租约只会被归还。
+    int64 caller_timeout_ms = 6;
 }
 message PollQueueResponse {
     bool empty = 1;
