@@ -67,6 +67,16 @@ func (s *transitionBarrierStore) ResetTimedOutTasks(
 	}
 }
 
+// addUnmatchedRoutedTask 写入一条只有 routing key "elsewhere" 的 poller 才能领取的任务。窗口里有一条本进程没投递过的
+// 行，后续不带 key 的 poll 因此必须读库，测试才能观察到读取与进行中的状态转换的竞争；没有它时内存记账证明窗口里
+// 没有可见行，poll 不读库，竞争不会发生。
+func addUnmatchedRoutedTask(t *testing.T, pq *PhysicalQueue) {
+	t.Helper()
+	if err := pq.AddTaskWithOptions(context.Background(), []byte("unmatched"), EnqueueOptions{RoutingKey: "elsewhere"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newTransitionTestQueue(t *testing.T, store Store, visTimeout time.Duration) *PhysicalQueue {
 	t.Helper()
 	pq, err := newPhysicalQueue(context.Background(), store, "delivery-attempt-q", 0, visTimeout, defaultMaxAttempts, "owner")
@@ -181,6 +191,7 @@ func TestPhysicalQueue_NackTransitionPreventsConcurrentRedispatch(t *testing.T) 
 	if err := pq.AddTask(ctx, []byte("nack-race")); err != nil {
 		t.Fatal(err)
 	}
+	addUnmatchedRoutedTask(t, pq)
 	_, firstToken, ok, err := pq.TryPoll(ctx)
 	if err != nil || !ok {
 		t.Fatalf("first poll ok = %v, err = %v", ok, err)
@@ -256,6 +267,7 @@ func TestPhysicalQueue_VisibilityResetPreventsConcurrentRedispatch(t *testing.T)
 	if err := pq.AddTask(ctx, []byte("visibility-race")); err != nil {
 		t.Fatal(err)
 	}
+	addUnmatchedRoutedTask(t, pq)
 	if _, _, ok, err := pq.TryPoll(ctx); err != nil || !ok {
 		t.Fatalf("first poll ok = %v, err = %v", ok, err)
 	}

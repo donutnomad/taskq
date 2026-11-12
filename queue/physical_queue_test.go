@@ -756,7 +756,7 @@ func TestPhysicalQueue_SyncMatch(t *testing.T) {
 	ctx := context.Background()
 
 	// 先注册 waiter
-	waiter, err := pq.registerWaiter(PollOptions{})
+	waiter, err := pq.registerWaiter(PollOptions{}, PollMark{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -819,7 +819,7 @@ func TestPhysicalQueue_BlockingPoll(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	waiter, err := pq.registerWaiter(PollOptions{})
+	waiter, err := pq.registerWaiter(PollOptions{}, PollMark{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -845,7 +845,7 @@ func TestPhysicalQueue_RegisterWaiterImmediatelyGetsReadableTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	waiter, err := pq.registerWaiter(PollOptions{})
+	waiter, err := pq.registerWaiter(PollOptions{}, PollMark{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -84,7 +84,7 @@ type Store interface {
 | `queue_info` | queue_name, partition_id, range_id, ack_level, next_task_id | 分区元数据 |
 | `tasks` | task_id, queue_name, partition_id, routing_key, routing_deadline, data, created_at, dispatched_at | 任务数据与定向 fallback |
 | `taskq_partition_lock` | lock_name, leader_ip, expire_at_ms, version | `dbleader` 分区锁 |
-| `taskq_partition_lock_members` | lock_name, instance_id, node_ip, last_seen | `dbleader` 成员心跳 |
+| `taskq_partition_lock_members` | lock_name, instance_id, node_ip, last_seen | `dbleader` 成员心跳（只供观测；每 5s 刷新、每 15s 清理过期行，判活阈值 15s） |
 | `taskq_membership_members` | service_name, rpc_address, rpc_port, heartbeat_at, expires_at | `membership.Monitor` 服务发现心跳 |
 
 #### PhysicalQueue — 单分区核心
@@ -121,7 +121,7 @@ graph TB
 | **deliveryState** | 内存中维护 outstanding/redelivery/acked 集合，追踪 ackLevel/maxReadLevel | - |
 | **waiterRegistry** | 管理长轮询阶段注册的等待者 | - |
 | **taskGC** | 根据 ackLevel 删除已确认的任务，通过 CAS 持久化 ackLevel | LeaderTask 内每 5s 执行一次 |
-| **visibilityScanner** | 检测超时的已分发任务，移入 redelivery 队列 | LeaderTask 内每 1s 执行一次 |
+| **visibilityScanner** | 检测超时的已分发任务，移入 redelivery 队列；内存证明没有可超时的投递时不读库 | LeaderTask 内每 1s 执行一次 |
 多分区分配不在 `queue` 包内完成。真实链路是：
 
 - `membership` 负责一致性哈希，把 `queue/partition` 映射到节点
@@ -318,6 +318,18 @@ Matching 侧 `DispatchTask` 不随 poll 的 ctx 取消：驱动可能在 UPDATE 
 Frontend 兼容仅实现旧契约的 Matching 节点：`PollQueue` 返回 `Unimplemented` 时，同一 owner 内回退为并发 `PollTask`，这条路径仍以取消 RPC 结束败者。Matching 和 Frontend 都使用独立的一秒清理上下文回收 loser lease；调用方取消与 delivery 同时发生时，Matching 先归还已领取的 lease，再返回 `Canceled`。
 
 `PollQueue` 将一次 Dequeue 的 RPC fan-out 从分区数量 `O(partitions)` 收敛为 Matching owner 数量 `O(owners)`；快速阶段顺序扫描 owner，长轮询阶段并发等待 owner。
+
+### 读库的时机
+
+poll、waiter 登记、写入后的 sync match 与可见性扫描都只在分区的内存状态不能证明「没有可见行」时读库：
+
+- **窗口记账**：待读窗口 `(ackLevel, maxReadLevel]` 里的每个 ID，要么在本进程的 outstanding（已投递）、respooling（重写中）、acked（已确认）集合里——这些行对任何 poller 都不可见——要么未知（新写入的、redelivery 里的、接管分区之前写入的）。三个集合的大小之和等于窗口长度时，poll 与投递尝试不读库。
+- **扫描之后登记 waiter**：`PollQueue` 在扫描每个分区之前记下分区的可见性序号（`PhysicalQueue.PollMark`），登记 waiter 时（`RegisterWaiterAfterScan`）序号没变就不再读一次库。新行落库、租约原地归还、respool 失败落回 redelivery、可见性扫描放出行，都先改状态、序号加一，再向已登记的 waiter 投递，因此扫描与登记之间到达的行由登记补读。定向行在 routing deadline 到达时对普通 poller 可见不是状态变化：与早先登记的 waiter 一样，由每秒一次的可见性扫描的投递尝试交给它们。
+- **不确定的归还**：放回可见状态的 UPDATE 报错时任务回到 outstanding 并记为 uncertain（UPDATE 可能已提交），记账把它算作未知，照常读库。
+- **读库不串行**：同一分区的 poll 各自读库。poll 的期限可以短到几毫秒，排在另一次读库之后的 poll 会在拿到读取机会之前到期；并发 poller 读到同一行时只有一个投递成功，其余的再读一次。
+- **可见性扫描**：窗口里没有未知行、也没有投递早于 `now - visTimeout + 1s` 时跳过 `ResetTimedOutTasks`（它本来也不会重置任何行；1s 余量吸收库里 `dispatched_at` 的毫秒精度）。
+
+GC 每 5 秒的 `AdvanceAckLevelAndDeleteTasks` 不受影响：它的 `range_id` CAS 也是空闲分区上发现 ownership 丢失的途径。
 
 ### Ack / Nack 流程
 

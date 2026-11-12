@@ -20,14 +20,24 @@ type deliveryState struct {
 	outstanding map[int64]*outstandingTask
 	// respooling 中的任务正在以新 taskID 重写，新行落库前必须阻止 ackLevel 推进。
 	respooling map[int64]*outstandingTask
+	// uncertain 是 outstanding 里库中可见性不确定的任务：放回可见状态的 UPDATE 报错后任务回到 outstanding，
+	// 而 UPDATE 可能已经提交（驱动在提交后才报告取消或超时）。窗口记账把它们算作未知，照常读库；任务再次
+	// 投递、确认或离开 outstanding 时移出。
+	uncertain  map[int64]struct{}
 	redelivery []*TaskRow
 	acked      map[int64]bool
+
+	// visibleSeq 在每次可能让行对 poller 变为可见的状态变化之后加一：新行落库、租约原地归还、respool 失败落回
+	// redelivery、可见性扫描重置了行。poll 在扫描前记下它，注册 waiter 时它没有变就说明扫描之后没有新的可见行，
+	// 不必再读一次库。
+	visibleSeq uint64
 }
 
 func newDeliveryState(ackLevel int64) *deliveryState {
 	return &deliveryState{
 		ackLevel:    ackLevel,
 		outstanding: make(map[int64]*outstandingTask),
+		uncertain:   make(map[int64]struct{}),
 		respooling:  make(map[int64]*outstandingTask),
 		acked:       make(map[int64]bool),
 	}
@@ -39,17 +49,74 @@ func (s *deliveryState) setMaxReadLevel(level int64) {
 
 	if level > s.maxReadLevel {
 		s.maxReadLevel = level
+		s.visibleSeq++
 	}
 }
 
+// markVisible 记录一次本进程内存之外的可见性变化（可见性扫描把行放回了可见状态）。
+func (s *deliveryState) markVisible() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.visibleSeq++
+}
+
+func (s *deliveryState) visibleSeqValue() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.visibleSeq
+}
+
+// nextReadWindow 返回待读窗口 (ackLevel, maxReadLevel]。ok=false 表示窗口里没有可能对 poller 可见的行，不必读库。
 func (s *deliveryState) nextReadWindow() (int64, int64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.ackLevel >= s.maxReadLevel {
+	if s.unknownLocked() == 0 {
 		return 0, 0, false
 	}
 	return s.ackLevel, s.maxReadLevel, true
+}
+
+// unknownLocked 返回窗口 (ackLevel, maxReadLevel] 里本进程不能证明已隐藏的 task ID 个数。
+//
+// 窗口里的每个 ID 要么在本进程的某个集合里，要么不在：outstanding（已投递，库里 dispatched_at 非空；uncertain 里的除外）、
+// respooling（老行已隐藏，新行写入中）、acked（库里已隐藏或已随 respool 删除）三者互斥，且都只含窗口内的 ID，
+// 它们的行对任何 poller 都不可见。其余 ID——redelivery 里的、本进程从未读过的（新写入的、接管分区前写入的）、
+// 已被 respool 删除而 ackLevel 尚未越过的——都可能可见，必须读库。计数只会把隐藏的行算作未知、从不反过来，
+// 结果为 0 时窗口里确定没有可见行。
+func (s *deliveryState) unknownLocked() int64 {
+	window := s.maxReadLevel - s.ackLevel
+	if window <= 0 {
+		return 0
+	}
+	hidden := int64(len(s.outstanding) - len(s.uncertain) + len(s.respooling) + len(s.acked))
+	if hidden >= window {
+		if hidden > window {
+			// 三个集合只含窗口内互不相同的 ID，超过窗口说明记账有误：按全部未知处理，照常读库。
+			return window
+		}
+		return 0
+	}
+	return window - hidden
+}
+
+// mayHaveTimedOut 报告可见性扫描能否找到超时的投递：窗口里有本进程不认识的行（可能由上一个 owner 投递），或者
+// 有 outstanding 投递的时刻早于 now-visTimeout+slack。acked 与 respooling 的行被扫描排除，ackLevel 及以下不扫描；
+// 返回 false 时扫描必然什么都不重置。slack 吸收内存与库里 dispatched_at 精度的差异。
+func (s *deliveryState) mayHaveTimedOut(now time.Time, visTimeout, slack time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.unknownLocked() > 0 {
+		return true
+	}
+	cutoff := now.Add(-visTimeout + slack)
+	for _, ot := range s.outstanding {
+		if ot.dispatchAt.Before(cutoff) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *deliveryState) markDispatched(row *TaskRow, dispatchAt time.Time, deliveryID int64) {
@@ -61,6 +128,7 @@ func (s *deliveryState) markDispatched(row *TaskRow, dispatchAt time.Time, deliv
 		dispatchAt: dispatchAt,
 		deliveryID: deliveryID,
 	}
+	delete(s.uncertain, row.TaskID)
 	for i, pending := range s.redelivery {
 		if pending.TaskID == row.TaskID {
 			s.redelivery = append(s.redelivery[:i], s.redelivery[i+1:]...)
@@ -82,6 +150,7 @@ func (s *deliveryState) ack(taskID, deliveryID int64) error {
 	}
 
 	delete(s.outstanding, taskID)
+	delete(s.uncertain, taskID)
 	s.acked[taskID] = true
 	s.advanceAckLevelLocked()
 	return nil
@@ -99,6 +168,7 @@ func (s *deliveryState) beginNack(taskID, deliveryID int64) (*outstandingTask, e
 		return nil, ErrStaleToken
 	}
 	delete(s.outstanding, taskID)
+	delete(s.uncertain, taskID)
 	return ot, nil
 }
 
@@ -106,13 +176,18 @@ func (s *deliveryState) finishNack(ot *outstandingTask) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.redelivery = append(s.redelivery, ot.row)
+	s.visibleSeq++
 }
 
+// restoreOutstanding 在放回可见状态的 UPDATE 报错后把任务放回 outstanding。UPDATE 可能已经提交，任务记为
+// uncertain：窗口记账把它算作未知、照常读库，读到可见的行就重新投递。
 func (s *deliveryState) restoreOutstanding(taskID int64, ot *outstandingTask) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.respooling, taskID)
 	s.outstanding[taskID] = ot
+	s.uncertain[taskID] = struct{}{}
+	s.visibleSeq++
 }
 
 // beginRespool 校验投递身份后把任务移入 respooling，等待新行落库。
@@ -146,6 +221,7 @@ func (s *deliveryState) moveToRespooling(taskID int64) (*outstandingTask, bool) 
 
 func (s *deliveryState) beginRespoolLocked(taskID int64, ot *outstandingTask) {
 	delete(s.outstanding, taskID)
+	delete(s.uncertain, taskID)
 	s.respooling[taskID] = ot
 }
 
@@ -170,6 +246,7 @@ func (s *deliveryState) abortRespool(taskID int64) {
 	}
 	delete(s.respooling, taskID)
 	s.redelivery = append(s.redelivery, ot.row)
+	s.visibleSeq++
 }
 
 // resetExclusionIDs 返回不允许被可见性扫描重置为可见的任务 ID。

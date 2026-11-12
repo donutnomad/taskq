@@ -56,7 +56,7 @@ func TestPhysicalQueue_ReturnLeaseWakesWaiters(t *testing.T) {
 		t.Fatalf("poll ok = %v, err = %v", ok, err)
 	}
 
-	waiter, err := pq.registerWaiter(PollOptions{})
+	waiter, err := pq.registerWaiter(PollOptions{}, PollMark{})
 	if err != nil {
 		t.Fatal(err)
 	}

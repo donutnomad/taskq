@@ -354,6 +354,29 @@ func (h *partitionHandle) TryPollWithOptions(ctx context.Context, opts queue.Pol
 	return pq.TryPollWithOptions(ctx, opts)
 }
 
+// TryPollAfterMark 与 TryPollWithOptions 相同，另外返回扫描开始前的 PollMark，供 RegisterWaiterAfterScan 使用。
+func (h *partitionHandle) TryPollAfterMark(ctx context.Context, opts queue.PollOptions) (queue.Lease, bool, queue.PollMark, error) {
+	pq, err := h.getActive()
+	if err != nil {
+		return queue.Lease{}, false, queue.PollMark{}, err
+	}
+	mark := pq.PollMark()
+	lease, ok, err := pq.TryPollWithOptions(ctx, opts)
+	if err != nil {
+		return queue.Lease{}, false, queue.PollMark{}, err
+	}
+	return lease, ok, mark, nil
+}
+
+// RegisterWaiterAfterScan 登记 waiter；mark 来自同一次 poll 的 TryPollAfterMark，见 queue.PhysicalQueue.RegisterWaiterAfterScan。
+func (h *partitionHandle) RegisterWaiterAfterScan(opts queue.PollOptions, mark queue.PollMark) (*queue.PollWaiter, error) {
+	pq, err := h.getActive()
+	if err != nil {
+		return nil, err
+	}
+	return pq.RegisterWaiterAfterScan(opts, mark)
+}
+
 func (h *partitionHandle) RegisterWaiter() (*queue.PollWaiter, error) {
 	return h.RegisterWaiterWithOptions(queue.PollOptions{})
 }
@@ -404,7 +427,7 @@ func newPartitionManager(
 	ctx, cancel := context.WithCancel(ctx)
 	return &partitionManager{
 		store:       store,
-		lockStore:   lockStore,
+		lockStore:   newMemberThrottledLockStore(lockStore),
 		selfAddr:    selfAddr,
 		leaseOwner:  leaseOwner,
 		resolver:    resolver,

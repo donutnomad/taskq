@@ -176,16 +176,33 @@ func (pq *PhysicalQueue) tryPollWithOptions(ctx context.Context, opts PollOption
 	return row, token, ok, nil
 }
 
-func (pq *PhysicalQueue) registerWaiter(opts PollOptions) (*PollWaiter, error) {
+func (pq *PhysicalQueue) registerWaiter(opts PollOptions, mark PollMark) (*PollWaiter, error) {
 	normalized, err := opts.Normalize()
 	if err != nil {
 		return nil, err
 	}
 	waiter := pq.waiters.add(normalized)
-	if !pq.IsClosed() {
-		pq.runtime.tryDeliverToWaiters()
+	if pq.IsClosed() {
+		return waiter, nil
 	}
+	// waiter 先登记、再读 visibleSeq：让行可见的一方先改状态并加一、再投递给已登记的 waiter。读到的值没变时，
+	// 扫描之后的可见性变化都还没发生，它们的投递会看到这个 waiter；变了就由这里补读一次。
+	if mark.pq == pq && pq.runtime.state.visibleSeqValue() == mark.seq {
+		return waiter, nil
+	}
+	pq.runtime.tryDeliverToWaiters()
 	return waiter, nil
+}
+
+// PollMark 记录一次扫描开始时分区的可见性序号，见 RegisterWaiterAfterScan。零值表示没有扫描。
+type PollMark struct {
+	pq  *PhysicalQueue
+	seq uint64
+}
+
+// PollMark 在 TryPollWithOptions 之前调用，记下扫描开始时的可见性序号。
+func (pq *PhysicalQueue) PollMark() PollMark {
+	return PollMark{pq: pq, seq: pq.runtime.state.visibleSeqValue()}
 }
 
 func (pq *PhysicalQueue) wakeWaiters() {
@@ -318,13 +335,22 @@ func (pq *PhysicalQueue) TryPollWithOptions(ctx context.Context, opts PollOption
 
 // RegisterWaiter registers an atomic delivery claim for a long poll.
 func (pq *PhysicalQueue) RegisterWaiter() *PollWaiter {
-	waiter, _ := pq.registerWaiter(PollOptions{})
+	waiter, _ := pq.registerWaiter(PollOptions{}, PollMark{})
 	return waiter
 }
 
 // RegisterWaiterWithOptions registers a routed long-poll delivery claim.
 func (pq *PhysicalQueue) RegisterWaiterWithOptions(opts PollOptions) (*PollWaiter, error) {
-	return pq.registerWaiter(opts)
+	return pq.registerWaiter(opts, PollMark{})
+}
+
+// RegisterWaiterAfterScan 在同一次 poll 用相同 opts 扫描过本分区之后登记 waiter。mark 是扫描前的 PollMark：
+// 之后没有任何行变为可见时不再读库，否则与 RegisterWaiterWithOptions 一样立即尝试投递。扫描失败时传零值。
+//
+// 定向行在 routing deadline 到达时对普通 poller 可见，这不是状态变化：与早先登记的 waiter 一样，由可见性扫描
+// 每轮的投递尝试交给它们。
+func (pq *PhysicalQueue) RegisterWaiterAfterScan(opts PollOptions, mark PollMark) (*PollWaiter, error) {
+	return pq.registerWaiter(opts, mark)
 }
 
 // Ack 确认消费完成

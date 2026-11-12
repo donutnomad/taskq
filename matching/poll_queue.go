@@ -93,6 +93,8 @@ func (h *matchingHandler) CancelPoll(_ context.Context, request *CancelPollReque
 type queuePollTarget struct {
 	partitionID int32
 	handle      *partitionHandle
+	// mark 是本次 poll 扫描这个分区之前的可见性序号；扫描失败或没有扫描时为零值，登记 waiter 时照常读库。
+	mark queue.PollMark
 }
 
 type queuePollWaiter struct {
@@ -212,8 +214,10 @@ func scanQueuePollTargets(
 	opts queue.PollOptions,
 ) (*queuePollCandidate, []error) {
 	var diagnostics []error
-	for _, target := range targets {
-		lease, ok, err := target.handle.TryPollWithOptions(ctx, opts)
+	for i := range targets {
+		target := targets[i]
+		lease, ok, mark, err := target.handle.TryPollAfterMark(ctx, opts)
+		targets[i].mark = mark
 		if err != nil {
 			diagnostics = append(diagnostics, fmt.Errorf("partition %d: %w", target.partitionID, err))
 			continue
@@ -238,7 +242,7 @@ func registerQueuePollWaiters(targets []queuePollTarget, opts queue.PollOptions)
 	waiters := make([]queuePollWaiter, 0, len(targets))
 	var diagnostics []error
 	for _, target := range targets {
-		waiter, err := target.handle.RegisterWaiterWithOptions(opts)
+		waiter, err := target.handle.RegisterWaiterAfterScan(opts, target.mark)
 		if err != nil {
 			diagnostics = append(diagnostics, fmt.Errorf("partition %d: %w", target.partitionID, err))
 			continue

@@ -2,6 +2,44 @@
 
 本文件记录 TaskQ 的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 2026-11-12 内存状态能证明没有可见行时不读库
+
+Tenuto 的压测（3 个 matching 副本、闭环并发 10）里每秒约六千条 SELECT，大部分来自 poll：一次 `PollQueue` 长轮询对每个
+分区先扫描一次、登记 waiter 时再读一次（4 个分区 8 条）；只要窗口里有一条未确认的任务，即使它已经投递出去、对谁都
+不可见，读取照常发生。可见性扫描每秒对每个分区开一个事务读一次库。
+
+### 变更
+
+- 窗口记账（`queue/delivery_state.go`）：待读窗口里的每个 ID 都在 outstanding、respooling、acked 之一时窗口里没有可见行，
+  poll、waiter 登记与写入后的 sync match 不读库。
+- `PollQueue` 扫描每个分区前记下可见性序号（新增 `PhysicalQueue.PollMark`、`RegisterWaiterAfterScan`），之后没有行变为
+  可见时登记 waiter 不再读库；新行落库、租约归还、respool 失败、可见性扫描放出行都让序号加一，扫描与登记之间到达的行
+  由登记补读。
+- 放回可见状态的 UPDATE 报错时任务回到 outstanding，记为 uncertain（UPDATE 可能已提交），窗口记账把它算作未知、照常读库。
+- 同一分区的读库不串行：poll 的期限只有几毫秒到一秒，排在另一次读库之后的 poll 拿到读取机会时期限已到，读取以 ctx 错误
+  结束；poll 持续到达时分区上的任务全部领不到（Tenuto 的 `TestTaskQShortDeadlinePollsLoseNoDelivery` 在 MySQL 上 300
+  个只领到 202 个）。并发 poller 读到同一行时只有一个投递成功，其余的再读一次，与此前相同。
+- 可见性扫描在窗口里没有未知行、也没有投递接近超时时跳过 `ResetTimedOutTasks`。
+- 分区锁成员行（`taskq_partition_lock_members`）按自己的节拍写库：dbleader 按锁的续约心跳（1s）刷新成员行、清理过期成员，
+  每个分区每秒一条 INSERT、一条 DELETE；成员行只供观测，判活阈值 15s。`matching/member_throttle.go` 改为每 5s 刷新、每 15s
+  清理，行在阈值内保持活跃，还容忍两次刷新失败；锁的获取、续约与释放不变。12 个分区的空闲写入从约 36 条/秒降到约 15 条/秒。
+- 行为不变：投递次序、at-least-once、fencing、ack/nack/respool 语义与超时重投都与此前相同；定向行的 routing deadline
+  回落仍由每秒一次的可见性扫描交给已登记的 waiter。
+
+### 测试
+
+- `queue/read_budget_test.go`：每行都已投递或确认时 poll、投递尝试与可见性扫描都不读库，新行照常唤醒 waiter；扫描之后
+  没有变化时登记不重读、有新行时补读并投递、别的分区实例的 mark 不跳过读取；投递接近超时时扫描照常读库并 respool。
+- `matching/poll_read_budget_test.go`（SQLite 上的真实 SQL）：4 个分区的行都在投递中时一次 200ms 长轮询读任务表 0 次
+  （此前 8 次），分区里只有别的 routing key 的行时读 4 次（此前 8 次）。
+- 既有并发测试 `TestPhysicalQueue_{Nack,VisibilityReset}TransitionPreventsConcurrentRedispatch` 加一条不匹配的定向行，
+  让 poll 仍然读库、竞争照常发生。
+- `matching/member_throttle_test.go`：16 次心跳刷新 4 次、清理 2 次，不同的锁各自计时，写入失败的心跳下一次照常写。
+- `queue/read_budget_test.go` 的 `TestPhysicalQueue_PollDoesNotQueueBehindAnotherPollsRead`（一次读库进行中时，另一个 200ms
+  期限的 poll 在期限内领到任务；读取串行时以 `context deadline exceeded` 失败）与
+  `TestPhysicalQueue_ReturnCommittedDespiteErrorStaysPollable`（归还的 UPDATE 已提交而驱动报错，任务仍可读；不记 uncertain
+  时读不到）。
+
 ## 2026-11-12 调用方离开时在途的 lease 不再隐身；写入换 owner
 
 Tenuto 的无故障压测（3 个 matching 副本、Workflow Task 长轮询每秒以新期限重新 poll）里 8 个任务已入队却没有被

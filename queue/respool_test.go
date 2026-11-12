@@ -316,10 +316,10 @@ func TestPhysicalQueue_WaiterDisappearedDoesNotConsumeAttempt(t *testing.T) {
 	ctx := context.Background()
 
 	// worker-a 的 waiter 不接受 worker-b 的任务，worker-b 的 waiter 撤销后投递必然落空。
-	if _, err := pq.registerWaiter(PollOptions{AcceptedRoutingKeys: []string{"worker-a"}}); err != nil {
+	if _, err := pq.registerWaiter(PollOptions{AcceptedRoutingKeys: []string{"worker-a"}}, PollMark{}); err != nil {
 		t.Fatal(err)
 	}
-	vanishing, err := pq.registerWaiter(PollOptions{AcceptedRoutingKeys: []string{"worker-b"}})
+	vanishing, err := pq.registerWaiter(PollOptions{AcceptedRoutingKeys: []string{"worker-b"}}, PollMark{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -378,10 +378,10 @@ func TestPhysicalQueue_NackFromWriterGoroutineDoesNotDeadlock(t *testing.T) {
 		t.Fatalf("poll ok = %v, err = %v", ok, err)
 	}
 
-	if _, err := pq.registerWaiter(PollOptions{AcceptedRoutingKeys: []string{"worker-a"}}); err != nil {
+	if _, err := pq.registerWaiter(PollOptions{AcceptedRoutingKeys: []string{"worker-a"}}, PollMark{}); err != nil {
 		t.Fatal(err)
 	}
-	vanishing, err := pq.registerWaiter(PollOptions{AcceptedRoutingKeys: []string{"worker-b"}})
+	vanishing, err := pq.registerWaiter(PollOptions{AcceptedRoutingKeys: []string{"worker-b"}}, PollMark{})
 	if err != nil {
 		t.Fatal(err)
 	}

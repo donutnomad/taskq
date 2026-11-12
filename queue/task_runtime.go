@@ -177,9 +177,18 @@ func (rt *taskRuntime) tryRespoolLocked(taskID int64, ot *outstandingTask) bool 
 // visibilityResetBatch 对齐，使一轮扫描至多触发一条批量重置 UPDATE。
 const visibilityResetScanLimit = 500
 
+// visibilityClockSlack 是判断「内存里没有超时投递」时留出的余量：库里的 dispatched_at 只有毫秒精度，
+// 余量让扫描宁可早一轮读库，也不会漏掉库里已经算作超时的投递。
+const visibilityClockSlack = time.Second
+
 func (rt *taskRuntime) resetTimedOutTasks(ctx context.Context, visTimeout time.Duration) error {
 	rt.transitionMu.Lock()
 	defer rt.transitionMu.Unlock()
+
+	if !rt.state.mayHaveTimedOut(time.Now(), visTimeout, visibilityClockSlack) {
+		// 窗口里每一行都由本进程投递或确认，且没有投递早于超时线：扫描不会重置任何行。
+		return nil
+	}
 
 	taskIDs, err := rt.pq.store.ResetTimedOutTasks(
 		ctx,
@@ -194,6 +203,10 @@ func (rt *taskRuntime) resetTimedOutTasks(ctx context.Context, visTimeout time.D
 	)
 	if err != nil {
 		return err
+	}
+	if len(taskIDs) > 0 {
+		// 本进程不认识的行已原地变为可见；认识的行在下面重新隐藏或落回 redelivery。
+		rt.state.markVisible()
 	}
 	for _, taskID := range taskIDs {
 		ot, ok := rt.state.moveToRespooling(taskID)
