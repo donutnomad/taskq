@@ -2,6 +2,30 @@
 
 本文件记录 TaskQ 的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 2026-11-12 respool 的老行与新行同事务删除
+
+Tenuto 的多副本故障注入里，一条被消费方反复 `Nack` 的任务在 `taskq_tasks` 里变成 88 份。respool 写入新行后老行仍以
+`dispatched_at` 非空留在库里，只在 owner 的内存里记为已确认，等 GC 把 `ackLevel` 推过它才删除。分区易主（锁续约
+超时）时新 owner 从库里的 `ack_level` 开始，没有这份内存：`ResetTimedOutTasks` 把这些老行当作超时未确认的投递
+重新放出，每条老行与它的新行各投递一次。反复 `Nack` 的任务每 respool 一次留下一条老行，每次易主都按老行数翻倍。
+
+### 修复
+
+- `TaskRow.RespoolOf`：respool 重写的行带上老行的 `taskID`；`CreateTasksAndAdvanceRange` 在写入新行、推进 range 的
+  同一事务里删除老行（`queue/writer.go`、`store/gormstore/store.go`）。
+- 新 `TaskStore.MinTaskIDAfter`：返回 `ackLevel` 之上最小的现存 `taskID`。GC 每轮先让 `ackLevel` 越过这之前（且不超过
+  `maxReadLevel`）在库里已没有行的 ID，本进程仍在投递、重写或待重投的任务挡住推进（`queue/gc.go`、
+  `queue/task_runtime.go`、`queue/delivery_state.go`）。接管分区的进程由此越过老 owner 删除的老行。
+- 已确认（`Ack`）但 `ackLevel` 尚未落库的行在易主后仍会重投一次：确认只在内存里，这是 at-least-once 的既有语义，
+  不在本次范围内；`MaxAttempts` 耗尽丢弃的任务同样保留老行。
+
+### 测试
+
+- `queue`：`TestPhysicalQueue_TakeoverDoesNotRedeliverRespooledTask`（respool 后不落库 `ackLevel` 即换 owner：只投递
+  新行一次，持久化 `ackLevel` 越过已删除的老行）。修复前投递两次；只删除老行而不越过空洞时 `ackLevel` 停在 0。
+- `store/gormstore`：`TestSQLiteStoreRespoolRetiresOldRowAtomically`（fence 失败时老行保留，成功时只剩新行，
+  `MinTaskIDAfter` 的边界）；`integration` 标签的 MySQL 测试补充同一断言。
+
 ## 2026-08-04 为 `GetActiveMembers` 补索引
 
 SQL 审查用 EXPLAIN ANALYZE 实测发现服务发现的高频查询走全表扫描。

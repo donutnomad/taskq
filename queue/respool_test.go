@@ -475,3 +475,65 @@ func TestPhysicalQueue_RespoolChannelFullDegradesToRedelivery(t *testing.T) {
 	}
 	unblock()
 }
+
+// 接管分区：老 owner 已把一条 Nack 的任务 respool 成新行，但 GC 还没把 ackLevel 落库就失去了分区。
+// 新 owner 没有「老行已确认」的内存；老行若还留在库里，可见性扫描会把它重新放出，与新行各投递一次，
+// 反复 Nack 的任务每换一次 owner 就多一份。老行必须与新行同事务删除，新 owner 的 GC 越过这个空洞。
+func TestPhysicalQueue_TakeoverDoesNotRedeliverRespooledTask(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	previous := newRespoolTestQueue(t, store, time.Minute, 0)
+	if err := previous.AddTask(ctx, []byte("task-1")); err != nil {
+		t.Fatal(err)
+	}
+	_, token, ok, err := previous.tryPoll(ctx)
+	if err != nil || !ok {
+		t.Fatalf("poll ok = %v, err = %v", ok, err)
+	}
+	if err := previous.Nack(ctx, token); err != nil {
+		t.Fatal(err)
+	}
+	awaitTestCondition(t, "the respooled row to be written", func() bool {
+		return len(undispatchedTestTasks(t, store, "respool-q")) == 1
+	})
+	previous.Close()
+
+	const visTimeout = time.Millisecond
+	next, err := newPhysicalQueue(ctx, store, "respool-q", 0, visTimeout, 0, "next-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startTestWriterTask(t, next)
+	t.Cleanup(next.Close)
+	time.Sleep(5 * visTimeout)
+	next.RunVisibilityScanOnce(ctx)
+
+	var delivered []*TaskRow
+	for {
+		row, token, ok, err := next.tryPoll(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			break
+		}
+		delivered = append(delivered, row)
+		if err := next.Ack(ctx, token); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(delivered) != 1 || delivered[0].Attempt != 1 || string(delivered[0].Data) != "task-1" {
+		t.Fatalf("deliveries after takeover = %+v, want only the respooled row", delivered)
+	}
+
+	if err := next.RunGCOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	info, err := store.GetQueue(ctx, "respool-q", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.AckLevel != delivered[0].TaskID {
+		t.Fatalf("persisted ack level = %d, want %d (past the retired row)", info.AckLevel, delivered[0].TaskID)
+	}
+}

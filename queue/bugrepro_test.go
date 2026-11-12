@@ -53,6 +53,9 @@ func (s *rangeUpdateErrorStore) UnDispatchTask(context.Context, string, int, int
 func (s *rangeUpdateErrorStore) ResetTimedOutTasks(context.Context, string, int, VisibilityResetOptions) ([]int64, error) {
 	return nil, nil
 }
+func (s *rangeUpdateErrorStore) MinTaskIDAfter(context.Context, string, int, int64) (int64, bool, error) {
+	return 0, false, nil
+}
 func (s *rangeUpdateErrorStore) Close() error { return nil }
 
 func TestBugRepro_CreateTasksAndAdvanceRangeKeepsNonCASFailures(t *testing.T) {

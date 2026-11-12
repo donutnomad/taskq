@@ -216,6 +216,28 @@ func (rt *taskRuntime) resetTimedOutTasks(ctx context.Context, visTimeout time.D
 	return nil
 }
 
+// skipRetiredTasks 让 ackLevel 越过已被 respool 删除的老行。本进程 respool 的老行在 finishRespool 时
+// 已记为 acked；接管分区的新进程没有这份内存，只能从库里看出这些 ID 没有行：ackLevel 之上最小的现存
+// task_id 之前的 ID（不超过已落库的 maxReadLevel）都已删除。
+func (rt *taskRuntime) skipRetiredTasks(ctx context.Context) error {
+	ackLevel, maxReadLevel := rt.state.ackLevelValue(), rt.state.maxReadLevelValue()
+	if ackLevel >= maxReadLevel {
+		return nil
+	}
+	minTaskID, found, err := rt.pq.store.MinTaskIDAfter(ctx, rt.pq.queueName, rt.pq.partitionID, ackLevel)
+	if err != nil {
+		return err
+	}
+	upTo := maxReadLevel
+	if found {
+		upTo = min(minTaskID-1, maxReadLevel)
+	}
+	if upTo > ackLevel {
+		rt.state.skipAbsent(upTo)
+	}
+	return nil
+}
+
 func (rt *taskRuntime) ackLevel() int64 {
 	return rt.state.ackLevelValue()
 }

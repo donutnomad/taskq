@@ -309,11 +309,30 @@ func (s *sqliteStore) CreateTasksAndAdvanceRange(
 		); err != nil {
 			return 0, err
 		}
+		if task.RespoolOf != 0 {
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM tasks WHERE queue_name = ? AND partition_id = ? AND task_id = ?`,
+				queueName, partitionID, task.RespoolOf,
+			); err != nil {
+				return 0, err
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return newRangeID, nil
+}
+
+func (s *sqliteStore) MinTaskIDAfter(ctx context.Context, queueName string, partitionID int, afterTaskID int64) (int64, bool, error) {
+	var minTaskID sql.NullInt64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT MIN(task_id) FROM tasks WHERE queue_name = ? AND partition_id = ? AND task_id > ?`,
+		queueName, partitionID, afterTaskID,
+	).Scan(&minTaskID); err != nil {
+		return 0, false, err
+	}
+	return minTaskID.Int64, minTaskID.Valid, nil
 }
 
 func (s *sqliteStore) GetTasks(

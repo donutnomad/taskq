@@ -703,6 +703,37 @@ func TestSQLiteStoreCreateTasksAndAdvanceRangeRollsBackTogether(t *testing.T) {
 	}
 }
 
+// respool 的新行与老行退役同事务：写入后老行不在库里，MinTaskIDAfter 越过它找到新行；写入失败时老行保留。
+func TestSQLiteStoreRespoolRetiresOldRowAtomically(t *testing.T) {
+	s := newSQLiteTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateQueue(ctx, &queue.QueueInfo{QueueName: "respool-q", PartitionID: 0, RangeID: 1, NextTaskID: 2}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := s.CreateTasks(ctx, []*queue.TaskRow{{TaskID: 1, QueueName: "respool-q", Data: []byte("task"), CreatedAt: now}}); err != nil {
+		t.Fatal(err)
+	}
+	respooled := []*queue.TaskRow{{TaskID: 2, QueueName: "respool-q", Data: []byte("task"), Attempt: 1, CreatedAt: now, RespoolOf: 1}}
+
+	if _, err := s.CreateTasksAndAdvanceRange(ctx, "respool-q", 0, respooled, 3, 99); !errors.Is(err, queue.ErrConditionFailed) {
+		t.Fatalf("fenced write err = %v, want ErrConditionFailed", err)
+	}
+	if minTaskID, found, err := s.MinTaskIDAfter(ctx, "respool-q", 0, 0); err != nil || !found || minTaskID != 1 {
+		t.Fatalf("after fenced write: min=%d found=%v err=%v, want the old row kept", minTaskID, found, err)
+	}
+
+	if _, err := s.CreateTasksAndAdvanceRange(ctx, "respool-q", 0, respooled, 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	if minTaskID, found, err := s.MinTaskIDAfter(ctx, "respool-q", 0, 0); err != nil || !found || minTaskID != 2 {
+		t.Fatalf("after respool: min=%d found=%v err=%v, want only the new row", minTaskID, found, err)
+	}
+	if _, found, err := s.MinTaskIDAfter(ctx, "respool-q", 0, 2); err != nil || found {
+		t.Fatalf("above the last row: found=%v err=%v", found, err)
+	}
+}
+
 func TestSQLiteStoreAdvanceAckLevelAndDeleteTasksAtomic(t *testing.T) {
 	s := newSQLiteTestStore(t)
 	ctx := context.Background()

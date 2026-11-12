@@ -69,6 +69,8 @@ type Store interface {
     DispatchTask(ctx, queueName, partitionID, taskID, dispatchedAt) error
     UnDispatchTask(ctx, queueName, partitionID, taskID) error
     ResetTimedOutTasks(ctx, queueName, partitionID, opts VisibilityResetOptions) ([]int64, error)
+    MinTaskIDAfter(ctx, queueName, partitionID, afterTaskID) (int64, bool, error)
+    CreateTasksAndAdvanceRange(ctx, queueName, partitionID, tasks, newNextTaskID, prevRangeID) (int64, error)
     Close() error
 }
 ```
@@ -253,7 +255,7 @@ TaskQ 提供 at-least-once delivery；业务幂等键定义一次业务效果。
 
 ### 投递重试、respool 与 attempt 上限
 
-失败任务（`Nack`、可见性超时）不再原地放回，而是 **respool**：以更高的 `taskID` 重写一条新任务，再确认（ack）老行。这样单条反复失败的任务不会永久钉死 `ackLevel`——`acked` 内存与 `tasks` 表持续 GC，队列始终能向前推进。该机制对齐 Temporal matching 层的 `respoolTaskAfterError`。
+失败任务（`Nack`、可见性超时）不再原地放回，而是 **respool**：以更高的 `taskID` 重写一条新任务，同一事务里删除老行（`TaskRow.RespoolOf`），再在内存里确认老行。老行不留在库里：分区易主时新 owner 没有老 owner 的确认内存，留下的老行会被可见性扫描重新放出，与新行各投递一次，反复 Nack 的任务每易主一次就多一份。新 owner 的 GC 用 `MinTaskIDAfter` 找到 `ackLevel` 之上最小的现存 `taskID`，之前的 ID 都已删除，`ackLevel` 越过它们。这样单条反复失败的任务不会永久钉死 `ackLevel`——`acked` 内存与 `tasks` 表持续 GC，队列始终能向前推进。该机制对齐 Temporal matching 层的 `respoolTaskAfterError`。
 
 - **`attempt` 列** — `tasks` 表新增，记录该任务已失败的投递次数（首次写入为 0）。持久化在行上，进程重启 / 分区易主后计数不丢。
 - **`MaxAttempts`（`matching.Config`）** — 单任务的总投递次数上限。**默认 `0` 表示不限次数**：反复失败的任务持续 respool，`ackLevel` 不会被其阻塞，数据也不会被 TaskQ 主动删除。设为正数才启用上限，超过后任务被丢弃并仅记录一条 `error` 日志。
@@ -335,7 +337,7 @@ sequenceDiagram
     M->>PQ: Nack(token)
     PQ->>RT: nack(taskID, deliveryID)
     RT->>DS: outstanding → respooling
-    RT->>DB: 以新 taskID 重写任务（attempt+1，老行仍隐藏）
+    RT->>DB: 以新 taskID 重写任务（attempt+1），同事务删除老行
     DS->>DS: 新行落库后 finishRespool，老行记 acked
     PQ->>PQ: wakeWaiters() → 投递给等待中的 poller
 ```
@@ -474,7 +476,9 @@ if err := matchingServer.ResizePartitions(ctx, "my-queue", 8); err != nil {
                                  ├ nack()/超时 → respooling → (新行落库) finishRespool → acked
                                  └ waiter 消失 → redelivery → tryGetTask() → outstanding → ...
 
-  respooling 的老行在新行落库后记为 acked（相当于就地退役）；新行以 attempt+1 排到队尾重新参与消费。
+  respooling 的老行与新行同事务从库里删除，新行落库后老行在内存里记为 acked；新行以 attempt+1 排到队尾重新参与消费。
+  GC 每轮先让 ackLevel 越过库里已没有行的 ID（ackLevel 之上最小现存 taskID 之前、不超过 maxReadLevel 的 ID），
+  接管分区的进程由此越过老 owner respool 删除的老行。
 
 ackLevel 推进规则 (advanceAckLevel)：
   从 ackLevel+1 开始逐个检查：

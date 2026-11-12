@@ -230,6 +230,35 @@ func (s *deliveryState) ackLevelBlocker(now time.Time) blockerStats {
 	return blockerStats{taskID: next, state: "unconsumed"}
 }
 
+func (s *deliveryState) maxReadLevelValue() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.maxReadLevel
+}
+
+// skipAbsent 把 ackLevel 推过 (ackLevel, upTo] 里在库中已没有行的 taskID。调用方保证这个区间在库里
+// 没有任何行：这些 ID 的任务已被 respool 重写并删除。本进程仍在投递或重写中的任务挡住推进。
+func (s *deliveryState) skipAbsent(upTo int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for s.ackLevel < upTo {
+		next := s.ackLevel + 1
+		if _, inFlight := s.outstanding[next]; inFlight {
+			break
+		}
+		if _, rewriting := s.respooling[next]; rewriting {
+			break
+		}
+		if s.inRedeliveryLocked(next) {
+			break
+		}
+		delete(s.acked, next)
+		s.ackLevel = next
+	}
+	s.advanceAckLevelLocked()
+}
+
 func (s *deliveryState) advanceAckLevelLocked() {
 	for {
 		next := s.ackLevel + 1

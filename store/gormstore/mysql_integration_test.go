@@ -126,6 +126,23 @@ func TestMySQLStoreQueueCASAndDelivery(t *testing.T) {
 	if len(atomicRows) != 1 || string(atomicRows[0].Data) != "atomic" {
 		t.Fatalf("atomic task rows = %+v", atomicRows)
 	}
+
+	// respool：新行写入与老行删除同事务，MinTaskIDAfter 越过已删除的老行。
+	if _, err := s.CreateTasksAndAdvanceRange(
+		ctx,
+		"mysql-atomic-q",
+		0,
+		[]*queue.TaskRow{{
+			TaskID: 2, QueueName: "mysql-atomic-q", PartitionID: 0, Data: []byte("atomic"), Attempt: 1, CreatedAt: time.Now(), RespoolOf: 1,
+		}},
+		3,
+		2,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if minTaskID, found, err := s.MinTaskIDAfter(ctx, "mysql-atomic-q", 0, 0); err != nil || !found || minTaskID != 2 {
+		t.Fatalf("after respool: min=%d found=%v err=%v", minTaskID, found, err)
+	}
 }
 
 func TestMySQLStoreLockAndMembers(t *testing.T) {

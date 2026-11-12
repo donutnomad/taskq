@@ -551,12 +551,42 @@ func (s *Store) CreateTasksAndAdvanceRange(
 		if result.RowsAffected == 0 {
 			return queue.ErrConditionFailed
 		}
-		return tx.Create(&rows).Error
+		if err := tx.Create(&rows).Error; err != nil {
+			return err
+		}
+		// respool 的老行与新行同事务退役：接管分区的进程没有老行已确认的内存，留在库里的老行会被
+		// 可见性扫描重新放出，与新行各投递一次。
+		if retired := respooledTaskIDs(tasks); len(retired) > 0 {
+			return tx.Where("queue_name = ? AND partition_id = ? AND task_id IN ?", queueName, partitionID, retired).
+				Delete(&taskRow{}).Error
+		}
+		return nil
 	})
 	if err != nil {
 		return 0, err
 	}
 	return newRangeID, nil
+}
+
+func respooledTaskIDs(tasks []*queue.TaskRow) []int64 {
+	var ids []int64
+	for _, task := range tasks {
+		if task.RespoolOf != 0 {
+			ids = append(ids, task.RespoolOf)
+		}
+	}
+	return ids
+}
+
+func (s *Store) MinTaskIDAfter(ctx context.Context, queueName string, partitionID int, afterTaskID int64) (int64, bool, error) {
+	var minTaskID sql.NullInt64
+	if err := s.db.WithContext(ctx).Model(&taskRow{}).
+		Where("queue_name = ? AND partition_id = ? AND task_id > ?", queueName, partitionID, afterTaskID).
+		Select("MIN(task_id)").
+		Scan(&minTaskID).Error; err != nil {
+		return 0, false, err
+	}
+	return minTaskID.Int64, minTaskID.Valid, nil
 }
 
 func (s *Store) GetTasks(ctx context.Context, queueName string, partitionID int, minTaskID, maxTaskID int64, limit int) ([]*queue.TaskRow, error) {

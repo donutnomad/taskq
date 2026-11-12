@@ -193,6 +193,7 @@ func (w *taskWriter) flush(batch []*writeRequest) error {
 			Data:            req.data,
 			Attempt:         req.attempt,
 			CreatedAt:       createdAt,
+			RespoolOf:       req.respoolOf,
 		}
 		req.taskID = taskID
 	}
@@ -221,7 +222,7 @@ func (w *taskWriter) flush(batch []*writeRequest) error {
 		return nil
 	}
 	w.nextID = newNextID
-	// 新行已落库，此时才允许 ack 老行并放行 ackLevel。
+	// 新行已落库、老行已在同一事务里删除，此时才允许 ack 老行并放行 ackLevel。
 	for _, req := range batch {
 		if req.respoolOf != 0 {
 			w.pq.runtime.state.finishRespool(req.respoolOf)

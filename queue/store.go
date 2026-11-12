@@ -16,6 +16,9 @@ type TaskRow struct {
 	Attempt         int // 投递失败重试次数，首次写入为 0
 	CreatedAt       time.Time
 	DispatchedAt    *time.Time // nil = 未分发
+	// RespoolOf 非 0 表示这一行是该老任务的 respool 重写：CreateTasksAndAdvanceRange 在写入这一行的
+	// 同一事务里删除老行。只在写入时有意义，不落库。
+	RespoolOf int64
 }
 
 // TaskQueryOptions controls which routed tasks are visible to a poller.
@@ -92,6 +95,10 @@ type TaskStore interface {
 		taskID int64) error
 	ResetTimedOutTasks(ctx context.Context, queueName string, partitionID int,
 		opts VisibilityResetOptions) ([]int64, error)
+	// MinTaskIDAfter 返回分区内 task_id 大于 afterTaskID 的最小 task_id（不论是否已投递、带什么
+	// routing key）；没有这样的行时 found 为 false。
+	MinTaskIDAfter(ctx context.Context, queueName string, partitionID int,
+		afterTaskID int64) (taskID int64, found bool, err error)
 }
 
 // Store 持久化存储接口
@@ -99,7 +106,8 @@ type Store interface {
 	QueueMetaStore
 	TaskStore
 	// CreateTasksAndAdvanceRange atomically fences ownership, advances the next
-	// task ID, and persists the matching task batch.
+	// task ID, and persists the matching task batch. 批次里 RespoolOf 非 0 的行所重写的
+	// 老行在同一事务里删除。
 	CreateTasksAndAdvanceRange(ctx context.Context,
 		queueName string, partitionID int,
 		tasks []*TaskRow, newNextTaskID int64, prevRangeID int64) (newRangeID int64, err error)

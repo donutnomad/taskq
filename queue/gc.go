@@ -60,6 +60,9 @@ func (g *taskGC) reportAckLevelStall(ackLevel int64) {
 }
 
 func (g *taskGC) collect(ctx context.Context) error {
+	if err := g.runtime.skipRetiredTasks(ctx); err != nil {
+		slog.Error("queue gc skip retired tasks failed", "queue", g.pq.queueName, "partition_id", g.pq.partitionID, "err", err)
+	}
 	ackLevel := g.runtime.ackLevel()
 	g.reportAckLevelStall(ackLevel)
 	if ackLevel <= 0 {
