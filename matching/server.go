@@ -17,6 +17,7 @@ type matchingHandler struct {
 	UnimplementedMatchingServiceServer
 	mgr        *partitionManager
 	pollCursor atomic.Uint64
+	polls      pollRegistry
 }
 
 func (h *matchingHandler) AddTask(ctx context.Context, req *AddTaskRequest) (*AddTaskResponse, error) {

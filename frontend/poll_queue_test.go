@@ -273,12 +273,23 @@ func TestFrontend_MultipleOwnersReturnSimultaneousLoser(t *testing.T) {
 	if _, _, err := frontend.Dequeue(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	// 败者在后台读回并归还。非获胜 owner 的租约从未交付给消费者，必须标记 undelivered。
+	awaitFrontendCondition(t, "loser lease returned as undelivered", func() bool {
+		return state.undeliveredNacks.Load() == 1
+	})
 	if got := state.nacks.Load(); got != 1 {
 		t.Fatalf("multi-owner loser Nacks = %d, want 1", got)
 	}
-	// 非获胜 owner 的租约从未交付给消费者，必须标记 undelivered。
-	if got := state.undeliveredNacks.Load(); got != 1 {
-		t.Fatalf("multi-owner loser undelivered Nacks = %d, want 1", got)
+}
+
+func awaitFrontendCondition(t *testing.T, message string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", message)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 

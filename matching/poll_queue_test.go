@@ -61,7 +61,7 @@ func TestWaitForQueuePollIgnoresInactiveWaiterSelectCases(t *testing.T) {
 	}
 	first.Close()
 
-	_, err = waitForQueuePoll(context.Background(), 20*time.Millisecond, waiters, nil)
+	_, err = waitForQueuePoll(context.Background(), nil, 20*time.Millisecond, waiters, nil)
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("status = %v, error = %v", status.Code(err), err)
 	}
@@ -290,7 +290,7 @@ func TestMatchingPollQueueLoserReturnDoesNotConsumeAttempt(t *testing.T) {
 		}
 	}
 
-	response, err := finishQueuePoll(ctx, candidates)
+	response, err := finishQueuePoll(ctx, nil, candidates)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,7 +396,7 @@ func TestMatchingPollFinalizationReturnsLeaseWhenRequestIsCanceled(t *testing.T)
 		}
 		candidates = append(candidates, queuePollCandidate{target: target, lease: lease})
 	}
-	if _, err := finishQueuePoll(canceled, candidates); status.Code(err) != codes.Canceled {
+	if _, err := finishQueuePoll(canceled, nil, candidates); status.Code(err) != codes.Canceled {
 		t.Fatalf("PollQueue finalization status = %v, err = %v", status.Code(err), err)
 	}
 	for _, target := range targets {
@@ -449,7 +449,7 @@ func TestMatchingPollFinalizationRechecksCancellationAfterLoserCleanup(t *testin
 	pollCtx, cancel := context.WithCancel(ctx)
 	resultCh := make(chan error, 1)
 	go func() {
-		_, err := finishQueuePoll(pollCtx, candidates)
+		_, err := finishQueuePoll(pollCtx, nil, candidates)
 		resultCh <- err
 	}()
 

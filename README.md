@@ -182,7 +182,8 @@ gRPC 分区管理服务，每个节点只处理哈希环分配给自己的分区
 |---|---|
 | `AddTask` | 写入任务到指定分区 |
 | `PollTask` | 消费任务（支持非阻塞和长轮询） |
-| `PollQueue` | 一次轮询同一 owner 的多个分区，返回一个任务并回收同时命中的其他 lease |
+| `PollQueue` | 一次轮询同一 owner 的多个分区，返回一个任务并回收同时命中的其他 lease；带 `poll_id` 时可被 `CancelPoll` 结束 |
+| `CancelPoll` | 结束一个带 `poll_id` 的 `PollQueue`：已领取的 lease 由 owner 原地归还，`PollQueue` 以 empty 应答；先于 `PollQueue` 到达时留下墓碑 |
 | `AckTask` | 确认消费完成 |
 | `NackTask` | 拒绝消费，触发重投递（respool）；`undelivered=true` 表示仅归还未交付的 lease，不计入 attempt |
 | `GetQueueInfo` | 查询队列的分区数 |
@@ -198,7 +199,7 @@ gRPC 分区管理服务，每个节点只处理哈希环分配给自己的分区
 客户端路由 SDK（**不是独立服务、不监听端口**），直接链接进 worker 进程，worker 通过它透明访问分布式队列。
 
 - 通过 `GetQueueInfo` 自动发现分区数量
-- round-robin 选分区写入
+- round-robin 选分区写入；写入失败的 owner 在本次调用内不再选，重试换到其他 owner 的分区
 - 快速扫描 + 长轮询消费
 - gRPC 连接池，成员离开时自动清理
 - 失败重试（`FailedPrecondition` / `Unavailable`）
@@ -237,7 +238,7 @@ sequenceDiagram
 
 ### At-least-once 与业务幂等契约
 
-`Frontend.Enqueue` 对可重试的 AddTask 路由或 gRPC 错误最多尝试 3 次，重试间隔为 50ms。Matching 可能已经提交任务，而 AddTask 响应在网络中丢失；后续重试会写入另一条任务。消费者进程退出、visibility timeout 和 Nack 也会触发重新投递。
+`Frontend.Enqueue` 对可重试的 AddTask 路由或 gRPC 错误（`FailedPrecondition` / `Unavailable` / `Aborted`）最多尝试 3 次。任务可以写进队列的任一可写分区（`RoutingKey` 定向由消费侧按 key 过滤，与分区无关），失败的 owner 在本次调用内不再选择，重试换到其他 owner 的分区；只剩失败过的 owner 时退避 50ms 后重新解析路由。owner 宕机、成员表尚未剔除它（约 20s）期间，写入由此落到存活的 owner。Matching 可能已经提交任务，而 AddTask 响应在网络中丢失；后续重试会写入另一条任务。消费者进程退出、visibility timeout 和 Nack 也会触发重新投递。
 
 生产接入遵循以下约定：
 
@@ -299,13 +300,22 @@ sequenceDiagram
         and owner B
             F->>M2: PollQueue(partitions, timeout=30s)
         end
-        F->>F: 首个 owner 胜出并取消其他请求
-		F->>M2: Nack 已返回的其他 owner loser lease
+        F->>F: 首个 owner 胜出，立即返回
+		F->>M2: CancelPoll(poll_id)：owner 归还已领取的 lease，以 empty 应答
 		F-->>W: winner；所有 owner 超时则 ErrNoTask
     end
 ```
 
-Frontend 兼容仅实现旧契约的 Matching 节点：`PollQueue` 返回 `Unimplemented` 时，同一 owner 内回退为并发 `PollTask`。Matching 和 Frontend 都使用独立的一秒清理上下文回收 loser lease；调用方取消与 delivery 同时发生时，Matching 先 Nack 已领取的 lease，再返回 `Canceled`。
+poll RPC 不随调用方的 ctx 取消。owner 只能在应答之前检查调用方是否还在：检查通过之后、应答到达之前取消 RPC，gRPC 会丢掉应答，应答里的 lease 在 owner 那里已是已投递，要等 visibility timeout 才重新出现。因此 Frontend：
+
+- 长轮询的 `PollTimeoutMs` 不超过 ctx 的剩余时间，owner 按时自己结束轮询并应答；RPC 的期限是等待时长加 5s，只在 owner 失联时用到。
+- 已有 owner 胜出或 ctx 被取消时，用 `CancelPoll` 请其余 owner 结束轮询，owner 把已领取的 lease 原地归还；在这之前已发出的应答照常读回。
+- 读回的 lease 已无人要（调用方已离开、竞速败者）时立即以 `NackTask(undelivered=true)` 归还，不消耗 attempt。
+- Owner 不支持 `CancelPoll`（旧 Matching）时退回取消 RPC。
+
+Matching 侧 `DispatchTask` 不随 poll 的 ctx 取消：驱动可能在 UPDATE 已提交之后才报告取消，此时行已隐藏而内存不知道这次投递。
+
+Frontend 兼容仅实现旧契约的 Matching 节点：`PollQueue` 返回 `Unimplemented` 时，同一 owner 内回退为并发 `PollTask`，这条路径仍以取消 RPC 结束败者。Matching 和 Frontend 都使用独立的一秒清理上下文回收 loser lease；调用方取消与 delivery 同时发生时，Matching 先归还已领取的 lease，再返回 `Canceled`。
 
 `PollQueue` 将一次 Dequeue 的 RPC fan-out 从分区数量 `O(partitions)` 收敛为 Matching owner 数量 `O(owners)`；快速阶段顺序扫描 owner，长轮询阶段并发等待 owner。
 

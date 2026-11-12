@@ -22,6 +22,7 @@ const (
 	MatchingService_AddTask_FullMethodName      = "/matching.MatchingService/AddTask"
 	MatchingService_PollTask_FullMethodName     = "/matching.MatchingService/PollTask"
 	MatchingService_PollQueue_FullMethodName    = "/matching.MatchingService/PollQueue"
+	MatchingService_CancelPoll_FullMethodName   = "/matching.MatchingService/CancelPoll"
 	MatchingService_AckTask_FullMethodName      = "/matching.MatchingService/AckTask"
 	MatchingService_NackTask_FullMethodName     = "/matching.MatchingService/NackTask"
 	MatchingService_GetQueueInfo_FullMethodName = "/matching.MatchingService/GetQueueInfo"
@@ -37,6 +38,9 @@ type MatchingServiceClient interface {
 	AddTask(ctx context.Context, in *AddTaskRequest, opts ...grpc.CallOption) (*AddTaskResponse, error)
 	PollTask(ctx context.Context, in *PollTaskRequest, opts ...grpc.CallOption) (*PollTaskResponse, error)
 	PollQueue(ctx context.Context, in *PollQueueRequest, opts ...grpc.CallOption) (*PollQueueResponse, error)
+	// CancelPoll 请 owner 结束一个带 poll_id 的 PollQueue：已领取的租约由 owner 原地归还，
+	// PollQueue 以 empty 应答。调用方不再需要结果时用它代替取消 RPC。
+	CancelPoll(ctx context.Context, in *CancelPollRequest, opts ...grpc.CallOption) (*CancelPollResponse, error)
 	AckTask(ctx context.Context, in *AckTaskRequest, opts ...grpc.CallOption) (*AckTaskResponse, error)
 	NackTask(ctx context.Context, in *NackTaskRequest, opts ...grpc.CallOption) (*NackTaskResponse, error)
 	GetQueueInfo(ctx context.Context, in *GetQueueInfoRequest, opts ...grpc.CallOption) (*GetQueueInfoResponse, error)
@@ -74,6 +78,16 @@ func (c *matchingServiceClient) PollQueue(ctx context.Context, in *PollQueueRequ
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PollQueueResponse)
 	err := c.cc.Invoke(ctx, MatchingService_PollQueue_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *matchingServiceClient) CancelPoll(ctx context.Context, in *CancelPollRequest, opts ...grpc.CallOption) (*CancelPollResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CancelPollResponse)
+	err := c.cc.Invoke(ctx, MatchingService_CancelPoll_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -120,6 +134,9 @@ type MatchingServiceServer interface {
 	AddTask(context.Context, *AddTaskRequest) (*AddTaskResponse, error)
 	PollTask(context.Context, *PollTaskRequest) (*PollTaskResponse, error)
 	PollQueue(context.Context, *PollQueueRequest) (*PollQueueResponse, error)
+	// CancelPoll 请 owner 结束一个带 poll_id 的 PollQueue：已领取的租约由 owner 原地归还，
+	// PollQueue 以 empty 应答。调用方不再需要结果时用它代替取消 RPC。
+	CancelPoll(context.Context, *CancelPollRequest) (*CancelPollResponse, error)
 	AckTask(context.Context, *AckTaskRequest) (*AckTaskResponse, error)
 	NackTask(context.Context, *NackTaskRequest) (*NackTaskResponse, error)
 	GetQueueInfo(context.Context, *GetQueueInfoRequest) (*GetQueueInfoResponse, error)
@@ -141,6 +158,9 @@ func (UnimplementedMatchingServiceServer) PollTask(context.Context, *PollTaskReq
 }
 func (UnimplementedMatchingServiceServer) PollQueue(context.Context, *PollQueueRequest) (*PollQueueResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PollQueue not implemented")
+}
+func (UnimplementedMatchingServiceServer) CancelPoll(context.Context, *CancelPollRequest) (*CancelPollResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CancelPoll not implemented")
 }
 func (UnimplementedMatchingServiceServer) AckTask(context.Context, *AckTaskRequest) (*AckTaskResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AckTask not implemented")
@@ -226,6 +246,24 @@ func _MatchingService_PollQueue_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MatchingService_CancelPoll_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CancelPollRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MatchingServiceServer).CancelPoll(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MatchingService_CancelPoll_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MatchingServiceServer).CancelPoll(ctx, req.(*CancelPollRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MatchingService_AckTask_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(AckTaskRequest)
 	if err := dec(in); err != nil {
@@ -298,6 +336,10 @@ var MatchingService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PollQueue",
 			Handler:    _MatchingService_PollQueue_Handler,
+		},
+		{
+			MethodName: "CancelPoll",
+			Handler:    _MatchingService_CancelPoll_Handler,
 		},
 		{
 			MethodName: "AckTask",

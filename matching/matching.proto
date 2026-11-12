@@ -10,6 +10,9 @@ service MatchingService {
     rpc AddTask(AddTaskRequest) returns (AddTaskResponse);
     rpc PollTask(PollTaskRequest) returns (PollTaskResponse);
     rpc PollQueue(PollQueueRequest) returns (PollQueueResponse);
+    // CancelPoll 请 owner 结束一个带 poll_id 的 PollQueue：已领取的租约由 owner 原地归还，
+    // PollQueue 以 empty 应答。调用方不再需要结果时用它代替取消 RPC。
+    rpc CancelPoll(CancelPollRequest) returns (CancelPollResponse);
     rpc AckTask(AckTaskRequest) returns (AckTaskResponse);
     rpc NackTask(NackTaskRequest) returns (NackTaskResponse);
     rpc GetQueueInfo(GetQueueInfoRequest) returns (GetQueueInfoResponse);
@@ -44,6 +47,8 @@ message PollQueueRequest {
     repeated int32 partition_ids = 2;
     int64 poll_timeout_ms = 3;
     repeated string accepted_routing_keys = 4;
+    // poll_id 由调用方生成、在一个 owner 上唯一；非空时这次轮询可被 CancelPoll 结束。
+    string poll_id = 5;
 }
 message PollQueueResponse {
     bool empty = 1;
@@ -54,6 +59,11 @@ message PollQueueResponse {
     google.protobuf.Timestamp routing_deadline = 6;
     bool routing_fallback = 7;
 }
+
+message CancelPollRequest {
+    string poll_id = 1;
+}
+message CancelPollResponse {}
 
 message AckTaskRequest {
     string queue_name = 1;

@@ -2,6 +2,36 @@
 
 本文件记录 TaskQ 的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 2026-11-12 调用方离开时在途的 lease 不再隐身；写入换 owner
+
+Tenuto 的无故障压测（3 个 matching 副本、Workflow Task 长轮询每秒以新期限重新 poll）里 8 个任务已入队却没有被
+任何消费者领到，60s visibility timeout 之前由 Tenuto 的兜底补投；故障注入里 owner 被杀后约 250 次写入以
+`frontend: enqueue: max retries exceeded` 失败。
+
+### 修复
+
+- 在途 lease 丢失：owner 在应答前检查 ctx，检查通过之后、应答到达之前调用方的期限到期或取消 RPC，gRPC 丢掉应答，
+  lease 在 owner 那里已是已投递，等 visibility timeout 才重新出现。owner 的期限按收到请求的时刻计算，比调用方
+  晚一个单程延迟；waiter 按 FIFO 取任务，最先拿到任务的正是等得最久、最接近期限的 waiter。Frontend 的 poll RPC
+  改为不随调用方 ctx 取消（`frontend/frontend.go`）：长轮询的 `PollTimeoutMs` 不超过 ctx 的剩余时间，由 owner
+  按时结束；已有 owner 胜出或 ctx 被取消时，用新的 `CancelPoll` RPC 请 owner 结束轮询并原地归还已领取的 lease
+  （`PollQueueRequest.poll_id`，`matching/poll_queue.go` 的 `pollRegistry`）；读回的 lease 已无人要时立即以
+  `undelivered` 归还。竞速败者在后台归还，胜者不再等 2ms 的收集窗口。
+- `DispatchTask` 不随 poll 的 ctx 取消（`queue/task_runtime.go`）：MySQL 驱动可能在 UPDATE 已提交之后才报告取消，
+  此时行已隐藏而内存不知道这次投递（日志 `queue tryPoll failed … dispatch task N: context canceled`）。调用方已
+  离开时的读取取消不再记 ERROR。
+- 写入换 owner：`EnqueueWithOptions` 在同一个分区上重试 3 次，owner 宕机、成员表尚未剔除它期间全部失败。任务可以
+  写进任一可写分区（`RoutingKey` 定向由消费侧按 key 过滤，与分区无关），失败的 owner 在本次调用内不再选择，重试
+  换到其他 owner 的分区；只剩失败过的 owner 时退避后重新解析路由。错误信息带上最后一次失败的原因。
+
+### 测试
+
+- `frontend`：`TestFrontend_LeaseIssuedAfterCallerDeadlineIsReturned`、`TestFrontend_LeaseIssuedWhileCallerCancelsIsReturned`
+  （owner 在调用方离开后签发 lease，lease 必须以 undelivered 归还）、`TestFrontend_EnqueueFailsOverToAnotherOwner`；
+  修复前三项都失败。`TestFrontend_MultipleOwnersReturnSimultaneousLoser` 改为等待后台归还。
+- `queue`：`TestPhysicalQueue_PollerCancelDuringDispatchKeepsTaskDeliverable`（驱动在提交后报告取消），修复前任务隐身。
+- `matching`：`CancelPoll` 结束等待中的轮询、先于 `PollQueue` 到达的墓碑、被结束的轮询原地归还 lease。
+
 ## 2026-11-12 respool 的老行与新行同事务删除
 
 Tenuto 的多副本故障注入里，一条被消费方反复 `Nack` 的任务在 `taskq_tasks` 里变成 88 份。respool 写入新行后老行仍以

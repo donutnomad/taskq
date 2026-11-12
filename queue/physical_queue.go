@@ -167,7 +167,10 @@ func (pq *PhysicalQueue) tryPollWithOptions(ctx context.Context, opts PollOption
 
 	row, token, ok, err := pq.runtime.tryGetTask(ctx, normalized)
 	if err != nil {
-		slog.Error("queue tryPoll failed", "queue", pq.queueName, "partition_id", pq.partitionID, "err", err)
+		// 调用方已离开时读取被取消是正常结束，不是故障。
+		if ctx.Err() == nil {
+			slog.Error("queue tryPoll failed", "queue", pq.queueName, "partition_id", pq.partitionID, "err", err)
+		}
 		return nil, "", false, err
 	}
 	return row, token, ok, nil

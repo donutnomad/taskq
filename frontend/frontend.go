@@ -7,8 +7,12 @@ package frontend
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +32,9 @@ const (
 	defaultRetryBackoff  = 50 * time.Millisecond
 	defaultServiceName   = "matching"
 	pollWinnerDrainGrace = 2 * time.Millisecond
+	// pollResponseGrace 是 poll RPC 在 owner 端等待时长之外继续等应答的时间。owner 按 PollTimeoutMs 自己结束
+	// 轮询并应答，只有 owner 失联时才会用到这个期限。
+	pollResponseGrace = 5 * time.Second
 	// partitionRefreshInterval 是周期性刷新 read/write 分区快照的间隔，
 	// 与 matching 的 partitionConfigTTL 对齐，保证运行时分区变更在一个周期内被 frontend 感知。
 	partitionRefreshInterval = 5 * time.Second
@@ -75,6 +82,8 @@ type Frontend struct {
 	partitions   atomic.Pointer[partitionSnapshot]
 	enqueueIdx   atomic.Int64
 	pollIdx      atomic.Int64
+	pollIDPrefix string
+	pollSeq      atomic.Uint64
 	ctx          context.Context
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
@@ -119,6 +128,7 @@ func NewWithContext(ctx context.Context, cfg Config) (*Frontend, error) {
 		resolver:     resolver,
 		pool:         newConnPool(cfg.DialOpts),
 		listenerName: fmt.Sprintf("frontend-%d", frontendListenerSeq.Add(1)),
+		pollIDPrefix: newPollIDPrefix(),
 		ctx:          lifecycleCtx,
 		cancel:       cancel,
 	}
@@ -153,34 +163,44 @@ func (f *Frontend) Enqueue(ctx context.Context, data []byte) error {
 }
 
 // EnqueueWithOptions writes a task with delivery routing metadata.
+//
+// 任务可以写进队列的任一可写分区：RoutingKey 定向由消费侧按 key 过滤，与分区无关。写入失败的 owner 在本次调用
+// 内不再选择，重试换到其他 owner 的分区；只剩失败过的 owner 时退避后重新解析路由。owner 宕机后、成员表把它
+// 剔除之前，写入由此落到存活的 owner，而不是在同一个分区上耗尽重试。
 func (f *Frontend) EnqueueWithOptions(ctx context.Context, data []byte, opts EnqueueOptions) error {
 	if err := opts.Validate(); err != nil {
 		return err
 	}
-	// 写在 [0, write) 内 round-robin 选分区（write 来自原子快照，兜底下限 1）。
-	partID := int(f.enqueueIdx.Add(1)) % f.snapshot().write
+	request := &matching.AddTaskRequest{
+		QueueName:  f.cfg.QueueName,
+		Data:       data,
+		RoutingKey: opts.RoutingKey,
+	}
+	if !opts.RoutingDeadline.IsZero() {
+		request.RoutingDeadline = timestamppb.New(opts.RoutingDeadline)
+	}
 
+	failed := make(map[string]bool)
+	var lastErr error
 	for attempt := range defaultMaxRetries {
-		client, err := f.getPartitionClient(f.cfg.QueueName, partID)
-		if err != nil {
-			if attempt < defaultMaxRetries-1 {
-				if retryErr := f.waitRetry(ctx); retryErr != nil {
-					return fmt.Errorf("frontend: enqueue: %w", retryErr)
-				}
-				continue
+		partID, address, fresh, err := f.pickWritePartition(failed)
+		if attempt > 0 && (err != nil || !fresh) {
+			if retryErr := f.waitRetry(ctx); retryErr != nil {
+				return fmt.Errorf("frontend: enqueue: %w", retryErr)
 			}
-			return fmt.Errorf("frontend: enqueue: %w", err)
+			partID, address, _, err = f.pickWritePartition(failed)
 		}
-
-		request := &matching.AddTaskRequest{
-			QueueName:   f.cfg.QueueName,
-			PartitionId: int32(partID),
-			Data:        data,
-			RoutingKey:  opts.RoutingKey,
+		if err != nil {
+			lastErr = err
+			continue
 		}
-		if !opts.RoutingDeadline.IsZero() {
-			request.RoutingDeadline = timestamppb.New(opts.RoutingDeadline)
+		client, err := f.pool.getClient(address)
+		if err != nil {
+			failed[address] = true
+			lastErr = err
+			continue
 		}
+		request.PartitionId = int32(partID)
 		_, err = client.AddTask(ctx, request)
 		if err == nil {
 			return nil
@@ -188,20 +208,41 @@ func (f *Frontend) EnqueueWithOptions(ctx context.Context, data []byte, opts Enq
 		if !isRetryable(err) {
 			return fmt.Errorf("frontend: enqueue: %w", err)
 		}
-		// 缩容态下 frontend 快照滞后仍按旧 write 选到高位分区，matching 按 numWrite
-		// 硬拒 FailedPrecondition。重试前刷新快照并按新 write 重选分区，否则重试仍撞
-		// 同一高位分区。刷新失败保留旧快照（best-effort）。
+		failed[address] = true
+		lastErr = err
+		// 缩容态下 frontend 快照滞后仍按旧 write 选到高位分区，matching 按 numWrite 硬拒 FailedPrecondition。
+		// 重试前刷新快照，按新 write 重选分区。刷新失败保留旧快照（best-effort）。
 		if status.Code(err) == codes.FailedPrecondition {
 			_ = f.refreshPartitions(ctx)
-			partID = int(f.enqueueIdx.Add(1)) % f.snapshot().write
-		}
-		if attempt < defaultMaxRetries-1 {
-			if retryErr := f.waitRetry(ctx); retryErr != nil {
-				return fmt.Errorf("frontend: enqueue: %w", retryErr)
-			}
 		}
 	}
-	return fmt.Errorf("frontend: enqueue: max retries exceeded")
+	return fmt.Errorf("frontend: enqueue: max retries exceeded: %w", lastErr)
+}
+
+// pickWritePartition 从 round-robin 位置起选第一个 owner 不在 failed 里的可写分区，fresh 为 true。所有 owner
+// 都失败过时返回 round-robin 位置上的分区，fresh 为 false。
+func (f *Frontend) pickWritePartition(failed map[string]bool) (partID int, address string, fresh bool, err error) {
+	write := f.snapshot().write
+	start := int(f.enqueueIdx.Add(1) % int64(write))
+	found := false
+	for i := range write {
+		candidate := (start + i) % write
+		host, lookupErr := f.resolver.Lookup(fmt.Sprintf("%s/%d", f.cfg.QueueName, candidate))
+		if lookupErr != nil {
+			err = lookupErr
+			continue
+		}
+		if !failed[host.GetAddress()] {
+			return candidate, host.GetAddress(), true, nil
+		}
+		if !found {
+			partID, address, found = candidate, host.GetAddress(), true
+		}
+	}
+	if found {
+		return partID, address, false, nil
+	}
+	return 0, "", false, err
 }
 
 // Dequeue 消费任务：快速扫描所有分区 → 长轮询
@@ -214,6 +255,12 @@ func (f *Frontend) Dequeue(ctx context.Context) ([]byte, string, error) {
 }
 
 // DequeueWithOptions consumes the first task visible to the accepted routing keys.
+//
+// poll RPC 不随 ctx 取消。owner 在应答前检查调用方是否还在，检查通过之后、应答到达之前的取消会让 gRPC 丢掉
+// 应答，应答里的租约在 owner 那里已是已投递，要等可见性超时才重新出现。因此：长轮询的 PollTimeoutMs 不超过
+// ctx 的剩余时间，owner 自己按时结束；ctx 被取消或已有 owner 胜出时，用 CancelPoll 请其余 owner 结束轮询并
+// 原地归还已领取的租约；应答照常读回，已无人要的租约立即以 undelivered 归还。owner 不支持 CancelPoll 时退回
+// 取消 RPC。
 func (f *Frontend) DequeueWithOptions(ctx context.Context, opts PollOptions) (Lease, error) {
 	normalized, err := opts.Normalize()
 	if err != nil {
@@ -234,55 +281,159 @@ func (f *Frontend) DequeueWithOptions(ctx context.Context, opts PollOptions) (Le
 	ownerErrors := make([]error, len(groups))
 
 	for i, group := range groups {
-		lease, ok, err := f.pollOwner(ctx, group, 0, opts)
-		if err != nil {
-			ownerErrors[i] = err
-			continue
+		if err := ctx.Err(); err != nil {
+			return Lease{}, fmt.Errorf("frontend: dequeue: %w", err)
 		}
-		ownerErrors[i] = nil
-		if ok {
-			return lease, nil
+		rpcCtx, cancel := f.pollRPCContext(ctx, 0)
+		lease, ok, err := f.pollOwner(rpcCtx, group, 0, opts, "")
+		cancel()
+		ownerErrors[i] = err
+		if err == nil && ok {
+			return f.handOverLease(ctx, ownerPollResult{group: group, lease: lease, found: true})
 		}
 	}
 
-	pollCtx, pollCancel := context.WithTimeout(ctx, f.cfg.PollTimeout+5*time.Second)
-	defer pollCancel()
+	wait := f.cfg.PollTimeout
+	deadline, bounded := ctx.Deadline()
+	if bounded {
+		bounded = time.Until(deadline) < wait
+		if bounded {
+			wait = time.Until(deadline)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return Lease{}, fmt.Errorf("frontend: dequeue: %w", err)
+	}
+	wait = max(wait, time.Millisecond)
 
 	resultCh := make(chan ownerPollResult, len(groups))
+	polls := make([]*ownerPoll, len(groups))
 	for i, group := range groups {
-		go func() {
-			lease, ok, err := f.pollOwner(pollCtx, group, f.cfg.PollTimeout, opts)
-			resultCh <- ownerPollResult{index: i, group: group, lease: lease, found: ok, err: err}
-		}()
+		polls[i] = f.startOwnerPoll(ctx, i, group, wait, opts, resultCh)
 	}
-
-	for i := range groups {
-		r := <-resultCh
-		ownerErrors[r.index] = r.err
-		if r.err == nil && r.found {
-			losers := make([]ownerPollResult, 0, len(groups)-1)
-			for _, other := range drainPollResults(resultCh, len(groups)-i-1, pollCancel) {
-				if other.err == nil && other.found {
-					losers = append(losers, other)
-				}
+	for pending := len(groups); pending > 0; {
+		select {
+		case r := <-resultCh:
+			pending--
+			polls[r.index] = nil
+			ownerErrors[r.index] = r.err
+			if r.err == nil && r.found {
+				f.abandonOwnerPolls(polls, resultCh, pending, true)
+				return f.handOverLease(ctx, r)
 			}
-			if cleanupErr := f.nackOwnerPollResults(losers); cleanupErr != nil {
-				if winnerErr := f.nackOwnerPollResults([]ownerPollResult{r}); winnerErr != nil {
-					cleanupErr = errors.Join(cleanupErr, fmt.Errorf("return winner: %w", winnerErr))
-				}
-				return Lease{}, cleanupErr
-			}
-			return r.lease, nil
+		case <-ctx.Done():
+			// 到期时 owner 按同一期限自己结束轮询，不必再发 CancelPoll。
+			f.abandonOwnerPolls(polls, resultCh, pending, !errors.Is(ctx.Err(), context.DeadlineExceeded))
+			return Lease{}, fmt.Errorf("frontend: dequeue: %w", ctx.Err())
 		}
+	}
+	allErrors := errors.Join(append(append([]error(nil), resolutionErrors...), ownerErrors...)...)
+	if bounded && allErrors == nil {
+		// owner 按截断到毫秒的期限结束，空应答可能早于 ctx 到期到达；等到期限，与不受期限约束的长轮询一样
+		// 以 ctx 的错误结束，调用方据此区分「期限到了」与「长轮询到期没有任务」。
+		<-ctx.Done()
 	}
 	if ctx.Err() != nil {
 		return Lease{}, fmt.Errorf("frontend: dequeue: %w", ctx.Err())
 	}
-	allErrors := append(append([]error(nil), resolutionErrors...), ownerErrors...)
-	if err := errors.Join(allErrors...); err != nil {
-		return Lease{}, err
+	if allErrors != nil {
+		return Lease{}, allErrors
 	}
 	return Lease{}, ErrNoTask
+}
+
+// handOverLease 把读回的租约交给调用方；调用方已离开时立即以 undelivered 归还。
+func (f *Frontend) handOverLease(ctx context.Context, result ownerPollResult) (Lease, error) {
+	if err := ctx.Err(); err != nil {
+		err = fmt.Errorf("frontend: dequeue: %w", err)
+		if cleanupErr := f.nackOwnerPollResults([]ownerPollResult{result}); cleanupErr != nil {
+			return Lease{}, errors.Join(err, cleanupErr)
+		}
+		return Lease{}, err
+	}
+	return result.lease, nil
+}
+
+// ownerPoll 是发往一个 owner 的一次长轮询。
+type ownerPoll struct {
+	group  ownerPollGroup
+	pollID string
+	// cancel 掐断 RPC，只在 CancelPoll 不可用时使用。
+	cancel context.CancelFunc
+}
+
+func (f *Frontend) startOwnerPoll(ctx context.Context, index int, group ownerPollGroup, timeout time.Duration, opts PollOptions, results chan<- ownerPollResult) *ownerPoll {
+	rpcCtx, cancel := f.pollRPCContext(ctx, timeout)
+	poll := &ownerPoll{group: group, pollID: f.nextPollID(), cancel: cancel}
+	go func() {
+		defer cancel()
+		lease, found, err := f.pollOwner(rpcCtx, group, timeout, opts, poll.pollID)
+		results <- ownerPollResult{index: index, group: group, lease: lease, found: found, err: err}
+	}()
+	return poll
+}
+
+// pollRPCContext 返回不随 ctx 取消的 poll RPC context：保留 ctx 的值，期限为 owner 端等待时长加
+// pollResponseGrace，Frontend 关闭时取消。
+func (f *Frontend) pollRPCContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	rpcCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout+pollResponseGrace)
+	stop := context.AfterFunc(f.ctx, cancel)
+	return rpcCtx, func() {
+		stop()
+		cancel()
+	}
+}
+
+// abandonOwnerPolls 在后台结束仍未应答的长轮询：cancel 为 true 时先用 CancelPoll 请 owner 结束，CancelPoll
+// 失败时取消 RPC；然后读回全部应答，把其中的租约以 undelivered 归还。polls 里已应答的项为 nil。
+func (f *Frontend) abandonOwnerPolls(polls []*ownerPoll, results <-chan ownerPollResult, pending int, cancel bool) {
+	if pending == 0 {
+		return
+	}
+	open := make([]*ownerPoll, 0, pending)
+	for _, poll := range polls {
+		if poll != nil {
+			open = append(open, poll)
+		}
+	}
+	go func() {
+		if cancel {
+			f.cancelOwnerPolls(open)
+		}
+		var leases []ownerPollResult
+		for range pending {
+			if r := <-results; r.err == nil && r.found {
+				leases = append(leases, r)
+			}
+		}
+		if err := f.nackOwnerPollResults(leases); err != nil {
+			slog.Warn("frontend failed to return abandoned poll leases", "queue", f.cfg.QueueName, "err", err)
+		}
+	}()
+}
+
+func (f *Frontend) cancelOwnerPolls(polls []*ownerPoll) {
+	ctx, cancel := context.WithTimeout(f.ctx, time.Second)
+	defer cancel()
+	for _, poll := range polls {
+		client, err := f.pool.getClient(poll.group.address)
+		if err == nil {
+			_, err = client.CancelPoll(ctx, &matching.CancelPollRequest{PollId: poll.pollID})
+		}
+		if err != nil {
+			poll.cancel()
+		}
+	}
+}
+
+func (f *Frontend) nextPollID() string {
+	return f.pollIDPrefix + "-" + strconv.FormatUint(f.pollSeq.Add(1), 36)
+}
+
+func newPollIDPrefix() string {
+	var buf [8]byte
+	_, _ = rand.Read(buf[:])
+	return hex.EncodeToString(buf[:])
 }
 
 type ownerPollGroup struct {
@@ -321,7 +472,7 @@ func (f *Frontend) resolvePollGroups(startIdx, numRead int) ([]ownerPollGroup, [
 	return groups, errs
 }
 
-func (f *Frontend) pollOwner(ctx context.Context, group ownerPollGroup, timeout time.Duration, opts PollOptions) (Lease, bool, error) {
+func (f *Frontend) pollOwner(ctx context.Context, group ownerPollGroup, timeout time.Duration, opts PollOptions, pollID string) (Lease, bool, error) {
 	client, err := f.pool.getClient(group.address)
 	if err != nil {
 		return Lease{}, false, fmt.Errorf("frontend: dequeue owner %q partitions %v: %w", group.address, group.partitionIDs, err)
@@ -331,6 +482,7 @@ func (f *Frontend) pollOwner(ctx context.Context, group ownerPollGroup, timeout 
 		PartitionIds:        group.partitionIDs,
 		PollTimeoutMs:       timeout.Milliseconds(),
 		AcceptedRoutingKeys: opts.AcceptedRoutingKeys,
+		PollId:              pollID,
 	})
 	if status.Code(err) == codes.Unimplemented {
 		return f.pollPartitions(ctx, client, group.partitionIDs, timeout, opts)

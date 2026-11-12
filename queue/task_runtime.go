@@ -70,8 +70,10 @@ func (rt *taskRuntime) dispatchTask(ctx context.Context, row *TaskRow) (*TaskRow
 	defer rt.transitionMu.Unlock()
 
 	dispatchAt := time.Now()
+	// 不随 poll 的 ctx 取消：取消可能在 UPDATE 已提交后才被驱动报告，此时行在库里已隐藏而内存不知道
+	// 这次投递，任务要等可见性超时才重新出现。投递完成后由调用方按 ctx 决定交付还是归还租约。
 	if err := rt.pq.store.DispatchTask(
-		ctx,
+		context.WithoutCancel(ctx),
 		rt.pq.queueName,
 		rt.pq.partitionID,
 		row.TaskID,
