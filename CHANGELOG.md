@@ -2,6 +2,28 @@
 
 本文件记录 TaskQ 的重要变更。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## 2026-11-12 重试用完的错误可识别；短期限压测区分饥饿与租约丢失
+
+Tenuto 的 2 小时 soak 里，分区换主期间 Activity 的 Ack 返回 `frontend: ack: max retries exceeded`（38 次），错误不带原因，
+调用方无法判断它是暂时性失败。同一天 Tenuto 的 `TestTaskQShortDeadlinePollsLoseNoDelivery` 在满载的整套测试里又出现一次
+「15s 内只领到 299 个」，失败信息分不清是期限短于一次往返（饥饿）还是租约丢失。
+
+### 变更
+
+- 新增 `frontend.ErrRetriesExhausted`。`Enqueue`、`Ack`、`Nack` 用完重试次数时返回
+  `frontend: <op>: max retries exceeded: <最后一次的 gRPC 错误>`，满足 `errors.Is(err, ErrRetriesExhausted)`，
+  错误链上带着最后一次的 gRPC 错误（`status.Code(err)` 返回它的 code）。此前 `Ack`、`Nack` 只返回不带原因的文本；`Enqueue` 的文本不变。
+- `frontend/delivery_stress_test.go`（`TASKQ_STRESS=1`）：15s 内没领完时记下每个没领到的任务在库里的状态（task_id、
+  attempt，已投递还是可见），再换 2 个 1s 期限的消费者排空 5s。可见的任务必须全部领到；丢失的租约在 visibility timeout
+  之前一直隐藏，排空之后仍缺任务即失败，失败信息分别列出「已投递但无人持有」与「可见但没被领到」。
+
+### 测试
+
+- `frontend/retries_exhausted_test.go`：owner 对 Ack、Nack、AddTask 一直返回 `FailedPrecondition` / `Unavailable` /
+  `Aborted`，三个调用的错误都满足 `ErrRetriesExhausted` 且带最后一次的 code；修改前 Ack 与 Nack 不满足。
+- 压测：`TASKQ_STRESS_ROUNDS=12 TASKQ_STRESS_BURNERS=8 GOMAXPROCS=2`，12 轮里 11 轮 15s 内领完；1 轮领到 275 个，没领到的
+  25 个全部可见、attempt 0、没有一个已投递的行，排空阶段全部领到。没有观察到租约丢失。
+
 ## 2026-11-12 MySQL DSN 建议客户端插值
 
 Tenuto 在三副本 MySQL 集群上的 CPU profile 里 `database/sql.ctxDriverPrepare` 占 8.6%：DSN 没有

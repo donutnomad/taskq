@@ -216,7 +216,7 @@ func (f *Frontend) EnqueueWithOptions(ctx context.Context, data []byte, opts Enq
 			_ = f.refreshPartitions(ctx)
 		}
 	}
-	return fmt.Errorf("frontend: enqueue: max retries exceeded: %w", lastErr)
+	return fmt.Errorf("frontend: enqueue: %w: %w", ErrRetriesExhausted, lastErr)
 }
 
 // pickWritePartition 从 round-robin 位置起选第一个 owner 不在 failed 里的可写分区，fresh 为 true。所有 owner
@@ -606,8 +606,6 @@ func (f *Frontend) nackOwnerPollResults(results []ownerPollResult) error {
 	if len(results) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
 	var errs []error
 	for _, result := range results {
 		client, err := f.pool.getClient(result.group.address)
@@ -615,7 +613,7 @@ func (f *Frontend) nackOwnerPollResults(results []ownerPollResult) error {
 			errs = append(errs, fmt.Errorf("frontend: connect cleanup owner %q: %w", result.group.address, err))
 			continue
 		}
-		if err := nackPollLease(ctx, client, f.cfg.QueueName, result.lease); err != nil {
+		if err := returnPollLease(client, f.cfg.QueueName, result.lease); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -626,15 +624,37 @@ func (f *Frontend) nackPollLeases(client matching.MatchingServiceClient, leases 
 	if len(leases) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
 	var errs []error
 	for _, lease := range leases {
-		if err := nackPollLease(ctx, client, f.cfg.QueueName, lease); err != nil {
+		if err := returnPollLease(client, f.cfg.QueueName, lease); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// 未交付租约的归还在后台进行，不占调用方的时间：每次尝试给 leaseReturnTimeout，失败按退避重试
+// leaseReturnAttempts 次。归还失败的任务要等可见性超时（默认 60s）才能再被领取，所以宁可多等多试；
+// 机器繁忙时一次本机 RPC 超过 1s 并不罕见。
+const (
+	leaseReturnTimeout  = 5 * time.Second
+	leaseReturnAttempts = 3
+)
+
+func returnPollLease(client matching.MatchingServiceClient, queueName string, lease Lease) error {
+	var err error
+	for attempt := range leaseReturnAttempts {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), leaseReturnTimeout)
+		err = nackPollLease(ctx, client, queueName, lease)
+		cancel()
+		if err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 func nackPollLease(ctx context.Context, client matching.MatchingServiceClient, queueName string, lease Lease) error {
@@ -728,6 +748,7 @@ func (f *Frontend) Ack(ctx context.Context, token string) error {
 		return err
 	}
 
+	var lastErr error
 	for attempt := range defaultMaxRetries {
 		client, err := f.getPartitionClient(f.cfg.QueueName, partID)
 		if err != nil {
@@ -751,13 +772,14 @@ func (f *Frontend) Ack(ctx context.Context, token string) error {
 		if !isRetryable(err) {
 			return fmt.Errorf("frontend: ack: %w", err)
 		}
+		lastErr = err
 		if attempt < defaultMaxRetries-1 {
 			if retryErr := f.waitRetry(ctx); retryErr != nil {
 				return fmt.Errorf("frontend: ack: %w", retryErr)
 			}
 		}
 	}
-	return fmt.Errorf("frontend: ack: max retries exceeded")
+	return fmt.Errorf("frontend: ack: %w: %w", ErrRetriesExhausted, lastErr)
 }
 
 // Nack 拒绝消费，触发重投递
@@ -767,6 +789,7 @@ func (f *Frontend) Nack(ctx context.Context, token string) error {
 		return err
 	}
 
+	var lastErr error
 	for attempt := range defaultMaxRetries {
 		client, err := f.getPartitionClient(f.cfg.QueueName, partID)
 		if err != nil {
@@ -790,13 +813,14 @@ func (f *Frontend) Nack(ctx context.Context, token string) error {
 		if !isRetryable(err) {
 			return fmt.Errorf("frontend: nack: %w", err)
 		}
+		lastErr = err
 		if attempt < defaultMaxRetries-1 {
 			if retryErr := f.waitRetry(ctx); retryErr != nil {
 				return fmt.Errorf("frontend: nack: %w", retryErr)
 			}
 		}
 	}
-	return fmt.Errorf("frontend: nack: max retries exceeded")
+	return fmt.Errorf("frontend: nack: %w: %w", ErrRetriesExhausted, lastErr)
 }
 
 // Close 关闭前端路由器

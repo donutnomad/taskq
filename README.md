@@ -240,6 +240,8 @@ sequenceDiagram
 
 `Frontend.Enqueue` 对可重试的 AddTask 路由或 gRPC 错误（`FailedPrecondition` / `Unavailable` / `Aborted`）最多尝试 3 次。任务可以写进队列的任一可写分区（`RoutingKey` 定向由消费侧按 key 过滤，与分区无关），失败的 owner 在本次调用内不再选择，重试换到其他 owner 的分区；只剩失败过的 owner 时退避 50ms 后重新解析路由。owner 宕机、成员表尚未剔除它（约 20s）期间，写入由此落到存活的 owner。Matching 可能已经提交任务，而 AddTask 响应在网络中丢失；后续重试会写入另一条任务。消费者进程退出、visibility timeout 和 Nack 也会触发重新投递。
 
+`Ack` 与 `Nack` 对同样的错误最多尝试 3 次（间隔 50ms），分区换主期间可能全部失败。三个调用用完重试次数时返回的错误满足 `errors.Is(err, frontend.ErrRetriesExhausted)`，错误链上同时带着最后一次的 gRPC 错误（`status.Code(err)` 返回它的 code）。这是暂时性失败，调用方稍后重试。Ack 没有送达时任务保持已投递，visibility timeout 之后重新投递，消费者按上面的幂等约定丢弃重复的任务。
+
 生产接入遵循以下约定：
 
 1. 生产者在 payload 中携带稳定的业务幂等键，例如 `order_id + operation`，应用层重试继续使用同一个键。
